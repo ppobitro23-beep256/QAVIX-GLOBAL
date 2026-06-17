@@ -1,0 +1,542 @@
+// ═══════════════════════════════════════════════════════════════════════
+//  QAVIX GLOBAL — server.js  (single file, everything inside)
+// ═══════════════════════════════════════════════════════════════════════
+require('dotenv').config();
+
+const express      = require('express');
+const { Pool }     = require('pg');
+const bcrypt       = require('bcryptjs');
+const jwt          = require('jsonwebtoken');
+const cors         = require('cors');
+const helmet       = require('helmet');
+const rateLimit    = require('express-rate-limit');
+
+const app  = express();
+const PORT = process.env.PORT || 5000;
+
+// ── Neon PostgreSQL pool ─────────────────────────────────────────────────
+const pool = process.env.DATABASE_URL
+  ? new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } })
+  : null;
+
+const db = (text, params) => pool.query(text, params);
+
+// ── Create all tables on first run ───────────────────────────────────────
+const initDB = async () => {
+  if (!pool) { console.log('⚠️  No DATABASE_URL'); return; }
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      name             VARCHAR(100)  NOT NULL,
+      email            VARCHAR(150)  NOT NULL UNIQUE,
+      phone            VARCHAR(20)   DEFAULT '',
+      password         TEXT          NOT NULL,
+      uid              VARCHAR(20)   NOT NULL UNIQUE,
+      referral_code    VARCHAR(20)   NOT NULL UNIQUE,
+      referred_by      UUID          REFERENCES users(id) ON DELETE SET NULL,
+      balance          NUMERIC(14,2) DEFAULT 0,
+      pending_earnings NUMERIC(14,2) DEFAULT 0,
+      total_deposited  NUMERIC(14,2) DEFAULT 0,
+      total_withdrawn  NUMERIC(14,2) DEFAULT 0,
+      membership_level VARCHAR(20)   DEFAULT 'starter',
+      is_verified      BOOLEAN       DEFAULT FALSE,
+      kyc_status       VARCHAR(20)   DEFAULT 'none',
+      wallet_address   VARCHAR(100)  DEFAULT '',
+      wallet_network   VARCHAR(20)   DEFAULT 'TRC20',
+      last_login       TIMESTAMPTZ   DEFAULT NOW(),
+      created_at       TIMESTAMPTZ   DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS investments (
+      id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id       UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      plan_id       VARCHAR(30) NOT NULL,
+      plan_name     VARCHAR(100) NOT NULL,
+      amount        NUMERIC(14,2) NOT NULL,
+      daily_income  NUMERIC(14,2) NOT NULL,
+      total_return  NUMERIC(14,2) NOT NULL,
+      days_total    INTEGER NOT NULL,
+      days_elapsed  INTEGER DEFAULT 0,
+      earned_so_far NUMERIC(14,2) DEFAULT 0,
+      status        VARCHAR(20) DEFAULT 'active',
+      start_date    TIMESTAMPTZ DEFAULT NOW(),
+      end_date      TIMESTAMPTZ NOT NULL,
+      created_at    TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS transactions (
+      id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      type        VARCHAR(20) NOT NULL,
+      amount      NUMERIC(14,2) NOT NULL,
+      status      VARCHAR(20) DEFAULT 'completed',
+      description TEXT DEFAULT '',
+      meta        JSONB DEFAULT '{}',
+      created_at  TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS notifications (
+      id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      type       VARCHAR(30) DEFAULT 'system',
+      title      VARCHAR(200) NOT NULL,
+      body       TEXT DEFAULT '',
+      read       BOOLEAN DEFAULT FALSE,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS reward_claims (
+      id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      reward_id  VARCHAR(30) NOT NULL,
+      claimed_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(user_id, reward_id)
+    );
+    CREATE TABLE IF NOT EXISTS refresh_tokens (
+      id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      token TEXT NOT NULL UNIQUE,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_users_email    ON users(email);
+    CREATE INDEX IF NOT EXISTS idx_users_ref      ON users(referral_code);
+    CREATE INDEX IF NOT EXISTS idx_inv_user       ON investments(user_id);
+    CREATE INDEX IF NOT EXISTS idx_tx_user        ON transactions(user_id);
+    CREATE INDEX IF NOT EXISTS idx_notif_user     ON notifications(user_id);
+  `);
+  console.log('✅ Neon DB tables ready');
+};
+
+// ── Helpers ──────────────────────────────────────────────────────────────
+// snake_case row → camelCase object
+const cc = (row) => {
+  if (!row) return null;
+  const o = {};
+  for (const [k,v] of Object.entries(row))
+    o[k.replace(/_([a-z])/g,(_,l)=>l.toUpperCase())] = v;
+  o.id = row.id;
+  return o;
+};
+const ccAll  = (rows) => rows.map(cc);
+const safe   = (u) => { const r={...u}; delete r.password; return r; };
+const notif  = (uid,type,title,body='') =>
+  db('INSERT INTO notifications(user_id,type,title,body) VALUES($1,$2,$3,$4)',[uid,type,title,body]).catch(()=>{});
+
+// ── JWT ───────────────────────────────────────────────────────────────────
+const signA = (id) => jwt.sign({id}, process.env.JWT_SECRET,         {expiresIn: process.env.JWT_EXPIRES_IN  ||'7d'});
+const signR = (id) => jwt.sign({id}, process.env.JWT_REFRESH_SECRET, {expiresIn: process.env.JWT_REFRESH_EXPIRES_IN||'30d'});
+
+// ── Auth middleware ───────────────────────────────────────────────────────
+const auth = async (req, res, next) => {
+  try {
+    const h = req.headers.authorization;
+    if (!h?.startsWith('Bearer ')) return res.status(401).json({success:false,message:'No token'});
+    const d = jwt.verify(h.split(' ')[1], process.env.JWT_SECRET);
+    const {rows} = await db('SELECT * FROM users WHERE id=$1',[d.id]);
+    if (!rows[0]) return res.status(401).json({success:false,message:'User not found'});
+    req.user = safe(cc(rows[0]));
+    next();
+  } catch(e) {
+    res.status(401).json({success:false,message: e.name==='TokenExpiredError'?'Token expired':'Invalid token'});
+  }
+};
+
+// ── Constants ────────────────────────────────────────────────────────────
+const PLANS = [
+  {id:'starter', name:'Starter Plan',  price:25,   rate:0.04, days:30, roi:120, min:25,   max:99   },
+  {id:'advanced',name:'Advanced Plan', price:100,  rate:0.05, days:45, roi:225, min:100,  max:499  },
+  {id:'premium', name:'Premium Plan',  price:500,  rate:0.06, days:60, roi:360, min:500,  max:4999 },
+  {id:'elite',   name:'Elite Plan',    price:5000, rate:0.06, days:80, roi:480, min:5000, max:99999},
+];
+const COMM = {1:10, 2:6, 3:4, 4:3, 5:2};
+const REWARDS = [
+  {id:'daily',  name:'Daily Check-in',      amount:0.50,  cd:24  },
+  {id:'weekly', name:'Weekly Reward',       amount:5.00,  cd:168 },
+  {id:'monthly',name:'Monthly Reward',      amount:25.00, cd:720 },
+  {id:'ref1',   name:'First Referral Bonus',amount:5.00,  cd:null},
+  {id:'ref10',  name:'10 Member Milestone', amount:15.00, cd:null},
+];
+
+// Pay referral commissions up the chain
+const payComm = async (investorId, amount) => {
+  let cur = investorId;
+  for (let lvl=1; lvl<=5; lvl++) {
+    const {rows} = await db('SELECT id,name,referred_by FROM users WHERE id=$1',[cur]);
+    if (!rows[0]?.referred_by) break;
+    const earned = +((amount*(COMM[lvl]||0))/100).toFixed(2);
+    await db('UPDATE users SET pending_earnings=pending_earnings+$1 WHERE id=$2',[earned, rows[0].referred_by]);
+    await db(`INSERT INTO transactions(user_id,type,amount,description,meta) VALUES($1,'commission',$2,$3,$4)`,
+      [rows[0].referred_by, earned, `Level ${lvl} commission from ${rows[0].name}`, JSON.stringify({from:investorId,lvl})]);
+    await notif(rows[0].referred_by,'commission',`Level ${lvl} commission received`,`$${earned} from ${rows[0].name}`);
+    cur = rows[0].referred_by;
+  }
+};
+
+// ═══════════════════════════════════════════════════════════════════════
+//  EXPRESS MIDDLEWARE
+// ═══════════════════════════════════════════════════════════════════════
+app.use(helmet({crossOriginResourcePolicy:{policy:'cross-origin'}}));
+
+const origins = () => ['http://localhost:3000','http://localhost:5500','http://127.0.0.1:5500',
+  ...(process.env.ALLOWED_ORIGINS||'').split(',').map(s=>s.trim()).filter(Boolean)];
+
+app.use(cors({
+  origin: (o,cb) => (!o||origins().includes(o)) ? cb(null,true) : cb(new Error('CORS blocked')),
+  credentials:true, methods:['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
+  allowedHeaders:['Content-Type','Authorization'],
+}));
+app.options('*', cors());
+app.use(express.json({limit:'10kb'}));
+app.use(rateLimit({windowMs:15*60000, max:300, skip:r=>r.path==='/api/health'}));
+
+const limit10 = rateLimit({windowMs:15*60000, max:10});
+
+// ═══════════════════════════════════════════════════════════════════════
+//  ROUTES
+// ═══════════════════════════════════════════════════════════════════════
+
+// Health
+app.get('/',           (_,res)=>res.json({success:true,message:'🏦 QAVIX GLOBAL API',db:pool?'Neon ✅':'No DB ⚠️'}));
+app.get('/api/health', (_,res)=>res.json({success:true,status:'healthy',uptime:process.uptime()}));
+
+// ── Auth ─────────────────────────────────────────────────────────────────
+app.post('/api/auth/register', limit10, async (req,res) => {
+  try {
+    const {name,email,phone,password,referralCode} = req.body;
+    if (!name||!email||!password) return res.status(400).json({success:false,message:'Name, email and password required'});
+
+    const {rows:ex} = await db('SELECT id FROM users WHERE email=$1',[email.toLowerCase()]);
+    if (ex[0]) return res.status(409).json({success:false,message:'Email already registered'});
+
+    let referredBy = null;
+    if (referralCode) {
+      const {rows:r} = await db('SELECT id FROM users WHERE referral_code=$1',[referralCode]);
+      if (!r[0]) return res.status(400).json({success:false,message:'Invalid referral code'});
+      referredBy = r[0].id;
+    }
+
+    const hash  = await bcrypt.hash(password,12);
+    const uid   = 'QVX-'+Math.floor(100000+Math.random()*900000);
+    const rCode = name.slice(0,2).toUpperCase()+uid.split('-')[1];
+
+    const {rows} = await db(
+      `INSERT INTO users(name,email,phone,password,uid,referral_code,referred_by) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+      [name,email.toLowerCase(),phone||'',hash,uid,rCode,referredBy]
+    );
+    const user = cc(rows[0]);
+    const aT=signA(user.id), rT=signR(user.id);
+    await db('INSERT INTO refresh_tokens(token) VALUES($1)',[rT]);
+    await notif(user.id,'system','Welcome to QAVIX GLOBAL! 🎉','Your account is ready. Start investing now.');
+
+    res.status(201).json({success:true,message:'Registration successful',data:{user:safe(user),accessToken:aT,refreshToken:rT}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.post('/api/auth/login', limit10, async (req,res) => {
+  try {
+    const {email,password} = req.body;
+    if (!email||!password) return res.status(400).json({success:false,message:'Email and password required'});
+    const {rows} = await db('SELECT * FROM users WHERE email=$1',[email.toLowerCase()]);
+    if (!rows[0]||!await bcrypt.compare(password,rows[0].password))
+      return res.status(401).json({success:false,message:'Invalid email or password'});
+    await db('UPDATE users SET last_login=NOW() WHERE id=$1',[rows[0].id]);
+    const user=cc(rows[0]), aT=signA(user.id), rT=signR(user.id);
+    await db('INSERT INTO refresh_tokens(token) VALUES($1)',[rT]);
+    res.json({success:true,message:'Login successful',data:{user:safe(user),accessToken:aT,refreshToken:rT}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.post('/api/auth/refresh', async (req,res) => {
+  try {
+    const {refreshToken} = req.body;
+    const {rows} = await db('SELECT 1 FROM refresh_tokens WHERE token=$1',[refreshToken]);
+    if (!rows[0]) return res.status(401).json({success:false,message:'Invalid refresh token'});
+    const d = jwt.verify(refreshToken,process.env.JWT_REFRESH_SECRET);
+    res.json({success:true,data:{accessToken:signA(d.id)}});
+  } catch(e){res.status(401).json({success:false,message:'Refresh token expired'});}
+});
+
+app.post('/api/auth/logout', async (req,res) => {
+  if (req.body.refreshToken) await db('DELETE FROM refresh_tokens WHERE token=$1',[req.body.refreshToken]).catch(()=>{});
+  res.json({success:true,message:'Logged out'});
+});
+
+app.get('/api/auth/me', auth, (req,res) => res.json({success:true,data:{user:req.user}}));
+
+// ── User ──────────────────────────────────────────────────────────────────
+app.get('/api/user/dashboard', auth, async (req,res) => {
+  try {
+    const [{rows:[u]},{rows:inv},{rows:tx}] = await Promise.all([
+      db('SELECT * FROM users WHERE id=$1',[req.user.id]),
+      db("SELECT * FROM investments WHERE user_id=$1 AND status='active'",[req.user.id]),
+      db('SELECT * FROM transactions WHERE user_id=$1 ORDER BY created_at DESC LIMIT 5',[req.user.id]),
+    ]);
+    const user=cc(u);
+    res.json({success:true,data:{user:safe(user),balance:user.balance,pendingEarnings:user.pendingEarnings,totalDeposited:user.totalDeposited,totalWithdrawn:user.totalWithdrawn,activeInvestments:ccAll(inv),recentTransactions:ccAll(tx)}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.get('/api/user/profile', auth, async (req,res) => {
+  const {rows}=await db('SELECT * FROM users WHERE id=$1',[req.user.id]);
+  res.json({success:true,data:{user:safe(cc(rows[0]))}});
+});
+
+app.put('/api/user/profile', auth, async (req,res) => {
+  try {
+    const {name,phone}=req.body; const sets=[],vals=[];
+    if (name)  {sets.push(`name=$${vals.length+1}`); vals.push(name.trim());}
+    if (phone) {sets.push(`phone=$${vals.length+1}`);vals.push(phone.trim());}
+    if (!sets.length) return res.status(400).json({success:false,message:'Nothing to update'});
+    vals.push(req.user.id);
+    const {rows}=await db(`UPDATE users SET ${sets.join(',')} WHERE id=$${vals.length} RETURNING *`,vals);
+    res.json({success:true,message:'Profile updated',data:{user:safe(cc(rows[0]))}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.post('/api/user/change-password', auth, async (req,res) => {
+  try {
+    const {currentPassword,newPassword}=req.body;
+    const {rows}=await db('SELECT password FROM users WHERE id=$1',[req.user.id]);
+    if (!await bcrypt.compare(currentPassword,rows[0].password))
+      return res.status(400).json({success:false,message:'Current password incorrect'});
+    await db('UPDATE users SET password=$1 WHERE id=$2',[await bcrypt.hash(newPassword,12),req.user.id]);
+    res.json({success:true,message:'Password changed'});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.put('/api/user/wallet-address', auth, async (req,res) => {
+  try {
+    const {walletAddress,network}=req.body;
+    if (!walletAddress) return res.status(400).json({success:false,message:'Wallet address required'});
+    await db('UPDATE users SET wallet_address=$1,wallet_network=$2 WHERE id=$3',[walletAddress,network||'TRC20',req.user.id]);
+    res.json({success:true,message:'Wallet address updated'});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── Plans ─────────────────────────────────────────────────────────────────
+app.get('/api/plans', auth, async (req,res) => {
+  try {
+    const {rows}=await db("SELECT plan_id FROM investments WHERE user_id=$1 AND status='active'",[req.user.id]);
+    const active=rows.map(r=>r.plan_id);
+    res.json({success:true,data:{plans:PLANS.map(p=>({...p,dailyExample:+(p.price*p.rate).toFixed(2),totalExample:+(p.price*p.roi/100).toFixed(2),isActive:active.includes(p.id)}))}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.post('/api/plans/purchase', auth, async (req,res) => {
+  try {
+    const {planId,amount}=req.body;
+    const plan=PLANS.find(p=>p.id===planId);
+    if (!plan) return res.status(404).json({success:false,message:'Plan not found'});
+    const {rows:[u]}=await db('SELECT balance FROM users WHERE id=$1',[req.user.id]);
+    const amt=parseFloat(amount)||plan.price;
+    if (amt<plan.min) return res.status(400).json({success:false,message:`Minimum is $${plan.min}`});
+    if (parseFloat(u.balance)<amt) return res.status(400).json({success:false,message:'Insufficient balance'});
+    const end=new Date(Date.now()+plan.days*86400000);
+    const daily=+(amt*plan.rate).toFixed(2), total=+(amt*plan.roi/100).toFixed(2);
+    const {rows}=await db(
+      `INSERT INTO investments(user_id,plan_id,plan_name,amount,daily_income,total_return,days_total,end_date) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+      [req.user.id,planId,plan.name,amt,daily,total,plan.days,end]
+    );
+    await db('UPDATE users SET balance=balance-$1,total_deposited=total_deposited+$1 WHERE id=$2',[amt,req.user.id]);
+    await payComm(req.user.id,amt);
+    await notif(req.user.id,'investment',`${plan.name} activated!`,`Daily: $${daily} for ${plan.days} days`);
+    res.status(201).json({success:true,message:`${plan.name} activated! Daily: $${daily}`,data:{investment:cc(rows[0])}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.get('/api/plans/mine', auth, async (req,res) => {
+  try {
+    const {rows}=await db('SELECT * FROM investments WHERE user_id=$1 ORDER BY created_at DESC',[req.user.id]);
+    res.json({success:true,data:{investments:ccAll(rows)}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── Wallet ────────────────────────────────────────────────────────────────
+app.get('/api/wallet/balance', auth, async (req,res) => {
+  try {
+    const {rows}=await db('SELECT balance,pending_earnings,total_deposited,total_withdrawn,wallet_address,wallet_network FROM users WHERE id=$1',[req.user.id]);
+    res.json({success:true,data:cc(rows[0])});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.get('/api/wallet/transactions', auth, async (req,res) => {
+  try {
+    const lim=parseInt(req.query.limit)||50, type=req.query.type;
+    const q=type ? 'SELECT * FROM transactions WHERE user_id=$1 AND type=$2 ORDER BY created_at DESC LIMIT $3'
+                 : 'SELECT * FROM transactions WHERE user_id=$1 ORDER BY created_at DESC LIMIT $2';
+    const p=type ? [req.user.id,type,lim] : [req.user.id,lim];
+    const {rows}=await db(q,p);
+    res.json({success:true,data:{transactions:ccAll(rows),count:rows.length}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.post('/api/wallet/deposit', auth, async (req,res) => {
+  try {
+    const {amount,network,txHash}=req.body;
+    const MIN=parseFloat(process.env.DEPOSIT_MIN)||10, amt=parseFloat(amount);
+    if (!amt||amt<MIN) return res.status(400).json({success:false,message:`Min deposit $${MIN}`});
+    if (!txHash)       return res.status(400).json({success:false,message:'Transaction hash required'});
+    await db('UPDATE users SET balance=balance+$1 WHERE id=$2',[amt,req.user.id]);
+    const {rows}=await db(`INSERT INTO transactions(user_id,type,amount,description,meta) VALUES($1,'deposit',$2,$3,$4) RETURNING *`,
+      [req.user.id,amt,`Deposit via ${network||'TRC20'}`,JSON.stringify({network,txHash})]);
+    await notif(req.user.id,'deposit','Deposit Confirmed',`$${amt} USDT received`);
+    res.status(201).json({success:true,message:`$${amt} deposit received`,data:{transaction:cc(rows[0])}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.post('/api/wallet/withdraw', auth, async (req,res) => {
+  try {
+    const {amount,walletAddress,network}=req.body;
+    const MIN=parseFloat(process.env.WITHDRAWAL_MIN)||10, MAX=parseFloat(process.env.WITHDRAWAL_MAX)||10000;
+    const amt=parseFloat(amount);
+    if (!amt||amt<MIN) return res.status(400).json({success:false,message:`Min withdrawal $${MIN}`});
+    if (amt>MAX)       return res.status(400).json({success:false,message:`Max withdrawal $${MAX}`});
+    if (!walletAddress)return res.status(400).json({success:false,message:'Wallet address required'});
+    const {rows:[u]}=await db('SELECT balance FROM users WHERE id=$1',[req.user.id]);
+    if (parseFloat(u.balance)<amt) return res.status(400).json({success:false,message:'Insufficient balance'});
+    const fee=+(Math.max(1,amt*0.02)).toFixed(2), net=+(amt-fee).toFixed(2);
+    await db('UPDATE users SET balance=balance-$1,total_withdrawn=total_withdrawn+$2 WHERE id=$3',[amt,net,req.user.id]);
+    const {rows}=await db(`INSERT INTO transactions(user_id,type,amount,status,description,meta) VALUES($1,'withdrawal',$2,'processing',$3,$4) RETURNING *`,
+      [req.user.id,net,`Withdrawal to ${walletAddress}`,JSON.stringify({walletAddress,network,fee})]);
+    await notif(req.user.id,'withdrawal','Withdrawal Processing',`$${net} USDT sent. 1-24h processing.`);
+    res.status(201).json({success:true,message:`$${net} withdrawal submitted`,data:{transaction:cc(rows[0]),fee,netAmount:net}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── Referral ──────────────────────────────────────────────────────────────
+app.get('/api/referral/info', auth, async (req,res) => {
+  try {
+    const {rows}=await db('SELECT referral_code FROM users WHERE id=$1',[req.user.id]);
+    const code=rows[0].referral_code;
+    res.json({success:true,data:{referralCode:code,referralLink:`https://qavix.io/ref/${code}`,commissionRates:COMM}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.get('/api/referral/team', auth, async (req,res) => {
+  try {
+    const {rows}=await db(`
+      WITH RECURSIVE t AS (
+        SELECT id,name,uid,membership_level,is_verified,created_at,1 AS lvl FROM users WHERE referred_by=$1
+        UNION ALL
+        SELECT u.id,u.name,u.uid,u.membership_level,u.is_verified,u.created_at,t.lvl+1
+        FROM users u JOIN t ON u.referred_by=t.id WHERE t.lvl<10
+      ) SELECT * FROM t ORDER BY lvl,created_at
+    `,[req.user.id]);
+    const byLvl={};
+    rows.forEach(r=>{ if(!byLvl[r.lvl]) byLvl[r.lvl]=[]; byLvl[r.lvl].push({id:r.id,name:r.name,uid:r.uid,status:r.is_verified?'active':'inactive',level:r.membership_level,joinDate:r.created_at}); });
+    res.json({success:true,data:{totalMembers:rows.length,levels:Object.entries(byLvl).map(([l,m])=>({level:parseInt(l),count:m.length,commission:COMM[l]||0,members:m}))}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.get('/api/referral/earnings', auth, async (req,res) => {
+  try {
+    const [{rows:[u]},{rows:tx},{rows:[agg]}]=await Promise.all([
+      db('SELECT pending_earnings FROM users WHERE id=$1',[req.user.id]),
+      db("SELECT * FROM transactions WHERE user_id=$1 AND type='commission' ORDER BY created_at DESC LIMIT 20",[req.user.id]),
+      db("SELECT COALESCE(SUM(amount),0) AS total FROM transactions WHERE user_id=$1 AND type='commission'",[req.user.id]),
+    ]);
+    const total=parseFloat(agg.total), avail=parseFloat(u.pending_earnings);
+    res.json({success:true,data:{totalEarned:+total.toFixed(2),available:+avail.toFixed(2),collected:+(total-avail).toFixed(2),recentCommissions:ccAll(tx)}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.post('/api/referral/collect', auth, async (req,res) => {
+  try {
+    const {rows:[u]}=await db('SELECT pending_earnings,balance FROM users WHERE id=$1',[req.user.id]);
+    const amount=parseFloat(u.pending_earnings);
+    if (amount<=0) return res.status(400).json({success:false,message:'No earnings to collect'});
+    await db('UPDATE users SET balance=balance+$1,pending_earnings=0 WHERE id=$2',[amount,req.user.id]);
+    await db(`INSERT INTO transactions(user_id,type,amount,description) VALUES($1,'commission',$2,'Referral commission collected')`,[req.user.id,amount]);
+    res.json({success:true,message:`$${amount.toFixed(2)} collected!`,data:{collected:amount,newBalance:parseFloat(u.balance)+amount}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── Notifications ─────────────────────────────────────────────────────────
+app.get('/api/notifications', auth, async (req,res) => {
+  try {
+    const {rows}=await db('SELECT * FROM notifications WHERE user_id=$1 ORDER BY created_at DESC LIMIT 30',[req.user.id]);
+    res.json({success:true,data:{notifications:ccAll(rows),unread:rows.filter(n=>!n.read).length}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.patch('/api/notifications/:id/read', auth, async (req,res) => {
+  await db('UPDATE notifications SET read=TRUE WHERE id=$1 AND user_id=$2',[req.params.id,req.user.id]);
+  res.json({success:true});
+});
+app.patch('/api/notifications/read-all', auth, async (req,res) => {
+  await db('UPDATE notifications SET read=TRUE WHERE user_id=$1',[req.user.id]);
+  res.json({success:true});
+});
+
+// ── Rewards ───────────────────────────────────────────────────────────────
+app.get('/api/rewards/status', auth, async (req,res) => {
+  try {
+    const {rows}=await db('SELECT reward_id,claimed_at FROM reward_claims WHERE user_id=$1',[req.user.id]);
+    const map={}; rows.forEach(r=>{map[r.reward_id]=r.claimed_at;});
+    res.json({success:true,data:{rewards:REWARDS.map(cfg=>{
+      const ca=map[cfg.id]; let ok=!ca,ni=null;
+      if (ca&&cfg.cd){ const el=(Date.now()-new Date(ca))/3600000; ok=el>=cfg.cd; if(!ok) ni=Math.ceil(cfg.cd-el); }
+      return {...cfg,available:ok,nextIn:ni,lastClaimed:ca||null};
+    })}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+const claimReward = async (req,res,rewardId) => {
+  try {
+    const cfg=REWARDS.find(r=>r.id===rewardId);
+    if (!cfg) return res.status(400).json({success:false,message:'Invalid reward'});
+    const {rows}=await db('SELECT claimed_at FROM reward_claims WHERE user_id=$1 AND reward_id=$2',[req.user.id,rewardId]);
+    const ex=rows[0];
+    if (ex&&cfg.cd){ const el=(Date.now()-new Date(ex.claimed_at))/3600000; if(el<cfg.cd) return res.status(400).json({success:false,message:`Available in ${Math.ceil(cfg.cd-el)}h`}); await db('UPDATE reward_claims SET claimed_at=NOW() WHERE user_id=$1 AND reward_id=$2',[req.user.id,rewardId]); }
+    else if (ex&&!cfg.cd) return res.status(400).json({success:false,message:'Already claimed'});
+    else await db('INSERT INTO reward_claims(user_id,reward_id) VALUES($1,$2)',[req.user.id,rewardId]);
+    await db('UPDATE users SET balance=balance+$1 WHERE id=$2',[cfg.amount,req.user.id]);
+    await db(`INSERT INTO transactions(user_id,type,amount,description) VALUES($1,'bonus',$2,$3)`,[req.user.id,cfg.amount,cfg.name]);
+    res.json({success:true,message:`${cfg.name} claimed! +$${cfg.amount}`,data:{reward:cfg,amount:cfg.amount}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+};
+
+app.post('/api/rewards/checkin', auth, (req,res) => claimReward(req,res,'daily'));
+app.post('/api/rewards/claim', auth, (req,res) => claimReward(req,res,req.body.rewardId));
+
+app.post('/api/rewards/lucky', auth, async (req,res) => {
+  try {
+    const prizes=[{l:'🎉 $1.00 USDT',a:1},{l:'🎊 $0.50 USDT',a:0.5},{l:'😢 Try Again',a:0},{l:'💰 $2.00 USDT',a:2},{l:'✨ $0.25 USDT',a:0.25}];
+    const p=prizes[Math.floor(Math.random()*prizes.length)];
+    if (p.a>0) {
+      await db('UPDATE users SET balance=balance+$1 WHERE id=$2',[p.a,req.user.id]);
+      await db(`INSERT INTO transactions(user_id,type,amount,description) VALUES($1,'bonus',$2,$3)`,[req.user.id,p.a,p.l]);
+    }
+    res.json({success:true,message:p.l,data:{prize:p}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── Stats ─────────────────────────────────────────────────────────────────
+app.get('/api/stats/platform', async (_,res) => {
+  try {
+    const [uR,dR,wR]=await Promise.all([
+      db('SELECT COUNT(*) FROM users'),
+      db("SELECT COALESCE(SUM(amount),0) AS t FROM transactions WHERE type='deposit'"),
+      db("SELECT COALESCE(SUM(amount),0) AS t FROM transactions WHERE type='withdrawal'"),
+    ]);
+    res.json({success:true,data:{totalUsers:18340+parseInt(uR.rows[0].count),activeInvestors:11200,totalDeposits:4200000+parseFloat(dR.rows[0].t),totalWithdrawals:2900000+parseFloat(wR.rows[0].t),totalInvestments:6100000,uptimePct:99.8}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.get('/api/stats/leaderboard', async (_,res) => {
+  try {
+    const {rows}=await db('SELECT name,membership_level,total_deposited,total_withdrawn FROM users ORDER BY total_deposited DESC LIMIT 10');
+    res.json({success:true,data:{investors:rows.map(r=>({name:r.name,level:r.membership_level,amount:parseFloat(r.total_deposited)})),earners:[...rows].sort((a,b)=>b.total_withdrawn-a.total_withdrawn).map(r=>({name:r.name,amount:parseFloat(r.total_withdrawn)}))}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── 404 & error handler ───────────────────────────────────────────────────
+app.use((_,res)=>res.status(404).json({success:false,message:'Route not found'}));
+app.use((e,req,res,_)=>{console.error(e.message); res.status(500).json({success:false,message:e.message});});
+
+// ── Start ─────────────────────────────────────────────────────────────────
+initDB().then(()=>{
+  app.listen(PORT,()=>{
+    console.log(`
+  ╔══════════════════════════════════════════╗
+  ║  🏦  QAVIX GLOBAL API                   ║
+  ║  Port : ${PORT}  |  DB: ${pool?'Neon ✅':'No DB ⚠️'}        ║
+  ╚══════════════════════════════════════════╝`);
+  });
+});
+
+module.exports = app;
