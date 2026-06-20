@@ -10,7 +10,6 @@ const jwt          = require('jsonwebtoken');
 const cors         = require('cors');
 const helmet       = require('helmet');
 const rateLimit    = require('express-rate-limit');
-const nodemailer   = require('nodemailer');
 
 const app  = express();
 const PORT = process.env.PORT || 5000;
@@ -133,29 +132,7 @@ const safe   = (u) => { const r={...u}; delete r.password; return r; };
 const notif  = (uid,type,title,body='') =>
   db('INSERT INTO notifications(user_id,type,title,body) VALUES($1,$2,$3,$4)',[uid,type,title,body]).catch(()=>{});
 
-// ── Nodemailer Setup ─────────────────────────────────────────────────────
-const mailer = nodemailer.createTransport({
-  host: 'smtp.gmail.com',
-  port: 587,
-  secure: false,
-  requireTLS: true,
-  auth: {
-    user: process.env.MAIL_USER,
-    pass: process.env.MAIL_PASS
-  },
-  tls: { rejectUnauthorized: false }
-});
-
-// Verify mail connection on startup
-mailer.verify((err) => {
-  if (err) console.error('❌ Mail error:', err.message);
-  else console.log('✅ Mail server ready:', process.env.MAIL_USER);
-});
-
-const OTP_EXPIRES = parseInt(process.env.OTP_EXPIRES_MIN) || 10;
-
-const genOTP = () => Math.floor(100000 + Math.random() * 900000).toString();
-
+// ── Resend Email Setup (HTTP API — works on all hosts) ───────────────────
 const sendOTPMail = async (toEmail, otp, purpose) => {
   const subjects = {
     change_pass  : '🔐 QAVIX — Password Change OTP',
@@ -171,34 +148,50 @@ const sendOTPMail = async (toEmail, otp, purpose) => {
     login_2fa    : 'complete your login',
     forgot_pass  : 'reset your password',
   };
-  await mailer.sendMail({
-    from    : `"QAVIX GLOBAL" <${process.env.MAIL_USER}>`,
-    to      : toEmail,
-    subject : subjects[purpose] || '🔐 QAVIX — Verification OTP',
-    html    : `
-      <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;background:#0d0d0d;border-radius:16px;overflow:hidden">
-        <div style="background:linear-gradient(135deg,#111,#1c1208);padding:28px 32px;text-align:center;border-bottom:1px solid rgba(201,162,39,0.2)">
-          <div style="font-size:22px;font-weight:800;color:#fff;letter-spacing:.1em">QAVIX <span style="color:#C9A227">GLOBAL</span></div>
-          <div style="font-size:12px;color:#666;margin-top:4px;letter-spacing:.06em">PREMIUM INVESTMENT PLATFORM</div>
+
+  const html = `
+    <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;background:#0d0d0d;border-radius:16px;overflow:hidden">
+      <div style="background:linear-gradient(135deg,#111,#1c1208);padding:28px 32px;text-align:center;border-bottom:1px solid rgba(201,162,39,0.2)">
+        <div style="font-size:22px;font-weight:800;color:#fff;letter-spacing:.1em">QAVIX <span style="color:#C9A227">GLOBAL</span></div>
+        <div style="font-size:12px;color:#666;margin-top:4px;letter-spacing:.06em">PREMIUM INVESTMENT PLATFORM</div>
+      </div>
+      <div style="padding:32px;text-align:center">
+        <div style="font-size:14px;color:#888;margin-bottom:8px">Your OTP to ${actions[purpose]||'verify your action'}:</div>
+        <div style="font-size:48px;font-weight:800;color:#C9A227;letter-spacing:.18em;margin:16px 0">${otp}</div>
+        <div style="background:rgba(201,162,39,0.08);border:1px solid rgba(201,162,39,0.2);border-radius:10px;padding:12px 20px;display:inline-block;margin-top:8px">
+          <div style="font-size:12px;color:#888">⏱ Expires in <strong style="color:#C9A227">${OTP_EXPIRES} minutes</strong></div>
         </div>
-        <div style="padding:32px;text-align:center">
-          <div style="font-size:14px;color:#888;margin-bottom:8px">Your OTP to ${actions[purpose]||'verify your action'}:</div>
-          <div style="font-size:48px;font-weight:800;color:#C9A227;letter-spacing:.18em;margin:16px 0">${otp}</div>
-          <div style="background:rgba(201,162,39,0.08);border:1px solid rgba(201,162,39,0.2);border-radius:10px;padding:12px 20px;display:inline-block;margin-top:8px">
-            <div style="font-size:12px;color:#888">⏱ Expires in <strong style="color:#C9A227">${OTP_EXPIRES} minutes</strong></div>
-          </div>
-          <div style="font-size:12px;color:#555;margin-top:24px;line-height:1.7">
-            If you did not request this, please ignore this email.<br>
-            Never share this OTP with anyone.
-          </div>
-        </div>
-        <div style="padding:16px 32px;border-top:1px solid rgba(255,255,255,0.06);text-align:center">
-          <div style="font-size:11px;color:#444">© 2025 QAVIX GLOBAL · All rights reserved</div>
+        <div style="font-size:12px;color:#555;margin-top:24px;line-height:1.7">
+          If you did not request this, please ignore this email.<br>
+          Never share this OTP with anyone.
         </div>
       </div>
-    `
+      <div style="padding:16px 32px;border-top:1px solid rgba(255,255,255,0.06);text-align:center">
+        <div style="font-size:11px;color:#444">© 2025 QAVIX GLOBAL · All rights reserved</div>
+      </div>
+    </div>`;
+
+  const res = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      from: 'QAVIX GLOBAL <onboarding@resend.dev>',
+      to: [toEmail],
+      subject: subjects[purpose] || '🔐 QAVIX — Verification OTP',
+      html
+    })
   });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.message || 'Mail send failed');
+  console.log('✅ OTP mail sent to:', toEmail);
 };
+
+const OTP_EXPIRES = parseInt(process.env.OTP_EXPIRES_MIN) || 10;
+
+const genOTP = () => Math.floor(100000 + Math.random() * 900000).toString();
 
 const saveOTP = async (userId, email, otp, purpose, meta={}) => {
   // Invalidate any existing unused OTPs for same user+purpose
