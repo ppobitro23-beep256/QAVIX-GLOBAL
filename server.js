@@ -651,7 +651,38 @@ app.get('/api/referral/info', auth, async (req,res) => {
   try {
     const {rows}=await db('SELECT referral_code FROM users WHERE id=$1',[req.user.id]);
     const code=rows[0].referral_code;
-    res.json({success:true,data:{referralCode:code,referralLink:`https://qavix.pages.dev/ref/${code}`,commissionRates:COMM}});
+    res.json({success:true,data:{referralCode:code,referralLink:`https://qavixglobal.pages.dev/ref/${code}`,commissionRates:COMM}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── Team Financials ───────────────────────────────────────────────────────
+app.get('/api/referral/team-financials', auth, async (req,res) => {
+  try {
+    const {rows:team} = await db(
+      `WITH RECURSIVE team AS (
+        SELECT id,name FROM users WHERE referred_by=$1
+        UNION ALL
+        SELECT u.id,u.name FROM users u INNER JOIN team t ON u.referred_by=t.id
+      ) SELECT id,name FROM team LIMIT 200`,
+      [req.user.id]
+    );
+    if (!team.length) return res.json({success:true,data:{totalDeposited:0,totalWithdrawn:0,deposits:[],withdrawals:[]}});
+    const ids = team.map(m=>m.id);
+    const nm  = {};  team.forEach(m=>{ nm[m.id]=m.name; });
+    const {rows:deps} = await db(
+      `SELECT user_id,amount,created_at FROM transactions WHERE user_id=ANY($1::uuid[]) AND type='deposit' ORDER BY created_at DESC LIMIT 100`,
+      [ids]
+    );
+    const {rows:wds} = await db(
+      `SELECT user_id,amount,created_at FROM transactions WHERE user_id=ANY($1::uuid[]) AND type='withdrawal' ORDER BY created_at DESC LIMIT 100`,
+      [ids]
+    );
+    res.json({success:true,data:{
+      totalDeposited: +deps.reduce((s,r)=>s+parseFloat(r.amount),0).toFixed(2),
+      totalWithdrawn: +wds.reduce((s,r)=>s+parseFloat(r.amount),0).toFixed(2),
+      deposits:    deps.map(r=>({name:nm[r.user_id]||'Member',amount:parseFloat(r.amount),date:r.created_at})),
+      withdrawals: wds.map(r=>({name:nm[r.user_id]||'Member',amount:parseFloat(r.amount),date:r.created_at})),
+    }});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
