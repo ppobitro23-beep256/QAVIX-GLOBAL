@@ -361,28 +361,13 @@ app.post('/api/auth/reset-password', limit10, async (req,res) => {
 
 app.post('/api/auth/login', limit10, async (req,res) => {
   try {
-    const {email,password,otp} = req.body;
+    const {email,password} = req.body;
     if (!email||!password) return res.status(400).json({success:false,message:'Email and password required'});
     const {rows} = await db('SELECT * FROM users WHERE email=$1',[email.toLowerCase()]);
     if (!rows[0]||!await bcrypt.compare(password,rows[0].password))
       return res.status(401).json({success:false,message:'Invalid email or password'});
-
-    const user = cc(rows[0]);
-
-    // ── Step 1: credentials OK → send OTP ──
-    if (!otp) {
-      const code = genOTP();
-      await saveOTP(user.id, user.email, code, 'login_2fa');
-      sendOTPMail(user.email, code, 'login_2fa').catch(e=>console.error("Mail error:",e.message));
-      return res.json({success:true, requireOtp:true, message:'OTP sent to your email'});
-    }
-
-    // ── Step 2: verify OTP → issue tokens ──
-    const valid = await verifyOTP(user.id, otp, 'login_2fa');
-    if (!valid) return res.status(401).json({success:false,message:'Invalid or expired OTP'});
-
-    await db('UPDATE users SET last_login=NOW() WHERE id=$1',[user.id]);
-    const aT=signA(user.id), rT=signR(user.id);
+    await db('UPDATE users SET last_login=NOW() WHERE id=$1',[rows[0].id]);
+    const user=cc(rows[0]), aT=signA(user.id), rT=signR(user.id);
     await db('INSERT INTO refresh_tokens(token) VALUES($1)',[rT]);
     res.json({success:true,message:'Login successful',data:{user:safe(user),accessToken:aT,refreshToken:rT}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
