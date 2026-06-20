@@ -135,8 +135,20 @@ const notif  = (uid,type,title,body='') =>
 
 // ── Nodemailer Setup ─────────────────────────────────────────────────────
 const mailer = nodemailer.createTransport({
-  service: 'gmail',
-  auth: { user: process.env.MAIL_USER, pass: process.env.MAIL_PASS }
+  host: 'smtp.gmail.com',
+  port: 465,
+  secure: true,
+  auth: {
+    user: process.env.MAIL_USER,
+    pass: process.env.MAIL_PASS
+  },
+  tls: { rejectUnauthorized: false }
+});
+
+// Verify mail connection on startup
+mailer.verify((err) => {
+  if (err) console.error('❌ Mail error:', err.message);
+  else console.log('✅ Mail server ready:', process.env.MAIL_USER);
 });
 
 const OTP_EXPIRES = parseInt(process.env.OTP_EXPIRES_MIN) || 10;
