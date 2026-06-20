@@ -334,7 +334,7 @@ app.post('/api/auth/forgot-password', limit10, async (req,res) => {
     const user = rows[0];
     const code = genOTP();
     await saveOTP(user.id, user.email, code, 'forgot_pass');
-    await sendOTPMail(user.email, code, 'forgot_pass');
+    sendOTPMail(user.email, code, 'forgot_pass').catch(e=>console.error("Mail error:",e.message));
     res.json({success:true,requireOtp:true,message:'OTP sent to your email'});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
@@ -367,7 +367,7 @@ app.post('/api/auth/login', limit10, async (req,res) => {
     if (!otp) {
       const code = genOTP();
       await saveOTP(user.id, user.email, code, 'login_2fa');
-      await sendOTPMail(user.email, code, 'login_2fa');
+      sendOTPMail(user.email, code, 'login_2fa').catch(e=>console.error("Mail error:",e.message));
       return res.json({success:true, requireOtp:true, message:'OTP sent to your email'});
     }
 
@@ -438,7 +438,7 @@ app.post('/api/user/change-password', auth, async (req,res) => {
     if (!otp) {
       const code = genOTP();
       await saveOTP(req.user.id, req.user.email, code, 'change_pass');
-      await sendOTPMail(req.user.email, code, 'change_pass');
+      sendOTPMail(req.user.email, code, 'change_pass').catch(e=>console.error("Mail error:",e.message));
       return res.json({success:true, requireOtp:true, message:'OTP sent to your email'});
     }
 
@@ -463,7 +463,7 @@ app.post('/api/user/change-email', auth, async (req,res) => {
       if (ex[0]) return res.status(409).json({success:false,message:'Email already in use'});
       const code = genOTP();
       await saveOTP(req.user.id, newEmail.toLowerCase(), code, 'change_email', {newEmail:newEmail.toLowerCase()});
-      await sendOTPMail(newEmail.toLowerCase(), code, 'change_email');
+      sendOTPMail(newEmail.toLowerCase(), code, 'change_email').catch(e=>console.error("Mail error:",e.message));
       return res.json({success:true, requireOtp:true, message:'OTP sent to new email address'});
     }
 
@@ -574,7 +574,7 @@ app.post('/api/wallet/withdraw', auth, async (req,res) => {
       const fee=+(Math.max(1,amt*0.02)).toFixed(2), net=+(amt-fee).toFixed(2);
       const code = genOTP();
       await saveOTP(req.user.id, u.email, code, 'withdraw', {amount:amt, walletAddress, network, fee, net});
-      await sendOTPMail(u.email, code, 'withdraw');
+      sendOTPMail(u.email, code, 'withdraw').catch(e=>console.error("Mail error:",e.message));
       return res.json({success:true, requireOtp:true, message:'OTP sent to your email', data:{fee, netAmount:net}});
     }
 
