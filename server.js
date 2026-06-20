@@ -96,7 +96,20 @@ const initDB = async () => {
       token TEXT NOT NULL UNIQUE,
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
-    CREATE TABLE IF NOT EXISTS otp_codes (
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS telegram        VARCHAR(100);
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS date_of_birth   DATE;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS phone           VARCHAR(30);
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS withdrawal_pass VARCHAR(255);
+
+    CREATE TABLE IF NOT EXISTS login_history (
+      id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id    UUID REFERENCES users(id) ON DELETE CASCADE,
+      ip         VARCHAR(60),
+      device     VARCHAR(200),
+      status     VARCHAR(20) DEFAULT 'success',
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_lh_user ON login_history(user_id);
       id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       user_id    UUID REFERENCES users(id) ON DELETE CASCADE,
       email      VARCHAR(150),
@@ -367,6 +380,10 @@ app.post('/api/auth/login', limit10, async (req,res) => {
     if (!rows[0]||!await bcrypt.compare(password,rows[0].password))
       return res.status(401).json({success:false,message:'Invalid email or password'});
     await db('UPDATE users SET last_login=NOW() WHERE id=$1',[rows[0].id]);
+    // Track login history
+    const ip  = req.ip || req.headers['x-forwarded-for'] || 'Unknown';
+    const dev = req.headers['user-agent'] || 'Unknown device';
+    await db('INSERT INTO login_history(user_id,ip,device) VALUES($1,$2,$3)',[rows[0].id,ip,dev.slice(0,200)]).catch(()=>{});
     const user=cc(rows[0]), aT=signA(user.id), rT=signR(user.id);
     await db('INSERT INTO refresh_tokens(token) VALUES($1)',[rT]);
     res.json({success:true,message:'Login successful',data:{user:safe(user),accessToken:aT,refreshToken:rT}});
@@ -420,23 +437,64 @@ app.put('/api/user/profile', auth, async (req,res) => {
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
+// ── Update Personal Info ──────────────────────────────────────────────────
+app.put('/api/user/personal-info', auth, async (req,res) => {
+  try {
+    const {name, telegram, dateOfBirth, phone} = req.body;
+    await db(
+      `UPDATE users SET
+        name=COALESCE($1,name),
+        telegram=COALESCE($2,telegram),
+        date_of_birth=COALESCE($3,date_of_birth),
+        phone=COALESCE($4,phone)
+       WHERE id=$5`,
+      [name||null, telegram||null, dateOfBirth||null, phone||null, req.user.id]
+    );
+    const {rows:[u]} = await db('SELECT * FROM users WHERE id=$1',[req.user.id]);
+    res.json({success:true,message:'Profile updated',data:{user:safe(cc(u))}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── Withdrawal Password ───────────────────────────────────────────────────
+app.post('/api/user/set-withdrawal-password', auth, async (req,res) => {
+  try {
+    const {password} = req.body;
+    if (!password||password.length<6) return res.status(400).json({success:false,message:'Min 6 characters'});
+    const {rows:[u]} = await db('SELECT withdrawal_pass FROM users WHERE id=$1',[req.user.id]);
+    if (u.withdrawal_pass) return res.status(400).json({success:false,message:'Withdrawal password already set. Use change option.'});
+    await db('UPDATE users SET withdrawal_pass=$1 WHERE id=$2',[await bcrypt.hash(password,10),req.user.id]);
+    res.json({success:true,message:'Withdrawal password set successfully'});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.post('/api/user/change-withdrawal-password', auth, async (req,res) => {
+  try {
+    const {oldPassword, newPassword} = req.body;
+    if (!oldPassword||!newPassword) return res.status(400).json({success:false,message:'All fields required'});
+    if (newPassword.length<6) return res.status(400).json({success:false,message:'Min 6 characters'});
+    const {rows:[u]} = await db('SELECT withdrawal_pass FROM users WHERE id=$1',[req.user.id]);
+    if (!u.withdrawal_pass) return res.status(400).json({success:false,message:'No withdrawal password set'});
+    if (!await bcrypt.compare(oldPassword,u.withdrawal_pass)) return res.status(400).json({success:false,message:'Old password incorrect'});
+    await db('UPDATE users SET withdrawal_pass=$1 WHERE id=$2',[await bcrypt.hash(newPassword,10),req.user.id]);
+    res.json({success:true,message:'Withdrawal password changed'});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── Login History ─────────────────────────────────────────────────────────
+app.get('/api/user/login-history', auth, async (req,res) => {
+  try {
+    const {rows} = await db(
+      `SELECT * FROM login_history WHERE user_id=$1 ORDER BY created_at DESC LIMIT 20`,
+      [req.user.id]
+    );
+    res.json({success:true,data:{history:rows.map(cc)}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
 app.post('/api/user/change-password', auth, async (req,res) => {
   try {
-    const {newPassword, otp} = req.body;
-    if (!newPassword) return res.status(400).json({success:false,message:'New password required'});
-
-    // ── Step 1: send OTP ──
-    if (!otp) {
-      const code = genOTP();
-      await saveOTP(req.user.id, req.user.email, code, 'change_pass');
-      sendOTPMail(req.user.email, code, 'change_pass').catch(e=>console.error("Mail error:",e.message));
-      return res.json({success:true, requireOtp:true, message:'OTP sent to your email'});
-    }
-
-    // ── Step 2: verify OTP → change password ──
-    const valid = await verifyOTP(req.user.id, otp, 'change_pass');
-    if (!valid) return res.status(400).json({success:false,message:'Invalid or expired OTP'});
-
+    const {newPassword} = req.body;
+    if (!newPassword||newPassword.length<8) return res.status(400).json({success:false,message:'Min 8 characters'});
     await db('UPDATE users SET password=$1 WHERE id=$2',[await bcrypt.hash(newPassword,12),req.user.id]);
     await notif(req.user.id,'security','Password changed successfully','Your account password was updated.');
     res.json({success:true,message:'Password changed successfully'});
@@ -551,40 +609,25 @@ app.post('/api/wallet/deposit', auth, async (req,res) => {
 
 app.post('/api/wallet/withdraw', auth, async (req,res) => {
   try {
-    const {amount,walletAddress,network,otp} = req.body;
+    const {amount,walletAddress,network,withdrawalPassword} = req.body;
     const MIN=parseFloat(process.env.WITHDRAWAL_MIN)||10, MAX=parseFloat(process.env.WITHDRAWAL_MAX)||10000;
     const amt=parseFloat(amount);
     if (!amt||amt<MIN) return res.status(400).json({success:false,message:`Min withdrawal $${MIN}`});
     if (amt>MAX)       return res.status(400).json({success:false,message:`Max withdrawal $${MAX}`});
     if (!walletAddress)return res.status(400).json({success:false,message:'Wallet address required'});
-    const {rows:[u]}=await db('SELECT balance,email FROM users WHERE id=$1',[req.user.id]);
+    const {rows:[u]}=await db('SELECT balance,email,withdrawal_pass,wallet_address FROM users WHERE id=$1',[req.user.id]);
     if (parseFloat(u.balance)<amt) return res.status(400).json({success:false,message:'Insufficient balance'});
+    // Withdrawal password required
+    if (!u.withdrawal_pass) return res.status(400).json({success:false,message:'Please set a withdrawal password first in Profile → Security'});
+    if (!withdrawalPassword) return res.status(400).json({success:false,message:'Withdrawal password required'});
+    if (!await bcrypt.compare(withdrawalPassword,u.withdrawal_pass)) return res.status(400).json({success:false,message:'Incorrect withdrawal password'});
 
-    // ── Step 1: send OTP ──
-    if (!otp) {
-      const fee=+(Math.max(1,amt*0.02)).toFixed(2), net=+(amt-fee).toFixed(2);
-      const code = genOTP();
-      await saveOTP(req.user.id, u.email, code, 'withdraw', {amount:amt, walletAddress, network, fee, net});
-      sendOTPMail(u.email, code, 'withdraw').catch(e=>console.error("Mail error:",e.message));
-      return res.json({success:true, requireOtp:true, message:'OTP sent to your email', data:{fee, netAmount:net}});
-    }
-
-    // ── Step 2: verify OTP → process withdrawal ──
-    const valid = await verifyOTP(req.user.id, otp, 'withdraw');
-    if (!valid) return res.status(400).json({success:false,message:'Invalid or expired OTP'});
-
-    const meta = valid.meta || {};
-    const finalAmt = parseFloat(meta.amount||amt);
-    const finalAddr = meta.walletAddress||walletAddress;
-    const finalNet  = meta.network||network;
-    const fee  = parseFloat(meta.fee)||+(Math.max(1,finalAmt*0.02)).toFixed(2);
-    const net  = parseFloat(meta.net)||+(finalAmt-fee).toFixed(2);
-
-    await db('UPDATE users SET balance=balance-$1,total_withdrawn=total_withdrawn+$2 WHERE id=$3',[finalAmt,net,req.user.id]);
+    const fee=+(Math.max(1,amt*0.02)).toFixed(2), net=+(amt-fee).toFixed(2);
+    await db('UPDATE users SET balance=balance-$1,total_withdrawn=total_withdrawn+$2 WHERE id=$3',[amt,net,req.user.id]);
     const {rows}=await db(
       `INSERT INTO transactions(user_id,type,amount,status,description,meta)
        VALUES($1,'withdrawal',$2,'processing',$3,$4) RETURNING *`,
-      [req.user.id,net,`Withdrawal to ${finalAddr}`,JSON.stringify({walletAddress:finalAddr,network:finalNet,fee})]
+      [req.user.id,net,`Withdrawal to ${walletAddress}`,JSON.stringify({walletAddress,network,fee})]
     );
     await notif(req.user.id,'withdrawal','Withdrawal Processing',`$${net} USDT sent. 1-24h processing.`);
     res.status(201).json({success:true,message:`$${net} withdrawal submitted`,data:{transaction:cc(rows[0]),fee,netAmount:net}});
