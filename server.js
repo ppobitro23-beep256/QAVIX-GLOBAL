@@ -403,7 +403,7 @@ app.get('/api/referral/info', auth, async (req,res) => {
   try {
     const {rows}=await db('SELECT referral_code FROM users WHERE id=$1',[req.user.id]);
     const code=rows[0].referral_code;
-    res.json({success:true,data:{referralCode:code,referralLink:`https://qavix.io/ref/${code}`,commissionRates:COMM}});
+    res.json({success:true,data:{referralCode:code,referralLink:`https://qavix.pages.dev/ref/${code}`,commissionRates:COMM}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
@@ -528,6 +528,50 @@ app.get('/api/stats/leaderboard', async (_,res) => {
 app.use((_,res)=>res.status(404).json({success:false,message:'Route not found'}));
 app.use((e,req,res,_)=>{console.error(e.message); res.status(500).json({success:false,message:e.message});});
 
+// ── Daily Profit Cron ────────────────────────────────────────────────────
+const runDailyProfits = async () => {
+  if (!pool) return;
+  try {
+    const { rows } = await db(
+      `SELECT * FROM investments WHERE status='active' AND end_date > NOW()`
+    );
+    let count = 0;
+    for (const inv of rows) {
+      // Credit daily income to user balance
+      await db(
+        `UPDATE users SET balance=balance+$1 WHERE id=$2`,
+        [inv.daily_income, inv.user_id]
+      );
+      // Update investment progress
+      await db(
+        `UPDATE investments SET days_elapsed=days_elapsed+1, earned_so_far=earned_so_far+$1 WHERE id=$2`,
+        [inv.daily_income, inv.id]
+      );
+      // Record transaction
+      await db(
+        `INSERT INTO transactions(user_id,type,amount,description,meta)
+         VALUES($1,'profit',$2,$3,$4)`,
+        [inv.user_id, inv.daily_income,
+         `Daily profit — ${inv.plan_name}`,
+         JSON.stringify({ investmentId: inv.id, planId: inv.plan_id })]
+      );
+      // Send notification
+      await notif(inv.user_id, 'profit', 'Daily profit credited 💰',
+        `$${parseFloat(inv.daily_income).toFixed(2)} from ${inv.plan_name}`);
+      // Mark completed if all days done
+      await db(
+        `UPDATE investments SET status='completed'
+         WHERE id=$1 AND days_elapsed >= days_total`,
+        [inv.id]
+      );
+      count++;
+    }
+    console.log(`✅ Daily profits credited: ${count} investments`);
+  } catch (e) {
+    console.error('❌ Daily profit error:', e.message);
+  }
+};
+
 // ── Start ─────────────────────────────────────────────────────────────────
 initDB().then(()=>{
   app.listen(PORT,()=>{
@@ -537,6 +581,11 @@ initDB().then(()=>{
   ║  Port : ${PORT}  |  DB: ${pool?'Neon ✅':'No DB ⚠️'}        ║
   ╚══════════════════════════════════════════╝`);
   });
+
+  // Run daily profits every 24 hours
+  // First run 10s after startup (catches up if server was down)
+  setTimeout(runDailyProfits, 10_000);
+  setInterval(runDailyProfits, 24 * 60 * 60 * 1000);
 });
 
 module.exports = app;
