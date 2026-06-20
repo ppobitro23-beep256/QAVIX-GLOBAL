@@ -111,6 +111,17 @@ const initDB = async () => {
     );
     CREATE INDEX IF NOT EXISTS idx_lh_user ON login_history(user_id);
 
+    CREATE TABLE IF NOT EXISTS checkin_log (
+      id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id      UUID REFERENCES users(id) ON DELETE CASCADE,
+      checkin_date DATE NOT NULL,
+      amount       DECIMAL(10,4) NOT NULL,
+      is_bonus     BOOLEAN DEFAULT FALSE,
+      created_at   TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(user_id, checkin_date)
+    );
+    CREATE INDEX IF NOT EXISTS idx_cl_user ON checkin_log(user_id);
+
     CREATE TABLE IF NOT EXISTS otp_codes (
       user_id    UUID REFERENCES users(id) ON DELETE CASCADE,
       email      VARCHAR(150),
@@ -727,7 +738,80 @@ const claimReward = async (req,res,rewardId) => {
   } catch(e){res.status(500).json({success:false,message:e.message});}
 };
 
-app.post('/api/rewards/checkin', auth, (req,res) => claimReward(req,res,'daily'));
+app.post('/api/rewards/checkin', auth, async (req,res) => {
+  try {
+    const today = new Date().toISOString().slice(0,10); // YYYY-MM-DD
+    const dayOfWeek = new Date().getDay(); // 0=Sunday
+    const isSunday  = dayOfWeek === 0;
+    const amount    = isSunday ? 0.05 : 0.01;
+
+    // Check already checked in today
+    const {rows:ex} = await db(
+      'SELECT id FROM checkin_log WHERE user_id=$1 AND checkin_date=$2',
+      [req.user.id, today]
+    );
+    if (ex[0]) return res.status(400).json({success:false,message:'Already checked in today! Come back tomorrow.'});
+
+    // Record check-in
+    await db(
+      'INSERT INTO checkin_log(user_id,checkin_date,amount,is_bonus) VALUES($1,$2,$3,$4)',
+      [req.user.id, today, amount, isSunday]
+    );
+    // Credit balance
+    await db('UPDATE users SET balance=balance+$1 WHERE id=$2',[amount,req.user.id]);
+    await db(`INSERT INTO transactions(user_id,type,amount,description) VALUES($1,'bonus',$2,$3)`,
+      [req.user.id, amount, isSunday ? 'Sunday Bonus Check-in 🎉' : 'Daily Check-in']);
+    await notif(req.user.id,'bonus', isSunday ? 'Sunday Bonus! 🎉' : 'Daily Check-in',
+      `+$${amount.toFixed(2)} credited to your balance`);
+
+    res.json({success:true,
+      message: isSunday ? `🎉 Sunday Bonus! +$${amount.toFixed(2)} credited!` : `✅ Check-in done! +$${amount.toFixed(2)} credited!`,
+      data:{ amount, isSunday }
+    });
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// Check-in weekly status
+app.get('/api/rewards/checkin-status', auth, async (req,res) => {
+  try {
+    // Get last 7 days of check-ins
+    const {rows} = await db(
+      `SELECT checkin_date, amount, is_bonus FROM checkin_log
+       WHERE user_id=$1 AND checkin_date >= CURRENT_DATE - INTERVAL '6 days'
+       ORDER BY checkin_date ASC`,
+      [req.user.id]
+    );
+    const today    = new Date().toISOString().slice(0,10);
+    const checkedToday = rows.some(r => r.checkin_date?.toISOString?.()?.slice(0,10) === today ||
+                                        String(r.checkin_date).slice(0,10) === today);
+    // Build week data (Mon to Sun)
+    const week = [];
+    for (let i=6; i>=0; i--) {
+      const d = new Date(); d.setDate(d.getDate()-i);
+      const ds = d.toISOString().slice(0,10);
+      const rec = rows.find(r=>String(r.checkin_date).slice(0,10)===ds);
+      week.push({
+        date: ds,
+        day: ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][d.getDay()],
+        dayNum: d.getDate(),
+        isToday: ds===today,
+        isSunday: d.getDay()===0,
+        checked: !!rec,
+        amount: rec ? parseFloat(rec.amount) : (d.getDay()===0 ? 0.05 : 0.01),
+        isBonus: rec ? rec.is_bonus : d.getDay()===0,
+      });
+    }
+    // Streak
+    let streak=0;
+    const sorted=[...rows].sort((a,b)=>String(b.checkin_date).localeCompare(String(a.checkin_date)));
+    for(let i=0;i<sorted.length;i++){
+      const exp=new Date(); exp.setDate(exp.getDate()-i);
+      if(String(sorted[i]?.checkin_date).slice(0,10)===exp.toISOString().slice(0,10)) streak++;
+      else break;
+    }
+    res.json({success:true,data:{week,streak,checkedToday,totalEarned:rows.reduce((s,r)=>s+parseFloat(r.amount),0)}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
 app.post('/api/rewards/claim', auth, (req,res) => claimReward(req,res,req.body.rewardId));
 
 app.post('/api/rewards/lucky', auth, async (req,res) => {
