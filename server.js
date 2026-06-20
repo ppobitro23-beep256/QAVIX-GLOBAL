@@ -15,6 +15,9 @@ const nodemailer   = require('nodemailer');
 const app  = express();
 const PORT = process.env.PORT || 5000;
 
+// Trust Render's proxy
+app.set('trust proxy', 1);
+
 // ── Neon PostgreSQL pool ─────────────────────────────────────────────────
 const pool = process.env.DATABASE_URL
   ? new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } })
@@ -146,12 +149,14 @@ const sendOTPMail = async (toEmail, otp, purpose) => {
     change_email : '📧 QAVIX — Email Change OTP',
     withdraw     : '💸 QAVIX — Withdrawal Confirmation OTP',
     login_2fa    : '🔑 QAVIX — Login Verification OTP',
+    forgot_pass  : '🔓 QAVIX — Password Reset OTP',
   };
   const actions = {
     change_pass  : 'change your password',
     change_email : 'change your email address',
     withdraw     : 'confirm your withdrawal',
     login_2fa    : 'complete your login',
+    forgot_pass  : 'reset your password',
   };
   await mailer.sendMail({
     from    : `"QAVIX GLOBAL" <${process.env.MAIL_USER}>`,
@@ -318,7 +323,35 @@ app.post('/api/auth/register', limit10, async (req,res) => {
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
-app.post('/api/auth/login', limit10, async (req,res) => {
+// ── Forgot Password ───────────────────────────────────────────────────────
+app.post('/api/auth/forgot-password', limit10, async (req,res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({success:false,message:'Email required'});
+    const { rows } = await db('SELECT * FROM users WHERE email=$1',[email.toLowerCase()]);
+    // Always return success (don't reveal if email exists)
+    if (!rows[0]) return res.json({success:true,requireOtp:true,message:'If this email exists, an OTP has been sent'});
+    const user = rows[0];
+    const code = genOTP();
+    await saveOTP(user.id, user.email, code, 'forgot_pass');
+    await sendOTPMail(user.email, code, 'forgot_pass');
+    res.json({success:true,requireOtp:true,message:'OTP sent to your email'});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.post('/api/auth/reset-password', limit10, async (req,res) => {
+  try {
+    const { email, otp, newPassword } = req.body;
+    if (!email||!otp||!newPassword) return res.status(400).json({success:false,message:'All fields required'});
+    const { rows } = await db('SELECT * FROM users WHERE email=$1',[email.toLowerCase()]);
+    if (!rows[0]) return res.status(400).json({success:false,message:'Invalid request'});
+    const valid = await verifyOTP(rows[0].id, otp, 'forgot_pass');
+    if (!valid) return res.status(400).json({success:false,message:'Invalid or expired OTP'});
+    await db('UPDATE users SET password=$1 WHERE id=$2',[await bcrypt.hash(newPassword,12),rows[0].id]);
+    await notif(rows[0].id,'security','Password Reset','Your password was reset successfully.');
+    res.json({success:true,message:'Password reset successful. Please login.'});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
   try {
     const {email,password,otp} = req.body;
     if (!email||!password) return res.status(400).json({success:false,message:'Email and password required'});
