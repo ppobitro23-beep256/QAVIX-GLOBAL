@@ -352,6 +352,8 @@ app.post('/api/auth/reset-password', limit10, async (req,res) => {
     res.json({success:true,message:'Password reset successful. Please login.'});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
+
+app.post('/api/auth/login', limit10, async (req,res) => {
   try {
     const {email,password,otp} = req.body;
     if (!email||!password) return res.status(400).json({success:false,message:'Email and password required'});
