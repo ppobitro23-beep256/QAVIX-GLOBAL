@@ -110,7 +110,8 @@ const initDB = async () => {
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
     CREATE INDEX IF NOT EXISTS idx_lh_user ON login_history(user_id);
-      id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    CREATE TABLE IF NOT EXISTS otp_codes (
       user_id    UUID REFERENCES users(id) ON DELETE CASCADE,
       email      VARCHAR(150),
       code       VARCHAR(6)  NOT NULL,
