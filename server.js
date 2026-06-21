@@ -702,13 +702,27 @@ app.get('/api/referral/team', auth, async (req,res) => {
 
 app.get('/api/referral/earnings', auth, async (req,res) => {
   try {
-    const [{rows:[u]},{rows:tx},{rows:[agg]}]=await Promise.all([
+    const [{rows:[u]},{rows:tx},{rows:[agg]},{rows:lvlRows}]=await Promise.all([
       db('SELECT pending_earnings FROM users WHERE id=$1',[req.user.id]),
       db("SELECT * FROM transactions WHERE user_id=$1 AND type='commission' ORDER BY created_at DESC LIMIT 20",[req.user.id]),
       db("SELECT COALESCE(SUM(amount),0) AS total FROM transactions WHERE user_id=$1 AND type='commission'",[req.user.id]),
+      db(`SELECT meta->>'lvl' AS lvl, COALESCE(SUM(amount),0) AS earned
+          FROM transactions WHERE user_id=$1 AND type='commission' AND meta->>'lvl' IS NOT NULL
+          GROUP BY meta->>'lvl' ORDER BY lvl`,[req.user.id]),
     ]);
     const total=parseFloat(agg.total), avail=parseFloat(u.pending_earnings);
-    res.json({success:true,data:{totalEarned:+total.toFixed(2),available:+avail.toFixed(2),collected:+(total-avail).toFixed(2),recentCommissions:ccAll(tx)}});
+    const byLevel={};
+    lvlRows.forEach(r=>{ byLevel[r.lvl]=parseFloat(r.earned); });
+    res.json({success:true,data:{
+      totalEarned:+total.toFixed(2),
+      available:+avail.toFixed(2),
+      pendingEarnings:+avail.toFixed(2),
+      availableEarnings:+avail.toFixed(2),
+      totalCollected:+(total-avail).toFixed(2),
+      collected:+(total-avail).toFixed(2),
+      byLevel,
+      recentCommissions:ccAll(tx)
+    }});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
