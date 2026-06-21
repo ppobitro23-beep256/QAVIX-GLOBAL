@@ -649,7 +649,7 @@ app.get('/api/referral/info', auth, async (req,res) => {
   try {
     const {rows}=await db('SELECT referral_code FROM users WHERE id=$1',[req.user.id]);
     const code=rows[0].referral_code;
-    res.json({success:true,data:{referralCode:code,referralLink:`https://qavixglobal.pages.dev/ref/${code}`,commissionRates:COMM}});
+    res.json({success:true,data:{referralCode:code,referralLink:`https://qavixglobal.pages.dev/?ref=${code}`,commissionRates:COMM}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
