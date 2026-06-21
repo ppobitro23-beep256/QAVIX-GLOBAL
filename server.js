@@ -326,16 +326,14 @@ app.post('/api/auth/register', limit10, async (req,res) => {
   try {
     const {name,email,phone,password,referralCode} = req.body;
     if (!name||!email||!password) return res.status(400).json({success:false,message:'Name, email and password required'});
+    if (!referralCode) return res.status(400).json({success:false,message:'Referral code is required to register'});
 
     const {rows:ex} = await db('SELECT id FROM users WHERE email=$1',[email.toLowerCase()]);
     if (ex[0]) return res.status(409).json({success:false,message:'Email already registered'});
 
-    let referredBy = null;
-    if (referralCode) {
-      const {rows:r} = await db('SELECT id FROM users WHERE referral_code=$1',[referralCode]);
-      if (!r[0]) return res.status(400).json({success:false,message:'Invalid referral code'});
-      referredBy = r[0].id;
-    }
+    const {rows:r} = await db('SELECT id FROM users WHERE referral_code=$1',[referralCode.toUpperCase()]);
+    if (!r[0]) return res.status(400).json({success:false,message:'Invalid referral code. Please check and try again.'});
+    const referredBy = r[0].id;
 
     const hash  = await bcrypt.hash(password,12);
     const uid   = 'QVX-'+Math.floor(100000+Math.random()*900000);
