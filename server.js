@@ -123,21 +123,31 @@ const initDB = async () => {
     CREATE INDEX IF NOT EXISTS idx_cl_user ON checkin_log(user_id);
 
     CREATE TABLE IF NOT EXISTS otp_codes (
-      user_id    UUID REFERENCES users(id) ON DELETE CASCADE,
-      email      VARCHAR(150),
-      code       VARCHAR(6)  NOT NULL,
-      purpose    VARCHAR(30) NOT NULL,
-      meta       JSONB DEFAULT '{}',
-      used       BOOLEAN DEFAULT FALSE,
-      expires_at TIMESTAMPTZ NOT NULL,
-      created_at TIMESTAMPTZ DEFAULT NOW()
+      id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id     UUID REFERENCES users(id) ON DELETE CASCADE,
+      email       VARCHAR(150) NOT NULL,
+      code_hash   VARCHAR(255) NOT NULL,
+      purpose     VARCHAR(30)  NOT NULL,
+      meta        JSONB DEFAULT '{}',
+      used        BOOLEAN DEFAULT FALSE,
+      attempts    INTEGER DEFAULT 0,
+      expires_at  TIMESTAMPTZ NOT NULL,
+      created_at  TIMESTAMPTZ DEFAULT NOW()
     );
-    CREATE INDEX IF NOT EXISTS idx_users_email    ON users(email);
-    CREATE INDEX IF NOT EXISTS idx_users_ref      ON users(referral_code);
-    CREATE INDEX IF NOT EXISTS idx_inv_user       ON investments(user_id);
-    CREATE INDEX IF NOT EXISTS idx_tx_user        ON transactions(user_id);
-    CREATE INDEX IF NOT EXISTS idx_notif_user     ON notifications(user_id);
-    CREATE INDEX IF NOT EXISTS idx_otp_user       ON otp_codes(user_id);
+    ALTER TABLE otp_codes ADD COLUMN IF NOT EXISTS id         UUID DEFAULT gen_random_uuid();
+    ALTER TABLE otp_codes ADD COLUMN IF NOT EXISTS code_hash  VARCHAR(255);
+    ALTER TABLE otp_codes ADD COLUMN IF NOT EXISTS attempts   INTEGER DEFAULT 0;
+
+    CREATE TABLE IF NOT EXISTS otp_rate_limit (
+      id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      email     VARCHAR(150) NOT NULL,
+      purpose   VARCHAR(30)  NOT NULL,
+      sent_at   TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_otp_email   ON otp_codes(email);
+    CREATE INDEX IF NOT EXISTS idx_otp_purpose ON otp_codes(purpose);
+    CREATE INDEX IF NOT EXISTS idx_orl_email   ON otp_rate_limit(email);
   `);
   console.log('✅ Neon DB tables ready');
 };
@@ -157,92 +167,183 @@ const safe   = (u) => { const r={...u}; delete r.password; return r; };
 const notif  = (uid,type,title,body='') =>
   db('INSERT INTO notifications(user_id,type,title,body) VALUES($1,$2,$3,$4)',[uid,type,title,body]).catch(()=>{});
 
-// ── Resend Email Setup (HTTP API — works on all hosts) ───────────────────
-const sendOTPMail = async (toEmail, otp, purpose) => {
-  const subjects = {
-    change_pass  : '🔐 QAVIX — Password Change OTP',
-    change_email : '📧 QAVIX — Email Change OTP',
-    withdraw     : '💸 QAVIX — Withdrawal Confirmation OTP',
-    login_2fa    : '🔑 QAVIX — Login Verification OTP',
-    forgot_pass  : '🔓 QAVIX — Password Reset OTP',
-  };
-  const actions = {
-    change_pass  : 'change your password',
-    change_email : 'change your email address',
-    withdraw     : 'confirm your withdrawal',
-    login_2fa    : 'complete your login',
-    forgot_pass  : 'reset your password',
-  };
+// ── Brevo SMTP Email Service ─────────────────────────────────────────────
+const nodemailer = require('nodemailer');
 
-  const html = `
-    <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;background:#0d0d0d;border-radius:16px;overflow:hidden">
-      <div style="background:linear-gradient(135deg,#111,#1c1208);padding:28px 32px;text-align:center;border-bottom:1px solid rgba(201,162,39,0.2)">
-        <div style="font-size:22px;font-weight:800;color:#fff;letter-spacing:.1em">QAVIX <span style="color:#C9A227">GLOBAL</span></div>
-        <div style="font-size:12px;color:#666;margin-top:4px;letter-spacing:.06em">PREMIUM INVESTMENT PLATFORM</div>
-      </div>
-      <div style="padding:32px;text-align:center">
-        <div style="font-size:14px;color:#888;margin-bottom:8px">Your OTP to ${actions[purpose]||'verify your action'}:</div>
-        <div style="font-size:48px;font-weight:800;color:#C9A227;letter-spacing:.18em;margin:16px 0">${otp}</div>
-        <div style="background:rgba(201,162,39,0.08);border:1px solid rgba(201,162,39,0.2);border-radius:10px;padding:12px 20px;display:inline-block;margin-top:8px">
-          <div style="font-size:12px;color:#888">⏱ Expires in <strong style="color:#C9A227">${OTP_EXPIRES} minutes</strong></div>
-        </div>
-        <div style="font-size:12px;color:#555;margin-top:24px;line-height:1.7">
-          If you did not request this, please ignore this email.<br>
-          Never share this OTP with anyone.
-        </div>
-      </div>
-      <div style="padding:16px 32px;border-top:1px solid rgba(255,255,255,0.06);text-align:center">
-        <div style="font-size:11px;color:#444">© 2025 QAVIX GLOBAL · All rights reserved</div>
-      </div>
-    </div>`;
+const mailer = nodemailer.createTransport({
+  host    : 'smtp-relay.brevo.com',
+  port    : 587,
+  secure  : false,
+  auth    : {
+    user  : process.env.BREVO_SMTP_USER,
+    pass  : process.env.BREVO_SMTP_PASS,
+  },
+  tls: { rejectUnauthorized: false }
+});
 
-  const res = await fetch('https://api.resend.com/emails', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-      from: 'QAVIX GLOBAL <onboarding@resend.dev>',
-      to: [toEmail],
-      subject: subjects[purpose] || '🔐 QAVIX — Verification OTP',
-      html
-    })
-  });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.message || 'Mail send failed');
-  console.log('✅ OTP mail sent to:', toEmail);
+mailer.verify((err) => {
+  if (err) console.error('❌ Brevo SMTP Error:', err.message);
+  else     console.log('✅ Brevo SMTP Ready:', process.env.BREVO_SMTP_USER);
+});
+
+// ── OTP Config ───────────────────────────────────────────────────────────
+const OTP_CONFIG = {
+  register          : { expiry: 5,  subject: '📧 Verify Your QAVIX Account',       action: 'verify your registration'     },
+  login             : { expiry: 5,  subject: '🔑 QAVIX Login Verification',         action: 'complete your login'           },
+  withdraw          : { expiry: 3,  subject: '💸 QAVIX Withdrawal Confirmation',    action: 'confirm your withdrawal'       },
+  password_reset    : { expiry: 10, subject: '🔓 QAVIX Password Reset',             action: 'reset your password'           },
+  withdraw_password : { expiry: 5,  subject: '🔐 QAVIX Withdrawal Password Change', action: 'change your withdrawal password'},
+  change_email      : { expiry: 5,  subject: '📧 QAVIX Email Change Verification',  action: 'change your email'             },
 };
 
-const OTP_EXPIRES = parseInt(process.env.OTP_EXPIRES_MIN) || 10;
+const MAX_RESENDS   = 3;   // max resend attempts in 10 minutes
+const MAX_ATTEMPTS  = 5;   // max wrong OTP attempts before invalidation
 
-const genOTP = () => Math.floor(100000 + Math.random() * 900000).toString();
+// ── Email Template ───────────────────────────────────────────────────────
+const buildOTPEmail = (otp, purpose, expiryMin) => `
+<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"></head>
+<body style="margin:0;padding:20px;background:#0a0a0a;font-family:Arial,sans-serif">
+  <div style="max-width:480px;margin:0 auto;background:#111;border-radius:20px;overflow:hidden;border:1px solid rgba(201,162,39,0.15)">
 
-const saveOTP = async (userId, email, otp, purpose, meta={}) => {
-  // Invalidate any existing unused OTPs for same user+purpose
-  await db(
-    `UPDATE otp_codes SET used=TRUE WHERE user_id=$1 AND purpose=$2 AND used=FALSE`,
-    [userId, purpose]
+    <!-- Header -->
+    <div style="background:linear-gradient(135deg,#0d0d0d 0%,#1a1208 100%);padding:28px 32px;text-align:center;border-bottom:1px solid rgba(201,162,39,0.2)">
+      <div style="display:inline-flex;align-items:center;gap:10px">
+        <div style="width:36px;height:36px;background:rgba(201,162,39,0.15);border-radius:10px;display:flex;align-items:center;justify-content:center">
+          <span style="font-size:18px">⚡</span>
+        </div>
+        <div>
+          <div style="font-size:18px;font-weight:900;color:#fff;letter-spacing:.12em">QAVIX <span style="color:#C9A227">GLOBAL</span></div>
+          <div style="font-size:9px;color:rgba(255,255,255,0.35);letter-spacing:.15em;margin-top:1px">PREMIUM INVESTMENT PLATFORM</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Body -->
+    <div style="padding:36px 32px;text-align:center">
+      <div style="font-size:13px;color:#888;margin-bottom:6px;letter-spacing:.05em;text-transform:uppercase">Your verification code to</div>
+      <div style="font-size:15px;color:#bbb;margin-bottom:24px">${OTP_CONFIG[purpose]?.action||'verify your action'}</div>
+
+      <!-- OTP Box -->
+      <div style="background:rgba(201,162,39,0.06);border:1.5px solid rgba(201,162,39,0.25);border-radius:16px;padding:24px 32px;margin:0 auto 24px;display:inline-block">
+        <div style="font-size:44px;font-weight:900;color:#C9A227;letter-spacing:.22em;font-family:monospace">${otp}</div>
+      </div>
+
+      <!-- Expiry -->
+      <div style="display:inline-flex;align-items:center;gap:8px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:999px;padding:8px 18px;margin-bottom:24px">
+        <span style="font-size:14px">⏱</span>
+        <span style="font-size:12px;color:#999">Expires in <strong style="color:#C9A227">${expiryMin} minutes</strong></span>
+      </div>
+
+      <!-- Warning -->
+      <div style="background:rgba(239,68,68,0.06);border:1px solid rgba(239,68,68,0.15);border-radius:12px;padding:14px 18px;text-align:left">
+        <div style="font-size:12px;color:#f87171;font-weight:700;margin-bottom:4px">⚠️ Security Notice</div>
+        <div style="font-size:11px;color:#888;line-height:1.6">
+          Never share this OTP with anyone, including QAVIX support.<br>
+          If you did not request this, please ignore this email.
+        </div>
+      </div>
+    </div>
+
+    <!-- Footer -->
+    <div style="padding:16px 32px;border-top:1px solid rgba(255,255,255,0.06);text-align:center">
+      <div style="font-size:10px;color:#444">© 2025 QAVIX GLOBAL · All rights reserved</div>
+      <div style="font-size:10px;color:#333;margin-top:3px">This is an automated message. Do not reply.</div>
+    </div>
+  </div>
+</body>
+</html>`;
+
+// ── OTP Service ──────────────────────────────────────────────────────────
+
+// Generate secure 6-digit OTP
+const genOTP = () => String(Math.floor(100000 + Math.random() * 900000));
+
+// Rate limit check — max 3 sends per email+purpose in 10 minutes
+const checkOTPRateLimit = async (email, purpose) => {
+  const { rows } = await db(
+    `SELECT COUNT(*) AS cnt FROM otp_rate_limit
+     WHERE email=$1 AND purpose=$2 AND sent_at > NOW() - INTERVAL '10 minutes'`,
+    [email, purpose]
   );
-  await db(
-    `INSERT INTO otp_codes(user_id,email,code,purpose,meta,expires_at)
-     VALUES($1,$2,$3,$4,$5,NOW()+INTERVAL '${OTP_EXPIRES} minutes')`,
-    [userId, email, otp, purpose, JSON.stringify(meta)]
-  );
+  if (parseInt(rows[0].cnt) >= MAX_RESENDS)
+    throw new Error(`Too many OTP requests. Please wait 10 minutes before trying again.`);
 };
 
-const verifyOTP = async (userId, code, purpose) => {
+// Save OTP (hashed) and record rate limit
+const saveOTP = async (userId, email, otp, purpose, meta={}, expiryMin) => {
+  const min = expiryMin || OTP_CONFIG[purpose]?.expiry || 5;
+  // Invalidate previous OTPs for same email+purpose
+  await db(
+    `UPDATE otp_codes SET used=TRUE WHERE email=$1 AND purpose=$2 AND used=FALSE`,
+    [email, purpose]
+  );
+  const codeHash = await bcrypt.hash(otp, 8);
+  const { rows } = await db(
+    `INSERT INTO otp_codes(user_id,email,code_hash,purpose,meta,expires_at)
+     VALUES($1,$2,$3,$4,$5,NOW()+INTERVAL '${min} minutes') RETURNING id`,
+    [userId||null, email, codeHash, purpose, JSON.stringify(meta)]
+  );
+  // Record rate limit
+  await db(
+    `INSERT INTO otp_rate_limit(email,purpose) VALUES($1,$2)`,
+    [email, purpose]
+  );
+  return rows[0].id;
+};
+
+// Verify OTP — check hash, expiry, attempts
+const verifyOTP = async (email, code, purpose) => {
   const { rows } = await db(
     `SELECT * FROM otp_codes
-     WHERE user_id=$1 AND code=$2 AND purpose=$3
-       AND used=FALSE AND expires_at > NOW()
+     WHERE email=$1 AND purpose=$2 AND used=FALSE AND expires_at>NOW()
      ORDER BY created_at DESC LIMIT 1`,
-    [userId, code, purpose]
+    [email, purpose]
   );
-  if (!rows[0]) return null;
+  if (!rows[0]) throw new Error('OTP expired or not found. Please request a new one.');
+  if (rows[0].attempts >= MAX_ATTEMPTS) {
+    await db(`UPDATE otp_codes SET used=TRUE WHERE id=$1`, [rows[0].id]);
+    throw new Error('Too many wrong attempts. Please request a new OTP.');
+  }
+  const match = await bcrypt.compare(code, rows[0].code_hash);
+  if (!match) {
+    await db(`UPDATE otp_codes SET attempts=attempts+1 WHERE id=$1`, [rows[0].id]);
+    const left = MAX_ATTEMPTS - rows[0].attempts - 1;
+    throw new Error(`Invalid OTP. ${left} attempt${left===1?'':'s'} remaining.`);
+  }
   await db(`UPDATE otp_codes SET used=TRUE WHERE id=$1`, [rows[0].id]);
   return rows[0];
 };
+
+// Send OTP email via Brevo SMTP
+const sendOTPMail = async (toEmail, otp, purpose) => {
+  const cfg = OTP_CONFIG[purpose] || { subject:'🔐 QAVIX Verification', expiry:5 };
+  await mailer.sendMail({
+    from    : `"QAVIX GLOBAL" <${process.env.BREVO_SMTP_USER}>`,
+    to      : toEmail,
+    subject : cfg.subject,
+    html    : buildOTPEmail(otp, purpose, cfg.expiry),
+  });
+  console.log(`✅ OTP sent [${purpose}] → ${toEmail}`);
+};
+
+// Combined: generate + save + send
+const issueOTP = async (userId, email, purpose, meta={}) => {
+  await checkOTPRateLimit(email, purpose);
+  const otp = genOTP();
+  await saveOTP(userId, email, otp, purpose, meta);
+  sendOTPMail(email, otp, purpose).catch(e => console.error('Mail error:', e.message));
+  return otp; // only for internal use, never expose to client
+};
+
+// Auto-cleanup expired OTPs (runs every hour)
+setInterval(async () => {
+  try {
+    await db(`DELETE FROM otp_codes WHERE expires_at < NOW() OR (used=TRUE AND created_at < NOW()-INTERVAL '1 day')`);
+    await db(`DELETE FROM otp_rate_limit WHERE sent_at < NOW()-INTERVAL '10 minutes'`);
+  } catch(e){}
+}, 60 * 60 * 1000);
 
 // ── JWT ───────────────────────────────────────────────────────────────────
 const signA = (id) => jwt.sign({id}, process.env.JWT_SECRET,         {expiresIn: process.env.JWT_EXPIRES_IN  ||'7d'});
@@ -322,33 +423,54 @@ app.get('/',           (_,res)=>res.json({success:true,message:'🏦 QAVIX GLOBA
 app.get('/api/health', (_,res)=>res.json({success:true,status:'healthy',uptime:process.uptime()}));
 
 // ── Auth ─────────────────────────────────────────────────────────────────
-app.post('/api/auth/register', limit10, async (req,res) => {
+// ── Registration — Step 1: Send OTP ──────────────────────────────────────
+app.post('/api/auth/register/send-otp', limit10, async (req,res) => {
   try {
-    const {name,email,phone,password,referralCode} = req.body;
+    const {name,email,password,phone,referralCode} = req.body;
     if (!name||!email||!password) return res.status(400).json({success:false,message:'Name, email and password required'});
-    if (!referralCode) return res.status(400).json({success:false,message:'Referral code is required to register'});
+    if (!referralCode) return res.status(400).json({success:false,message:'Referral code is required'});
+    if (password.length < 8) return res.status(400).json({success:false,message:'Password must be at least 8 characters'});
 
     const {rows:ex} = await db('SELECT id FROM users WHERE email=$1',[email.toLowerCase()]);
     if (ex[0]) return res.status(409).json({success:false,message:'Email already registered'});
 
     const {rows:r} = await db('SELECT id FROM users WHERE referral_code=$1',[referralCode.toUpperCase()]);
-    if (!r[0]) return res.status(400).json({success:false,message:'Invalid referral code. Please check and try again.'});
-    const referredBy = r[0].id;
+    if (!r[0]) return res.status(400).json({success:false,message:'Invalid referral code'});
 
-    const hash  = await bcrypt.hash(password,12);
-    const uid   = 'QVX-'+Math.floor(100000+Math.random()*900000);
-    const rCode = name.slice(0,2).toUpperCase()+uid.split('-')[1];
+    await issueOTP(null, email.toLowerCase(), 'register', {name,email:email.toLowerCase(),password,phone,referralCode:referralCode.toUpperCase(),referredBy:r[0].id});
+    res.json({success:true,requireOtp:true,message:'OTP sent to your email. Valid for 5 minutes.'});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
 
-    const {rows} = await db(
-      `INSERT INTO users(name,email,phone,password,uid,referral_code,referred_by) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
-      [name,email.toLowerCase(),phone||'',hash,uid,rCode,referredBy]
+// ── Registration — Step 2: Verify OTP + Create Account ───────────────────
+app.post('/api/auth/register', limit10, async (req,res) => {
+  try {
+    const {email, otp} = req.body;
+    if (!email||!otp) return res.status(400).json({success:false,message:'Email and OTP required'});
+
+    const record = await verifyOTP(email.toLowerCase(), otp, 'register');
+    const meta   = record.meta || {};
+
+    const hash  = await bcrypt.hash(meta.password, 12);
+    const uid   = 'QVX-' + Math.floor(100000+Math.random()*900000);
+    const code  = meta.name.replace(/\s+/g,'').substring(0,2).toUpperCase() + Math.floor(100000+Math.random()*900000);
+
+    const {rows:[newUser]} = await db(
+      `INSERT INTO users(name,email,phone,password,uid,referral_code,referred_by,is_verified)
+       VALUES($1,$2,$3,$4,$5,$6,$7,TRUE) RETURNING *`,
+      [meta.name, meta.email, meta.phone||'', hash, uid, code, meta.referredBy||null]
     );
-    const user = cc(rows[0]);
-    const aT=signA(user.id), rT=signR(user.id);
-    await db('INSERT INTO refresh_tokens(token) VALUES($1)',[rT]);
-    await notif(user.id,'system','Welcome to QAVIX GLOBAL! 🎉','Your account is ready. Start investing now.');
 
-    res.status(201).json({success:true,message:'Registration successful',data:{user:safe(user),accessToken:aT,refreshToken:rT}});
+    // Commission tracking setup
+    if (meta.referredBy) {
+      await db(`INSERT INTO transactions(user_id,type,amount,description,meta)
+        VALUES($1,'commission',0,'New referral joined','{}')`,[meta.referredBy]);
+    }
+
+    await notif(newUser.id,'system','Welcome to QAVIX GLOBAL 🎉','Your account is ready. Start investing today!');
+    const aT=signA(newUser.id), rT=signR(newUser.id);
+    await db('INSERT INTO refresh_tokens(token) VALUES($1)',[rT]);
+    res.status(201).json({success:true,message:'Account created successfully!',data:{user:safe(cc(newUser)),accessToken:aT,refreshToken:rT}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
@@ -357,14 +479,10 @@ app.post('/api/auth/forgot-password', limit10, async (req,res) => {
   try {
     const { email } = req.body;
     if (!email) return res.status(400).json({success:false,message:'Email required'});
-    const { rows } = await db('SELECT * FROM users WHERE email=$1',[email.toLowerCase()]);
-    // Always return success (don't reveal if email exists)
+    const { rows } = await db('SELECT id FROM users WHERE email=$1',[email.toLowerCase()]);
     if (!rows[0]) return res.json({success:true,requireOtp:true,message:'If this email exists, an OTP has been sent'});
-    const user = rows[0];
-    const code = genOTP();
-    await saveOTP(user.id, user.email, code, 'forgot_pass');
-    sendOTPMail(user.email, code, 'forgot_pass').catch(e=>console.error("Mail error:",e.message));
-    res.json({success:true,requireOtp:true,message:'OTP sent to your email'});
+    await issueOTP(rows[0].id, email.toLowerCase(), 'password_reset');
+    res.json({success:true,requireOtp:true,message:'OTP sent to your email. Valid for 10 minutes.'});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
@@ -372,10 +490,10 @@ app.post('/api/auth/reset-password', limit10, async (req,res) => {
   try {
     const { email, otp, newPassword } = req.body;
     if (!email||!otp||!newPassword) return res.status(400).json({success:false,message:'All fields required'});
-    const { rows } = await db('SELECT * FROM users WHERE email=$1',[email.toLowerCase()]);
-    if (!rows[0]) return res.status(400).json({success:false,message:'Invalid request'});
-    const valid = await verifyOTP(rows[0].id, otp, 'forgot_pass');
-    if (!valid) return res.status(400).json({success:false,message:'Invalid or expired OTP'});
+    if (newPassword.length < 8) return res.status(400).json({success:false,message:'Min 8 characters'});
+    await verifyOTP(email.toLowerCase(), otp, 'password_reset');
+    const {rows} = await db('SELECT id FROM users WHERE email=$1',[email.toLowerCase()]);
+    if (!rows[0]) return res.status(400).json({success:false,message:'User not found'});
     await db('UPDATE users SET password=$1 WHERE id=$2',[await bcrypt.hash(newPassword,12),rows[0].id]);
     await notif(rows[0].id,'security','Password Reset','Your password was reset successfully.');
     res.json({success:true,message:'Password reset successful. Please login.'});
@@ -384,19 +502,29 @@ app.post('/api/auth/reset-password', limit10, async (req,res) => {
 
 app.post('/api/auth/login', limit10, async (req,res) => {
   try {
-    const {email,password} = req.body;
+    const {email,password,otp} = req.body;
     if (!email||!password) return res.status(400).json({success:false,message:'Email and password required'});
     const {rows} = await db('SELECT * FROM users WHERE email=$1',[email.toLowerCase()]);
     if (!rows[0]||!await bcrypt.compare(password,rows[0].password))
       return res.status(401).json({success:false,message:'Invalid email or password'});
-    await db('UPDATE users SET last_login=NOW() WHERE id=$1',[rows[0].id]);
-    // Track login history
+
+    const user = rows[0];
+
+    // Step 1: credentials OK → send OTP
+    if (!otp) {
+      await issueOTP(user.id, user.email, 'login');
+      return res.json({success:true,requireOtp:true,message:'OTP sent to your email. Valid for 5 minutes.'});
+    }
+
+    // Step 2: verify OTP → issue tokens
+    await verifyOTP(user.email, otp, 'login');
+    await db('UPDATE users SET last_login=NOW() WHERE id=$1',[user.id]);
     const ip  = req.ip || req.headers['x-forwarded-for'] || 'Unknown';
     const dev = req.headers['user-agent'] || 'Unknown device';
-    await db('INSERT INTO login_history(user_id,ip,device) VALUES($1,$2,$3)',[rows[0].id,ip,dev.slice(0,200)]).catch(()=>{});
-    const user=cc(rows[0]), aT=signA(user.id), rT=signR(user.id);
+    await db('INSERT INTO login_history(user_id,ip,device) VALUES($1,$2,$3)',[user.id,ip,dev.slice(0,200)]).catch(()=>{});
+    const aT=signA(user.id), rT=signR(user.id);
     await db('INSERT INTO refresh_tokens(token) VALUES($1)',[rT]);
-    res.json({success:true,message:'Login successful',data:{user:safe(user),accessToken:aT,refreshToken:rT}});
+    res.json({success:true,message:'Login successful',data:{user:safe(cc(user)),accessToken:aT,refreshToken:rT}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
@@ -479,12 +607,18 @@ app.post('/api/user/set-withdrawal-password', auth, async (req,res) => {
 
 app.post('/api/user/change-withdrawal-password', auth, async (req,res) => {
   try {
-    const {oldPassword, newPassword} = req.body;
-    if (!oldPassword||!newPassword) return res.status(400).json({success:false,message:'All fields required'});
-    if (newPassword.length<6) return res.status(400).json({success:false,message:'Min 6 characters'});
-    const {rows:[u]} = await db('SELECT withdrawal_pass FROM users WHERE id=$1',[req.user.id]);
+    const {oldPassword, newPassword, otp} = req.body;
+    if (!newPassword||newPassword.length<6) return res.status(400).json({success:false,message:'Min 6 characters'});
+    const {rows:[u]} = await db('SELECT withdrawal_pass,email FROM users WHERE id=$1',[req.user.id]);
     if (!u.withdrawal_pass) return res.status(400).json({success:false,message:'No withdrawal password set'});
-    if (!await bcrypt.compare(oldPassword,u.withdrawal_pass)) return res.status(400).json({success:false,message:'Old password incorrect'});
+
+    if (!otp) {
+      if (!oldPassword||!await bcrypt.compare(oldPassword,u.withdrawal_pass))
+        return res.status(400).json({success:false,message:'Old password incorrect'});
+      await issueOTP(req.user.id, u.email, 'withdraw_password');
+      return res.json({success:true,requireOtp:true,message:'OTP sent to verify withdrawal password change'});
+    }
+    await verifyOTP(req.user.email||u.email, otp, 'withdraw_password');
     await db('UPDATE users SET withdrawal_pass=$1 WHERE id=$2',[await bcrypt.hash(newPassword,10),req.user.id]);
     res.json({success:true,message:'Withdrawal password changed'});
   } catch(e){res.status(500).json({success:false,message:e.message});}
@@ -503,10 +637,15 @@ app.get('/api/user/login-history', auth, async (req,res) => {
 
 app.post('/api/user/change-password', auth, async (req,res) => {
   try {
-    const {newPassword} = req.body;
+    const {newPassword, otp} = req.body;
     if (!newPassword||newPassword.length<8) return res.status(400).json({success:false,message:'Min 8 characters'});
+    if (!otp) {
+      await issueOTP(req.user.id, req.user.email, 'password_reset');
+      return res.json({success:true,requireOtp:true,message:'OTP sent to your email'});
+    }
+    await verifyOTP(req.user.email, otp, 'password_reset');
     await db('UPDATE users SET password=$1 WHERE id=$2',[await bcrypt.hash(newPassword,12),req.user.id]);
-    await notif(req.user.id,'security','Password changed successfully','Your account password was updated.');
+    await notif(req.user.id,'security','Password changed','Your login password was updated.');
     res.json({success:true,message:'Password changed successfully'});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
@@ -619,7 +758,7 @@ app.post('/api/wallet/deposit', auth, async (req,res) => {
 
 app.post('/api/wallet/withdraw', auth, async (req,res) => {
   try {
-    const {amount,walletAddress,network,withdrawalPassword} = req.body;
+    const {amount,walletAddress,network,withdrawalPassword,otp} = req.body;
     const MIN=parseFloat(process.env.WITHDRAWAL_MIN)||10, MAX=parseFloat(process.env.WITHDRAWAL_MAX)||10000;
     const amt=parseFloat(amount);
     if (!amt||amt<MIN) return res.status(400).json({success:false,message:`Min withdrawal $${MIN}`});
@@ -627,12 +766,18 @@ app.post('/api/wallet/withdraw', auth, async (req,res) => {
     if (!walletAddress)return res.status(400).json({success:false,message:'Wallet address required'});
     const {rows:[u]}=await db('SELECT balance,email,withdrawal_pass,wallet_address FROM users WHERE id=$1',[req.user.id]);
     if (parseFloat(u.balance)<amt) return res.status(400).json({success:false,message:'Insufficient balance'});
-    // Withdrawal password required
     if (!u.withdrawal_pass) return res.status(400).json({success:false,message:'Please set a withdrawal password first in Profile → Security'});
     if (!withdrawalPassword) return res.status(400).json({success:false,message:'Withdrawal password required'});
     if (!await bcrypt.compare(withdrawalPassword,u.withdrawal_pass)) return res.status(400).json({success:false,message:'Incorrect withdrawal password'});
 
     const fee=+(Math.max(1,amt*0.02)).toFixed(2), net=+(amt-fee).toFixed(2);
+
+    // OTP step
+    if (!otp) {
+      await issueOTP(req.user.id, u.email, 'withdraw', {amount:amt, walletAddress, network, fee, net});
+      return res.json({success:true,requireOtp:true,message:'OTP sent to confirm withdrawal. Valid for 3 minutes.',data:{fee,netAmount:net}});
+    }
+    await verifyOTP(u.email, otp, 'withdraw');
     await db('UPDATE users SET balance=balance-$1,total_withdrawn=total_withdrawn+$2 WHERE id=$3',[amt,net,req.user.id]);
     const {rows}=await db(
       `INSERT INTO transactions(user_id,type,amount,status,description,meta)
