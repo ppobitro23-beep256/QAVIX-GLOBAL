@@ -137,6 +137,9 @@ const initDB = async () => {
     ALTER TABLE otp_codes ADD COLUMN IF NOT EXISTS id         UUID DEFAULT gen_random_uuid();
     ALTER TABLE otp_codes ADD COLUMN IF NOT EXISTS code_hash  VARCHAR(255);
     ALTER TABLE otp_codes ADD COLUMN IF NOT EXISTS attempts   INTEGER DEFAULT 0;
+    ALTER TABLE otp_codes ALTER COLUMN code DROP NOT NULL;
+    ALTER TABLE otp_codes ADD COLUMN IF NOT EXISTS email      VARCHAR(150);
+    UPDATE otp_codes SET email='' WHERE email IS NULL;
 
     CREATE TABLE IF NOT EXISTS otp_rate_limit (
       id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
