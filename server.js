@@ -170,24 +170,29 @@ const safe   = (u) => { const r={...u}; delete r.password; return r; };
 const notif  = (uid,type,title,body='') =>
   db('INSERT INTO notifications(user_id,type,title,body) VALUES($1,$2,$3,$4)',[uid,type,title,body]).catch(()=>{});
 
-// ── Brevo SMTP Email Service ─────────────────────────────────────────────
-const nodemailer = require('nodemailer');
-
-const mailer = nodemailer.createTransport({
-  host    : 'smtp-relay.brevo.com',
-  port    : 587,
-  secure  : false,
-  auth    : {
-    user  : process.env.BREVO_SMTP_USER,
-    pass  : process.env.BREVO_SMTP_PASS,
-  },
-  tls: { rejectUnauthorized: false }
-});
-
-mailer.verify((err) => {
-  if (err) console.error('❌ Brevo SMTP Error:', err.message);
-  else     console.log('✅ Brevo SMTP Ready:', process.env.BREVO_SMTP_USER);
-});
+// ── Brevo HTTP API Email Service ─────────────────────────────────────────
+// NOTE: Render free plan blocks outbound SMTP — HTTP API only
+const sendEmail = async (toEmail, toName, subject, htmlBody) => {
+  const response = await fetch('https://api.brevo.com/v3/smtp/email', {
+    method  : 'POST',
+    headers : {
+      'Content-Type' : 'application/json',
+      'api-key'      : process.env.BREVO_API_KEY,
+    },
+    body: JSON.stringify({
+      sender     : { name: 'QAVIX GLOBAL', email: process.env.BREVO_SENDER_EMAIL },
+      to         : [{ email: toEmail, name: toName || toEmail }],
+      subject    : subject,
+      htmlContent: htmlBody,
+    }),
+  });
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(`Brevo API error ${response.status}: ${errText}`);
+  }
+  console.log(`✅ Email sent via Brevo HTTP → ${toEmail}`);
+  return true;
+};
 
 // ── OTP Config ───────────────────────────────────────────────────────────
 const OTP_CONFIG = {
@@ -319,15 +324,10 @@ const verifyOTP = async (email, code, purpose) => {
   return rows[0];
 };
 
-// Send OTP email via Brevo SMTP
+// Send OTP email via Brevo HTTP API
 const sendOTPMail = async (toEmail, otp, purpose) => {
   const cfg = OTP_CONFIG[purpose] || { subject:'🔐 QAVIX Verification', expiry:5 };
-  await mailer.sendMail({
-    from    : `"QAVIX GLOBAL" <${process.env.BREVO_SMTP_USER}>`,
-    to      : toEmail,
-    subject : cfg.subject,
-    html    : buildOTPEmail(otp, purpose, cfg.expiry),
-  });
+  await sendEmail(toEmail, toEmail, cfg.subject, buildOTPEmail(otp, purpose, cfg.expiry));
   console.log(`✅ OTP sent [${purpose}] → ${toEmail}`);
 };
 
