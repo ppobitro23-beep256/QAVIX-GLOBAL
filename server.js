@@ -369,10 +369,18 @@ const auth = async (req, res, next) => {
 
 // ── Constants ────────────────────────────────────────────────────────────
 const PLANS = [
-  {id:'starter', name:'Starter Plan',  price:25,   rate:0.04, days:30, roi:120, min:25,   max:99   },
-  {id:'advanced',name:'Advanced Plan', price:100,  rate:0.05, days:45, roi:225, min:100,  max:499  },
-  {id:'premium', name:'Premium Plan',  price:500,  rate:0.06, days:60, roi:360, min:500,  max:4999 },
-  {id:'elite',   name:'Elite Plan',    price:5000, rate:0.06, days:80, roi:480, min:5000, max:99999},
+  { id:'bronze', name:'QAVIX BRONZE', tier:'Bronze', emoji:'🥉',
+    rate:0.055, days:20, min:5,   max:20,   recommended:false,
+    color:'#CD7F32', description:'Entry-level plan for new investors' },
+  { id:'silver', name:'QAVIX SILVER', tier:'Silver', emoji:'🥈',
+    rate:0.060, days:20, min:21,  max:100,  recommended:false,
+    color:'#C0C0C0', description:'Steady growth for growing portfolios' },
+  { id:'gold',   name:'QAVIX GOLD',   tier:'Gold',   emoji:'🥇',
+    rate:0.065, days:20, min:101, max:300,  recommended:true,
+    color:'#C9A227', description:'Our most popular premium tier' },
+  { id:'elite',  name:'QAVIX ELITE',  tier:'Elite',  emoji:'💎',
+    rate:0.075, days:20, min:301, max:1000, recommended:false,
+    color:'#9B7AE8', description:'Maximum returns for serious investors' },
 ];
 const COMM = {1:10, 2:6, 3:4, 4:3, 5:2};
 const REWARDS = [
@@ -691,9 +699,16 @@ app.put('/api/user/wallet-address', auth, async (req,res) => {
 // ── Plans ─────────────────────────────────────────────────────────────────
 app.get('/api/plans', auth, async (req,res) => {
   try {
-    const {rows}=await db("SELECT plan_id FROM investments WHERE user_id=$1 AND status='active'",[req.user.id]);
-    const active=rows.map(r=>r.plan_id);
-    res.json({success:true,data:{plans:PLANS.map(p=>({...p,dailyExample:+(p.price*p.rate).toFixed(2),totalExample:+(p.price*p.roi/100).toFixed(2),isActive:active.includes(p.id)}))}});
+    const {rows} = await db("SELECT plan_id FROM investments WHERE user_id=$1 AND status='active'",[req.user.id]);
+    const active = rows.map(r=>r.plan_id);
+    res.json({success:true, data:{plans: PLANS.map(p=>({
+      ...p,
+      isActive      : active.includes(p.id),
+      dailyExample  : +(p.min * p.rate).toFixed(2),
+      dailyExampleMax: +(p.max * p.rate).toFixed(2),
+      totalExample  : +(p.min * p.rate * p.days).toFixed(2),
+      totalExampleMax: +(p.max * p.rate * p.days).toFixed(2),
+    }))}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
@@ -703,19 +718,30 @@ app.post('/api/plans/purchase', auth, async (req,res) => {
     const plan=PLANS.find(p=>p.id===planId);
     if (!plan) return res.status(404).json({success:false,message:'Plan not found'});
     const {rows:[u]}=await db('SELECT balance FROM users WHERE id=$1',[req.user.id]);
-    const amt=parseFloat(amount)||plan.price;
-    if (amt<plan.min) return res.status(400).json({success:false,message:`Minimum is $${plan.min}`});
+    const amt = parseFloat(amount);
+    if (!amt || isNaN(amt))       return res.status(400).json({success:false,message:'Invalid amount'});
+    if (amt < plan.min)           return res.status(400).json({success:false,message:`Minimum for ${plan.tier} is $${plan.min}`});
+    if (amt > plan.max)           return res.status(400).json({success:false,message:`Maximum for ${plan.tier} is $${plan.max}`});
+    if (amt < 5)                  return res.status(400).json({success:false,message:'Minimum investment is $5'});
     if (parseFloat(u.balance)<amt) return res.status(400).json({success:false,message:'Insufficient balance'});
-    const end=new Date(Date.now()+plan.days*86400000);
-    const daily=+(amt*plan.rate).toFixed(2), total=+(amt*plan.roi/100).toFixed(2);
-    const {rows}=await db(
-      `INSERT INTO investments(user_id,plan_id,plan_name,amount,daily_income,total_return,days_total,end_date) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
-      [req.user.id,planId,plan.name,amt,daily,total,plan.days,end]
+    const end   = new Date(Date.now() + plan.days * 86400000);
+    const daily = +(amt * plan.rate).toFixed(4);
+    const totalProfit = +(daily * plan.days).toFixed(2);
+    // Capital is locked — total_return stores only total profit (not capital)
+    const {rows} = await db(
+      `INSERT INTO investments(user_id,plan_id,plan_name,amount,daily_income,total_return,days_total,end_date)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+      [req.user.id, planId, plan.name, amt, daily, totalProfit, plan.days, end]
     );
+    // Deduct from balance — capital is locked permanently
     await db('UPDATE users SET balance=balance-$1,total_deposited=total_deposited+$1 WHERE id=$2',[amt,req.user.id]);
-    await payComm(req.user.id,amt);
-    await notif(req.user.id,'investment',`${plan.name} activated!`,`Daily: $${daily} for ${plan.days} days`);
-    res.status(201).json({success:true,message:`${plan.name} activated! Daily: $${daily}`,data:{investment:cc(rows[0])}});
+    await payComm(req.user.id, amt);
+    await notif(req.user.id,'investment',`${plan.name} activated!`,
+      `Daily profit: $${daily.toFixed(2)} for ${plan.days} days. Capital is locked.`);
+    res.status(201).json({success:true,
+      message:`${plan.name} activated! Daily profit: $${daily.toFixed(2)}`,
+      data:{investment:cc(rows[0]), dailyProfit:daily, totalProfit, daysTotal:plan.days}
+    });
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
@@ -762,9 +788,10 @@ app.post('/api/wallet/deposit', auth, async (req,res) => {
 app.post('/api/wallet/withdraw', auth, async (req,res) => {
   try {
     const {amount,walletAddress,network,withdrawalPassword,otp} = req.body;
-    const MIN=parseFloat(process.env.WITHDRAWAL_MIN)||10, MAX=parseFloat(process.env.WITHDRAWAL_MAX)||10000;
-    const amt=parseFloat(amount);
-    if (!amt||amt<MIN) return res.status(400).json({success:false,message:`Min withdrawal $${MIN}`});
+    const MIN = parseFloat(process.env.WITHDRAWAL_MIN) || 2;
+    const MAX = parseFloat(process.env.WITHDRAWAL_MAX) || 10000;
+    const amt = parseFloat(amount);
+    if (!amt||amt<MIN) return res.status(400).json({success:false,message:`Minimum withdrawal is $${MIN} USDT`});
     if (amt>MAX)       return res.status(400).json({success:false,message:`Max withdrawal $${MAX}`});
     if (!walletAddress)return res.status(400).json({success:false,message:'Wallet address required'});
     const {rows:[u]}=await db('SELECT balance,email,withdrawal_pass,wallet_address FROM users WHERE id=$1',[req.user.id]);
@@ -773,7 +800,8 @@ app.post('/api/wallet/withdraw', auth, async (req,res) => {
     if (!withdrawalPassword) return res.status(400).json({success:false,message:'Withdrawal password required'});
     if (!await bcrypt.compare(withdrawalPassword,u.withdrawal_pass)) return res.status(400).json({success:false,message:'Incorrect withdrawal password'});
 
-    const fee=+(Math.max(1,amt*0.02)).toFixed(2), net=+(amt-fee).toFixed(2);
+    const fee = +(amt * 0.05).toFixed(2);
+    const net = +(amt - fee).toFixed(2);
 
     // OTP step
     if (!otp) {
