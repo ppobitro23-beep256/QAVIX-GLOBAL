@@ -382,7 +382,7 @@ const PLANS = [
     rate:0.075, days:20, min:301, max:1000, recommended:false,
     color:'#9B7AE8', description:'Maximum returns for serious investors' },
 ];
-const COMM = {1:10, 2:6, 3:4, 4:3, 5:2};
+const COMM = {1:10, 2:5, 3:2, 4:1, 5:1, 6:1, 7:1, 8:1, 9:1, 10:1};
 const REWARDS = [
   {id:'daily',  name:'Daily Check-in',      amount:0.50,  cd:24  },
   {id:'weekly', name:'Weekly Reward',       amount:5.00,  cd:168 },
@@ -394,7 +394,7 @@ const REWARDS = [
 // Pay referral commissions up the chain
 const payComm = async (investorId, amount) => {
   let cur = investorId;
-  for (let lvl=1; lvl<=5; lvl++) {
+  for (let lvl=1; lvl<=10; lvl++) {
     const {rows} = await db('SELECT id,name,referred_by FROM users WHERE id=$1',[cur]);
     if (!rows[0]?.referred_by) break;
     const earned = +((amount*(COMM[lvl]||0))/100).toFixed(2);
@@ -870,8 +870,26 @@ app.get('/api/referral/team', auth, async (req,res) => {
         FROM users u JOIN t ON u.referred_by=t.id WHERE t.lvl<10
       ) SELECT * FROM t ORDER BY lvl,created_at
     `,[req.user.id]);
+    // Check which members have an active investment plan
+    const memberIds = rows.map(r => r.id);
+    let activeSet = new Set();
+    if (memberIds.length > 0) {
+      const placeholders = memberIds.map((_,i)=>`$${i+1}`).join(',');
+      const {rows: activeRows} = await db(
+        `SELECT DISTINCT user_id FROM investments WHERE status='active' AND user_id IN (${placeholders})`,
+        memberIds
+      );
+      activeRows.forEach(r => activeSet.add(r.user_id));
+    }
     const byLvl={};
-    rows.forEach(r=>{ if(!byLvl[r.lvl]) byLvl[r.lvl]=[]; byLvl[r.lvl].push({id:r.id,name:r.name,uid:r.uid,status:r.is_verified?'active':'inactive',level:r.membership_level,joinDate:r.created_at}); });
+    rows.forEach(r=>{
+      if(!byLvl[r.lvl]) byLvl[r.lvl]=[];
+      byLvl[r.lvl].push({
+        id:r.id, name:r.name, uid:r.uid,
+        status: activeSet.has(r.id) ? 'active' : 'inactive',
+        level:r.membership_level, joinDate:r.created_at
+      });
+    });
     res.json({success:true,data:{totalMembers:rows.length,levels:Object.entries(byLvl).map(([l,m])=>({level:parseInt(l),count:m.length,commission:COMM[l]||0,members:m}))}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
