@@ -669,7 +669,7 @@ app.post('/api/user/change-email', auth, async (req,res) => {
     }
 
     // ── Step 2: verify OTP → change email ──
-    const valid = await verifyOTP(req.user.id, otp, 'change_email');
+    const valid = await verifyOTP(newEmail.toLowerCase(), otp, 'change_email');
     if (!valid) return res.status(400).json({success:false,message:'Invalid or expired OTP'});
     const newEmailVal = valid.meta?.newEmail;
     if (!newEmailVal) return res.status(400).json({success:false,message:'Session expired, try again'});
