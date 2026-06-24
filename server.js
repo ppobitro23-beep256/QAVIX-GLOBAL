@@ -166,7 +166,7 @@ const cc = (row) => {
   return o;
 };
 const ccAll  = (rows) => rows.map(cc);
-const safe   = (u) => { const r={...u}; delete r.password; return r; };
+const safe   = (u) => { const r={...u}; delete r.password; r.hasWithdrawalPass = !!r.withdrawalPass; delete r.withdrawalPass; return r; };
 const notif  = (uid,type,title,body='') =>
   db('INSERT INTO notifications(user_id,type,title,body) VALUES($1,$2,$3,$4)',[uid,type,title,body]).catch(()=>{});
 
