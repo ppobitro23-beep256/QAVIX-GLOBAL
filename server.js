@@ -1090,6 +1090,12 @@ app.use((e,req,res,_)=>{console.error(e.message); res.status(500).json({success:
 const runDailyProfits = async () => {
   if (!pool) return;
   try {
+    // ── Auto-complete any investments past end_date ──────────────────────
+    await db(
+      `UPDATE investments SET status='completed'
+       WHERE status='active' AND end_date <= NOW()`
+    );
+
     const { rows } = await db(
       `SELECT * FROM investments WHERE status='active' AND end_date > NOW()`
     );
@@ -1131,7 +1137,17 @@ const runDailyProfits = async () => {
 };
 
 // ── Start ─────────────────────────────────────────────────────────────────
-initDB().then(()=>{
+initDB().then(async ()=>{
+  // ── Fix expired investments on startup ──────────────────────────────────
+  if (pool) {
+    try {
+      const {rowCount} = await pool.query(
+        `UPDATE investments SET status='completed' WHERE status='active' AND end_date <= NOW()`
+      );
+      if (rowCount > 0) console.log(`✅ Marked ${rowCount} expired investments as completed`);
+    } catch(e) { console.error('Startup cleanup error:', e.message); }
+  }
+
   app.listen(PORT,()=>{
     console.log(`
   ╔══════════════════════════════════════════╗
