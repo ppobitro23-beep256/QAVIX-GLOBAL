@@ -96,6 +96,18 @@ const initDB = async () => {
       token TEXT NOT NULL UNIQUE,
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
+
+    CREATE TABLE IF NOT EXISTS user_sessions (
+      id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id       UUID REFERENCES users(id) ON DELETE CASCADE,
+      refresh_token TEXT NOT NULL UNIQUE,
+      device        VARCHAR(300),
+      ip            VARCHAR(60),
+      created_at    TIMESTAMPTZ DEFAULT NOW(),
+      last_active   TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_sess_user ON user_sessions(user_id);
+    CREATE INDEX IF NOT EXISTS idx_sess_token ON user_sessions(refresh_token);
     ALTER TABLE users ADD COLUMN IF NOT EXISTS telegram        VARCHAR(100);
     ALTER TABLE users ADD COLUMN IF NOT EXISTS date_of_birth   DATE;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS phone           VARCHAR(30);
@@ -530,11 +542,22 @@ app.post('/api/auth/login', limit10, async (req,res) => {
     // Step 2: verify OTP → issue tokens
     await verifyOTP(user.email, otp, 'login');
     await db('UPDATE users SET last_login=NOW() WHERE id=$1',[user.id]);
-    const ip  = req.ip || req.headers['x-forwarded-for'] || 'Unknown';
+    const ip  = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || req.connection?.remoteAddress || 'unknown';
     const dev = req.headers['user-agent'] || 'Unknown device';
-    await db('INSERT INTO login_history(user_id,ip,device) VALUES($1,$2,$3)',[user.id,ip,dev.slice(0,200)]).catch(()=>{});
+    // Skip logging internal/Render IPs
+    const isInternal = ip.startsWith('10.') || ip.startsWith('127.') || ip.startsWith('172.1') || ip.startsWith('192.168.');
+    if (!isInternal) {
+      await db('INSERT INTO login_history(user_id,ip,device) VALUES($1,$2,$3)',[user.id,ip,dev.slice(0,200)]).catch(()=>{});
+    }
     const aT=signA(user.id), rT=signR(user.id);
     await db('INSERT INTO refresh_tokens(token) VALUES($1)',[rT]);
+    // Save active session
+    if (!isInternal) {
+      await db(
+        'INSERT INTO user_sessions(user_id,refresh_token,device,ip) VALUES($1,$2,$3,$4)',
+        [user.id, rT, dev.slice(0,300), ip]
+      ).catch(()=>{});
+    }
     res.json({success:true,message:'Login successful',data:{user:safe(cc(user)),accessToken:aT,refreshToken:rT}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
@@ -550,8 +573,32 @@ app.post('/api/auth/refresh', async (req,res) => {
 });
 
 app.post('/api/auth/logout', async (req,res) => {
-  if (req.body.refreshToken) await db('DELETE FROM refresh_tokens WHERE token=$1',[req.body.refreshToken]).catch(()=>{});
+  const rT = req.body.refreshToken;
+  if (rT) {
+    await db('DELETE FROM refresh_tokens WHERE token=$1',[rT]).catch(()=>{});
+    await db('DELETE FROM user_sessions WHERE refresh_token=$1',[rT]).catch(()=>{});
+  }
   res.json({success:true,message:'Logged out'});
+});
+
+// ── Active Sessions ───────────────────────────────────────────────────────
+app.get('/api/user/sessions', auth, async (req,res) => {
+  try {
+    const {rows} = await db(
+      `SELECT id, device, ip, created_at, last_active
+       FROM user_sessions WHERE user_id=$1
+       ORDER BY last_active DESC`,
+      [req.user.id]
+    );
+    res.json({success:true, data:{sessions: rows.map(cc)}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.delete('/api/user/sessions/:id', auth, async (req,res) => {
+  try {
+    await db('DELETE FROM user_sessions WHERE id=$1 AND user_id=$2',[req.params.id, req.user.id]);
+    res.json({success:true, message:'Session removed'});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
 app.get('/api/auth/me', auth, (req,res) => res.json({success:true,data:{user:req.user}}));
