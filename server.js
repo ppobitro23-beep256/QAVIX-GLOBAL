@@ -1180,18 +1180,30 @@ app.post('/api/support/send', auth, async (req, res) => {
       [req.user.id, text]
     );
 
-    // Forward to Telegram with ForceReply
+    // Forward to Telegram
     const {rows:[u]} = await db('SELECT name,email,uid FROM users WHERE id=$1',[req.user.id]);
-    const tgText = `💬 <b>${u.name}</b>  |  🆔 ${u.uid}\n\n${text}`;
-    // Send with ForceReply — admin just taps Reply in Telegram, no command needed
+
+    // Count this user's messages (thread context)
+    const {rows:[cnt]} = await db(
+      `SELECT COUNT(*) as c FROM support_messages WHERE user_id=$1 AND direction='user'`,
+      [req.user.id]
+    );
+    const msgNum = parseInt(cnt.c);
+
+    // Clear formatted message with user identity always visible
+    const tgText = [
+      `👤 <b>${u.name}</b>  |  🆔 <code>${u.uid}</code>`,
+      `📧 ${u.email}`,
+      `─────────────────────`,
+      `💬 ${text}`,
+      `─────────────────────`,
+      `<i>Hit Reply ↩ to respond to this user</i>`,
+      `#uid_${req.user.id}`
+    ].join('\n');
+
     const result = await tgSend(tgText, {
-      reply_markup: { force_reply: true, selective: false },
-      // store user_id in the message for webhook to extract
+      reply_markup: { force_reply: true, selective: false }
     });
-    // Also send a hidden marker message with user_id (used by webhook)
-    if (result) {
-      await tgSend(`#uid_${req.user.id}`, { reply_to_message_id: result.message_id });
-    }
 
     const tgMsgId = result ? result.message_id : null;
     if (tgMsgId) await db('UPDATE support_messages SET tg_msg_id=$1 WHERE id=$2',[tgMsgId, msg.id]);
@@ -1223,8 +1235,6 @@ app.post('/api/support/webhook', async (req, res) => {
     const msg  = update.message;
     const text = msg.text || '';
 
-    // Skip system/bot messages and marker messages
-    if (text.startsWith('#uid_')) return;
 
     // Method 1: Admin used /reply USER_ID message (legacy)
     if (text.startsWith('/reply ')) {
@@ -1239,34 +1249,32 @@ app.post('/api/support/webhook', async (req, res) => {
     }
 
     // Method 2: Admin just hit Reply on a user message (ForceReply)
-    // The replied-to message has a sibling marker #uid_USERID
     if (msg.reply_to_message) {
+      const repliedText  = msg.reply_to_message.text || '';
       const repliedMsgId = msg.reply_to_message.message_id;
+      let userId = null;
 
-      // Find the user_id from tg_msg_id stored in DB
-      const {rows} = await db(
-        `SELECT user_id FROM support_messages WHERE tg_msg_id=$1 LIMIT 1`,
-        [repliedMsgId]
-      );
+      // Extract #uid_ from the replied message body (always embedded)
+      const uidMatch = repliedText.match(/#uid_([a-f0-9\-]{36})/);
+      if (uidMatch) userId = uidMatch[1];
 
-      // Also check one message above (the marker is sent right after user msg)
-      let userId = rows[0]?.user_id;
+      // Fallback: look up by tg_msg_id in DB
       if (!userId) {
-        const {rows:r2} = await db(
+        const {rows} = await db(
           `SELECT user_id FROM support_messages WHERE tg_msg_id=$1 LIMIT 1`,
-          [repliedMsgId - 1]
+          [repliedMsgId]
         );
-        userId = r2[0]?.user_id;
-      }
-
-      // Fallback: check if reply text is the marker message #uid_...
-      if (!userId && msg.reply_to_message.text && msg.reply_to_message.text.startsWith('#uid_')) {
-        userId = msg.reply_to_message.text.replace('#uid_','').trim();
+        userId = rows[0]?.user_id || null;
       }
 
       if (userId && text.trim()) {
-        await db(`INSERT INTO support_messages(user_id,direction,message) VALUES($1,'admin',$2)`,[userId, text.trim()]);
-        await tgSend(`✅ Reply sent!`);
+        await db(
+          `INSERT INTO support_messages(user_id,direction,message) VALUES($1,'admin',$2)`,
+          [userId, text.trim()]
+        );
+        await tgSend(`✅ Replied to user successfully!`);
+      } else if (!userId) {
+        await tgSend(`❌ Could not identify user. Please use:\n/reply USER_ID your message`);
       }
       return;
     }
