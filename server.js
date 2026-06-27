@@ -1302,14 +1302,34 @@ app.post('/api/support/webhook', async (req, res) => {
 const registerTgWebhook = async (appUrl) => {
   try {
     const webhookUrl = `${appUrl}/api/support/webhook`;
+    console.log('📡 Registering webhook:', webhookUrl);
     const r = await fetch(`${TG_API}/setWebhook`, {
       method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ url: webhookUrl })
+      body: JSON.stringify({ url: webhookUrl, drop_pending_updates: true })
     });
     const data = await r.json();
-    console.log('✅ Telegram webhook:', data.ok ? 'registered' : data.description);
+    console.log('✅ Telegram webhook result:', JSON.stringify(data));
+    // Send startup notification to admin
+    await tgSend(`🟢 QAVIX Support Bot is ONLINE\nWebhook: ${webhookUrl}\n\nWaiting for user messages...`);
   } catch(e) { console.error('Webhook register error:', e.message); }
 };
+
+// Manual webhook test route
+app.get('/api/support/test', async (req,res) => {
+  try {
+    const result = await tgSend('🔔 Test message from QAVIX server!');
+    res.json({success: !!result, tg_message_id: result});
+  } catch(e) { res.json({success:false, error:e.message}); }
+});
+
+// Check webhook status
+app.get('/api/support/webhook-info', async (req,res) => {
+  try {
+    const r = await fetch(`${TG_API}/getWebhookInfo`);
+    const data = await r.json();
+    res.json(data);
+  } catch(e) { res.json({error:e.message}); }
+});
 
   app.listen(PORT,()=>{
     console.log(`
@@ -1318,7 +1338,7 @@ const registerTgWebhook = async (appUrl) => {
   ║  Port : ${PORT}  |  DB: ${pool?'Neon ✅':'No DB ⚠️'}        ║
   ╚══════════════════════════════════════════╝`);
     // Register Telegram webhook
-    const appUrl = process.env.APP_URL || `https://qavix-backend.onrender.com`;
+    const appUrl = process.env.APP_URL || 'https://qavix-global-axeo.onrender.com';
     registerTgWebhook(appUrl);
   });
 
