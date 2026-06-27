@@ -843,6 +843,11 @@ app.post('/api/wallet/withdraw', auth, async (req,res) => {
     if (!walletAddress)return res.status(400).json({success:false,message:'Wallet address required'});
     const {rows:[u]}=await db('SELECT balance,email,withdrawal_pass,wallet_address FROM users WHERE id=$1',[req.user.id]);
     if (parseFloat(u.balance)<amt) return res.status(400).json({success:false,message:'Insufficient balance'});
+
+    // ── Must have at least one active investment plan to withdraw ──
+    const {rows:activePlans}=await db("SELECT id FROM investments WHERE user_id=$1 AND status='active' LIMIT 1",[req.user.id]);
+    if (!activePlans.length) return res.status(400).json({success:false,message:'You must have an active investment plan to withdraw. Please purchase a plan first.'});
+
     if (!u.withdrawal_pass) return res.status(400).json({success:false,message:'Please set a withdrawal password first in Profile → Security'});
     if (!withdrawalPassword) return res.status(400).json({success:false,message:'Withdrawal password required'});
     if (!await bcrypt.compare(withdrawalPassword,u.withdrawal_pass)) return res.status(400).json({success:false,message:'Incorrect withdrawal password'});
