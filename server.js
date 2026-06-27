@@ -1145,71 +1145,6 @@ app.get('/api/stats/leaderboard', async (_,res) => {
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
-// ── 404 & error handler ───────────────────────────────────────────────────
-app.use((_,res)=>res.status(404).json({success:false,message:'Route not found'}));
-app.use((e,req,res,_)=>{console.error(e.message); res.status(500).json({success:false,message:e.message});});
-
-// ── Daily Profit Cron ────────────────────────────────────────────────────
-const runDailyProfits = async () => {
-  if (!pool) return;
-  try {
-    // ── Auto-complete any investments past end_date ──────────────────────
-    await db(
-      `UPDATE investments SET status='completed'
-       WHERE status='active' AND end_date <= NOW()`
-    );
-
-    const { rows } = await db(
-      `SELECT * FROM investments WHERE status='active' AND end_date > NOW()`
-    );
-    let count = 0;
-    for (const inv of rows) {
-      // Credit daily income to user balance
-      await db(
-        `UPDATE users SET balance=balance+$1 WHERE id=$2`,
-        [inv.daily_income, inv.user_id]
-      );
-      // Update investment progress
-      await db(
-        `UPDATE investments SET days_elapsed=days_elapsed+1, earned_so_far=earned_so_far+$1 WHERE id=$2`,
-        [inv.daily_income, inv.id]
-      );
-      // Record transaction
-      await db(
-        `INSERT INTO transactions(user_id,type,amount,description,meta)
-         VALUES($1,'profit',$2,$3,$4)`,
-        [inv.user_id, inv.daily_income,
-         `Daily profit — ${inv.plan_name}`,
-         JSON.stringify({ investmentId: inv.id, planId: inv.plan_id })]
-      );
-      // Send notification
-      await notif(inv.user_id, 'profit', 'Daily profit credited 💰',
-        `$${parseFloat(inv.daily_income).toFixed(2)} from ${inv.plan_name}`);
-      // Mark completed if all days done
-      await db(
-        `UPDATE investments SET status='completed'
-         WHERE id=$1 AND days_elapsed >= days_total`,
-        [inv.id]
-      );
-      count++;
-    }
-    console.log(`✅ Daily profits credited: ${count} investments`);
-  } catch (e) {
-    console.error('❌ Daily profit error:', e.message);
-  }
-};
-
-// ── Start ─────────────────────────────────────────────────────────────────
-initDB().then(async ()=>{
-  // ── Fix expired investments on startup ──────────────────────────────────
-  if (pool) {
-    try {
-      const {rowCount} = await pool.query(
-        `UPDATE investments SET status='completed' WHERE status='active' AND end_date <= NOW()`
-      );
-      if (rowCount > 0) console.log(`✅ Marked ${rowCount} expired investments as completed`);
-    } catch(e) { console.error('Startup cleanup error:', e.message); }
-  }
 
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1330,6 +1265,73 @@ app.get('/api/support/webhook-info', async (req,res) => {
     res.json(data);
   } catch(e) { res.json({error:e.message}); }
 });
+
+
+// ── 404 & error handler ───────────────────────────────────────────────────
+app.use((_,res)=>res.status(404).json({success:false,message:'Route not found'}));
+app.use((e,req,res,_)=>{console.error(e.message); res.status(500).json({success:false,message:e.message});});
+
+// ── Daily Profit Cron ────────────────────────────────────────────────────
+const runDailyProfits = async () => {
+  if (!pool) return;
+  try {
+    // ── Auto-complete any investments past end_date ──────────────────────
+    await db(
+      `UPDATE investments SET status='completed'
+       WHERE status='active' AND end_date <= NOW()`
+    );
+
+    const { rows } = await db(
+      `SELECT * FROM investments WHERE status='active' AND end_date > NOW()`
+    );
+    let count = 0;
+    for (const inv of rows) {
+      // Credit daily income to user balance
+      await db(
+        `UPDATE users SET balance=balance+$1 WHERE id=$2`,
+        [inv.daily_income, inv.user_id]
+      );
+      // Update investment progress
+      await db(
+        `UPDATE investments SET days_elapsed=days_elapsed+1, earned_so_far=earned_so_far+$1 WHERE id=$2`,
+        [inv.daily_income, inv.id]
+      );
+      // Record transaction
+      await db(
+        `INSERT INTO transactions(user_id,type,amount,description,meta)
+         VALUES($1,'profit',$2,$3,$4)`,
+        [inv.user_id, inv.daily_income,
+         `Daily profit — ${inv.plan_name}`,
+         JSON.stringify({ investmentId: inv.id, planId: inv.plan_id })]
+      );
+      // Send notification
+      await notif(inv.user_id, 'profit', 'Daily profit credited 💰',
+        `$${parseFloat(inv.daily_income).toFixed(2)} from ${inv.plan_name}`);
+      // Mark completed if all days done
+      await db(
+        `UPDATE investments SET status='completed'
+         WHERE id=$1 AND days_elapsed >= days_total`,
+        [inv.id]
+      );
+      count++;
+    }
+    console.log(`✅ Daily profits credited: ${count} investments`);
+  } catch (e) {
+    console.error('❌ Daily profit error:', e.message);
+  }
+};
+
+// ── Start ─────────────────────────────────────────────────────────────────
+initDB().then(async ()=>{
+  // ── Fix expired investments on startup ──────────────────────────────────
+  if (pool) {
+    try {
+      const {rowCount} = await pool.query(
+        `UPDATE investments SET status='completed' WHERE status='active' AND end_date <= NOW()`
+      );
+      if (rowCount > 0) console.log(`✅ Marked ${rowCount} expired investments as completed`);
+    } catch(e) { console.error('Startup cleanup error:', e.message); }
+  }
 
   app.listen(PORT,()=>{
     console.log(`
