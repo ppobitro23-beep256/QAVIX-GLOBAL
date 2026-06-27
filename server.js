@@ -1215,8 +1215,8 @@ initDB().then(async ()=>{
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // LIVE CHAT SUPPORT — Telegram Bot Integration
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-const TG_TOKEN   = process.env.TELEGRAM_BOT_TOKEN || '8850489978:AAF55S-RVXj59YSYoIt6hFJ7ADkHq025B3Q';
-const TG_CHAT_ID = process.env.TELEGRAM_CHAT_ID   || '8850489978';
+const TG_TOKEN   = process.env.TELEGRAM_BOT_TOKEN || '8850489978:AAFvF7bpKrovFwwjpMgGxw4v8WmJclbMGWI';
+const TG_CHAT_ID = process.env.TELEGRAM_CHAT_ID   || '6874570336';
 const TG_API     = `https://api.telegram.org/bot${TG_TOKEN}`;
 
 // Send message to admin Telegram
