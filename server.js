@@ -1155,16 +1155,15 @@ const TG_CHAT_ID = process.env.TELEGRAM_CHAT_ID   || '6874570336';
 const TG_API     = `https://api.telegram.org/bot${TG_TOKEN}`;
 
 // Send message to admin Telegram
-const tgSend = async (text, replyMarkup) => {
+const tgSend = async (text, opts={}) => {
   try {
-    const body = { chat_id: TG_CHAT_ID, text, parse_mode: 'HTML' };
-    if (replyMarkup) body.reply_markup = replyMarkup;
+    const body = { chat_id: TG_CHAT_ID, text, parse_mode: 'HTML', ...opts };
     const r = await fetch(`${TG_API}/sendMessage`, {
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify(body)
     });
     const data = await r.json();
-    return data.ok ? data.result.message_id : null;
+    return data.ok ? data.result : null;
   } catch(e) { console.error('TG send error:', e.message); return null; }
 };
 
@@ -1181,12 +1180,20 @@ app.post('/api/support/send', auth, async (req, res) => {
       [req.user.id, text]
     );
 
-    // Forward to Telegram
+    // Forward to Telegram with ForceReply
     const {rows:[u]} = await db('SELECT name,email,uid FROM users WHERE id=$1',[req.user.id]);
-    const tgText = `💬 <b>Live Chat — ${u.name}</b>\n📧 ${u.email}\n🆔 ${u.uid}\n\n${text}\n\n<i>Reply: /reply ${req.user.id} [message]</i>`;
-    const tgMsgId = await tgSend(tgText);
+    const tgText = `💬 <b>${u.name}</b>  |  🆔 ${u.uid}\n\n${text}`;
+    // Send with ForceReply — admin just taps Reply in Telegram, no command needed
+    const result = await tgSend(tgText, {
+      reply_markup: { force_reply: true, selective: false },
+      // store user_id in the message for webhook to extract
+    });
+    // Also send a hidden marker message with user_id (used by webhook)
+    if (result) {
+      await tgSend(`#uid_${req.user.id}`, { reply_to_message_id: result.message_id });
+    }
 
-    // Store tg_msg_id for reference
+    const tgMsgId = result ? result.message_id : null;
     if (tgMsgId) await db('UPDATE support_messages SET tg_msg_id=$1 WHERE id=$2',[tgMsgId, msg.id]);
 
     res.json({success:true, data:{message: cc(msg)}});
@@ -1209,27 +1216,61 @@ app.get('/api/support/messages', auth, async (req, res) => {
 // Telegram webhook — admin replies here
 app.post('/api/support/webhook', async (req, res) => {
   try {
-    res.sendStatus(200); // Always 200 to Telegram
+    res.sendStatus(200);
     const update = req.body;
     if (!update.message) return;
 
-    const text = update.message.text || '';
-    if (!text.startsWith('/reply ')) return;
+    const msg  = update.message;
+    const text = msg.text || '';
 
-    // Format: /reply USER_ID message text here
-    const parts   = text.split(' ');
-    const userId  = parts[1];
-    const replyTx = parts.slice(2).join(' ').trim();
-    if (!userId || !replyTx) return;
+    // Skip system/bot messages and marker messages
+    if (text.startsWith('#uid_')) return;
 
-    // Save admin reply to DB
-    await db(
-      `INSERT INTO support_messages(user_id,direction,message) VALUES($1,'admin',$2)`,
-      [userId, replyTx]
-    );
+    // Method 1: Admin used /reply USER_ID message (legacy)
+    if (text.startsWith('/reply ')) {
+      const parts  = text.split(' ');
+      const userId = parts[1];
+      const reply  = parts.slice(2).join(' ').trim();
+      if (userId && reply) {
+        await db(`INSERT INTO support_messages(user_id,direction,message) VALUES($1,'admin',$2)`,[userId, reply]);
+        await tgSend(`✅ Sent!`);
+      }
+      return;
+    }
 
-    // Confirm to admin in Telegram
-    await tgSend(`✅ Reply sent to user.`);
+    // Method 2: Admin just hit Reply on a user message (ForceReply)
+    // The replied-to message has a sibling marker #uid_USERID
+    if (msg.reply_to_message) {
+      const repliedMsgId = msg.reply_to_message.message_id;
+
+      // Find the user_id from tg_msg_id stored in DB
+      const {rows} = await db(
+        `SELECT user_id FROM support_messages WHERE tg_msg_id=$1 LIMIT 1`,
+        [repliedMsgId]
+      );
+
+      // Also check one message above (the marker is sent right after user msg)
+      let userId = rows[0]?.user_id;
+      if (!userId) {
+        const {rows:r2} = await db(
+          `SELECT user_id FROM support_messages WHERE tg_msg_id=$1 LIMIT 1`,
+          [repliedMsgId - 1]
+        );
+        userId = r2[0]?.user_id;
+      }
+
+      // Fallback: check if reply text is the marker message #uid_...
+      if (!userId && msg.reply_to_message.text && msg.reply_to_message.text.startsWith('#uid_')) {
+        userId = msg.reply_to_message.text.replace('#uid_','').trim();
+      }
+
+      if (userId && text.trim()) {
+        await db(`INSERT INTO support_messages(user_id,direction,message) VALUES($1,'admin',$2)`,[userId, text.trim()]);
+        await tgSend(`✅ Reply sent!`);
+      }
+      return;
+    }
+
   } catch(e) { console.error('Webhook error:', e.message); }
 });
 
