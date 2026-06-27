@@ -163,6 +163,17 @@ const initDB = async () => {
     CREATE INDEX IF NOT EXISTS idx_otp_email   ON otp_codes(email);
     CREATE INDEX IF NOT EXISTS idx_otp_purpose ON otp_codes(purpose);
     CREATE INDEX IF NOT EXISTS idx_orl_email   ON otp_rate_limit(email);
+
+    CREATE TABLE IF NOT EXISTS support_messages (
+      id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id    UUID REFERENCES users(id) ON DELETE CASCADE,
+      direction  VARCHAR(10) NOT NULL CHECK (direction IN ('user','admin')),
+      message    TEXT NOT NULL,
+      tg_msg_id  BIGINT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_sm_user ON support_messages(user_id);
+    CREATE INDEX IF NOT EXISTS idx_sm_time ON support_messages(created_at);
   `);
   console.log('✅ Neon DB tables ready');
 };
@@ -1200,12 +1211,115 @@ initDB().then(async ()=>{
     } catch(e) { console.error('Startup cleanup error:', e.message); }
   }
 
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// LIVE CHAT SUPPORT — Telegram Bot Integration
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+const TG_TOKEN   = process.env.TELEGRAM_BOT_TOKEN || '8850489978:AAF55S-RVXj59YSYoIt6hFJ7ADkHq025B3Q';
+const TG_CHAT_ID = process.env.TELEGRAM_CHAT_ID   || '8850489978';
+const TG_API     = `https://api.telegram.org/bot${TG_TOKEN}`;
+
+// Send message to admin Telegram
+const tgSend = async (text, replyMarkup) => {
+  try {
+    const body = { chat_id: TG_CHAT_ID, text, parse_mode: 'HTML' };
+    if (replyMarkup) body.reply_markup = replyMarkup;
+    const r = await fetch(`${TG_API}/sendMessage`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(body)
+    });
+    const data = await r.json();
+    return data.ok ? data.result.message_id : null;
+  } catch(e) { console.error('TG send error:', e.message); return null; }
+};
+
+// User sends a message → saved to DB + forwarded to Telegram
+app.post('/api/support/send', auth, async (req, res) => {
+  try {
+    const { message } = req.body;
+    if (!message || !message.trim()) return res.status(400).json({success:false,message:'Message required'});
+    const text = message.trim().slice(0, 2000);
+
+    // Save to DB
+    const {rows:[msg]} = await db(
+      `INSERT INTO support_messages(user_id,direction,message) VALUES($1,'user',$2) RETURNING *`,
+      [req.user.id, text]
+    );
+
+    // Forward to Telegram
+    const {rows:[u]} = await db('SELECT name,email,uid FROM users WHERE id=$1',[req.user.id]);
+    const tgText = `💬 <b>Live Chat — ${u.name}</b>\n📧 ${u.email}\n🆔 ${u.uid}\n\n${text}\n\n<i>Reply: /reply ${req.user.id} [message]</i>`;
+    const tgMsgId = await tgSend(tgText);
+
+    // Store tg_msg_id for reference
+    if (tgMsgId) await db('UPDATE support_messages SET tg_msg_id=$1 WHERE id=$2',[tgMsgId, msg.id]);
+
+    res.json({success:true, data:{message: cc(msg)}});
+  } catch(e) { res.status(500).json({success:false,message:e.message}); }
+});
+
+// Get conversation history
+app.get('/api/support/messages', auth, async (req, res) => {
+  try {
+    const since = req.query.since || '1970-01-01';
+    const {rows} = await db(
+      `SELECT id,direction,message,created_at FROM support_messages
+       WHERE user_id=$1 AND created_at > $2 ORDER BY created_at ASC LIMIT 100`,
+      [req.user.id, since]
+    );
+    res.json({success:true, data:{messages: ccAll(rows)}});
+  } catch(e) { res.status(500).json({success:false,message:e.message}); }
+});
+
+// Telegram webhook — admin replies here
+app.post('/api/support/webhook', async (req, res) => {
+  try {
+    res.sendStatus(200); // Always 200 to Telegram
+    const update = req.body;
+    if (!update.message) return;
+
+    const text = update.message.text || '';
+    if (!text.startsWith('/reply ')) return;
+
+    // Format: /reply USER_ID message text here
+    const parts   = text.split(' ');
+    const userId  = parts[1];
+    const replyTx = parts.slice(2).join(' ').trim();
+    if (!userId || !replyTx) return;
+
+    // Save admin reply to DB
+    await db(
+      `INSERT INTO support_messages(user_id,direction,message) VALUES($1,'admin',$2)`,
+      [userId, replyTx]
+    );
+
+    // Confirm to admin in Telegram
+    await tgSend(`✅ Reply sent to user.`);
+  } catch(e) { console.error('Webhook error:', e.message); }
+});
+
+// Register Telegram webhook on startup
+const registerTgWebhook = async (appUrl) => {
+  try {
+    const webhookUrl = `${appUrl}/api/support/webhook`;
+    const r = await fetch(`${TG_API}/setWebhook`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ url: webhookUrl })
+    });
+    const data = await r.json();
+    console.log('✅ Telegram webhook:', data.ok ? 'registered' : data.description);
+  } catch(e) { console.error('Webhook register error:', e.message); }
+};
+
   app.listen(PORT,()=>{
     console.log(`
   ╔══════════════════════════════════════════╗
   ║  🏦  QAVIX GLOBAL API                   ║
   ║  Port : ${PORT}  |  DB: ${pool?'Neon ✅':'No DB ⚠️'}        ║
   ╚══════════════════════════════════════════╝`);
+    // Register Telegram webhook
+    const appUrl = process.env.APP_URL || `https://qavix-backend.onrender.com`;
+    registerTgWebhook(appUrl);
   });
 
   // Run daily profits every 24 hours
