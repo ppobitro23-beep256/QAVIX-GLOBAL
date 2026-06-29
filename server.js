@@ -45,7 +45,7 @@ const initDB = async () => {
       is_verified      BOOLEAN       DEFAULT FALSE,
       kyc_status       VARCHAR(20)   DEFAULT 'none',
       wallet_address   VARCHAR(100)  DEFAULT '',
-      wallet_network   VARCHAR(20)   DEFAULT 'TRC20',
+      wallet_network   VARCHAR(20)   DEFAULT 'BEP20',
       last_login       TIMESTAMPTZ   DEFAULT NOW(),
       created_at       TIMESTAMPTZ   DEFAULT NOW()
     );
@@ -225,6 +225,7 @@ const OTP_CONFIG = {
   password_reset    : { expiry: 10, subject: '🔓 QAVIX Password Reset',             action: 'reset your password'           },
   withdraw_password : { expiry: 5,  subject: '🔐 QAVIX Withdrawal Password Change', action: 'change your withdrawal password'},
   change_email      : { expiry: 5,  subject: '📧 QAVIX Email Change Verification',  action: 'change your email'             },
+  change_password   : { expiry: 5,  subject: '🔑 QAVIX Password Change',            action: 'change your login password'    },
 };
 
 const MAX_RESENDS   = 3;   // max resend attempts in 10 minutes
@@ -363,11 +364,12 @@ const issueOTP = async (userId, email, purpose, meta={}) => {
   return otp; // only for internal use, never expose to client
 };
 
-// Auto-cleanup expired OTPs (runs every hour)
+// Auto-cleanup expired OTPs + stale refresh tokens (runs every hour)
 setInterval(async () => {
   try {
     await db(`DELETE FROM otp_codes WHERE expires_at < NOW() OR (used=TRUE AND created_at < NOW()-INTERVAL '1 day')`);
     await db(`DELETE FROM otp_rate_limit WHERE sent_at < NOW()-INTERVAL '10 minutes'`);
+    await db(`DELETE FROM refresh_tokens WHERE created_at < NOW()-INTERVAL '31 days'`);
   } catch(e){}
 }, 60 * 60 * 1000);
 
@@ -676,20 +678,36 @@ app.post('/api/user/set-withdrawal-password', auth, async (req,res) => {
 
 app.post('/api/user/change-withdrawal-password', auth, async (req,res) => {
   try {
-    const {oldPassword, newPassword, otp} = req.body;
-    if (!newPassword||newPassword.length<6) return res.status(400).json({success:false,message:'Min 6 characters'});
+    const {oldPassword, newPassword, otp, forgotMode} = req.body;
     const {rows:[u]} = await db('SELECT withdrawal_pass,email FROM users WHERE id=$1',[req.user.id]);
     if (!u.withdrawal_pass) return res.status(400).json({success:false,message:'No withdrawal password set'});
 
-    if (!otp) {
-      if (!oldPassword||!await bcrypt.compare(oldPassword,u.withdrawal_pass))
-        return res.status(400).json({success:false,message:'Old password incorrect'});
+    // ── Forgot mode: send OTP ──
+    if (forgotMode && !otp && !newPassword) {
       await issueOTP(req.user.id, u.email, 'withdraw_password');
-      return res.json({success:true,requireOtp:true,message:'OTP sent to verify withdrawal password change'});
+      return res.json({success:true,requireOtp:true,message:'OTP sent to your email. Valid for 5 minutes.'});
     }
-    await verifyOTP(req.user.email||u.email, otp, 'withdraw_password');
-    await db('UPDATE users SET withdrawal_pass=$1 WHERE id=$2',[await bcrypt.hash(newPassword,10),req.user.id]);
-    res.json({success:true,message:'Withdrawal password changed'});
+
+    // ── Forgot mode: verify OTP → change ──
+    if (otp && newPassword) {
+      if (newPassword.length<6) return res.status(400).json({success:false,message:'Min 6 characters'});
+      await verifyOTP(u.email, otp, 'withdraw_password');
+      await db('UPDATE users SET withdrawal_pass=$1 WHERE id=$2',[await bcrypt.hash(newPassword,10),req.user.id]);
+      await notif(req.user.id,'security','Withdrawal password changed','Your withdrawal password was reset via OTP.');
+      return res.json({success:true,message:'Withdrawal password changed successfully'});
+    }
+
+    // ── Normal mode: old password → change directly (no OTP) ──
+    if (oldPassword && newPassword) {
+      if (newPassword.length<6) return res.status(400).json({success:false,message:'Min 6 characters'});
+      if (!await bcrypt.compare(oldPassword,u.withdrawal_pass))
+        return res.status(400).json({success:false,message:'Old password is incorrect'});
+      await db('UPDATE users SET withdrawal_pass=$1 WHERE id=$2',[await bcrypt.hash(newPassword,10),req.user.id]);
+      await notif(req.user.id,'security','Withdrawal password changed','Your withdrawal password was updated.');
+      return res.json({success:true,message:'Withdrawal password changed successfully'});
+    }
+
+    return res.status(400).json({success:false,message:'Invalid request'});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
@@ -706,16 +724,35 @@ app.get('/api/user/login-history', auth, async (req,res) => {
 
 app.post('/api/user/change-password', auth, async (req,res) => {
   try {
-    const {newPassword, otp} = req.body;
-    if (!newPassword||newPassword.length<8) return res.status(400).json({success:false,message:'Min 8 characters'});
-    if (!otp) {
-      await issueOTP(req.user.id, req.user.email, 'password_reset');
-      return res.json({success:true,requireOtp:true,message:'OTP sent to your email'});
+    const {oldPassword, newPassword, otp, forgotMode} = req.body;
+
+    // ── Forgot mode: send OTP ──
+    if (forgotMode && !otp && !newPassword) {
+      await issueOTP(req.user.id, req.user.email, 'change_password');
+      return res.json({success:true,requireOtp:true,message:'OTP sent to your email. Valid for 5 minutes.'});
     }
-    await verifyOTP(req.user.email, otp, 'password_reset');
-    await db('UPDATE users SET password=$1 WHERE id=$2',[await bcrypt.hash(newPassword,12),req.user.id]);
-    await notif(req.user.id,'security','Password changed','Your login password was updated.');
-    res.json({success:true,message:'Password changed successfully'});
+
+    // ── Forgot mode: verify OTP → change ──
+    if (otp && newPassword) {
+      if (newPassword.length<8) return res.status(400).json({success:false,message:'Min 8 characters'});
+      await verifyOTP(req.user.email, otp, 'change_password');
+      await db('UPDATE users SET password=$1 WHERE id=$2',[await bcrypt.hash(newPassword,12),req.user.id]);
+      await notif(req.user.id,'security','Password changed','Your login password was reset via OTP.');
+      return res.json({success:true,message:'Password changed successfully'});
+    }
+
+    // ── Normal mode: old password → change directly (no OTP) ──
+    if (oldPassword && newPassword) {
+      if (newPassword.length<8) return res.status(400).json({success:false,message:'Min 8 characters'});
+      const {rows:[u]} = await db('SELECT password FROM users WHERE id=$1',[req.user.id]);
+      if (!await bcrypt.compare(oldPassword,u.password))
+        return res.status(400).json({success:false,message:'Old password is incorrect'});
+      await db('UPDATE users SET password=$1 WHERE id=$2',[await bcrypt.hash(newPassword,12),req.user.id]);
+      await notif(req.user.id,'security','Password changed','Your login password was updated.');
+      return res.json({success:true,message:'Password changed successfully'});
+    }
+
+    return res.status(400).json({success:false,message:'Invalid request'});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
@@ -749,7 +786,7 @@ app.put('/api/user/wallet-address', auth, async (req,res) => {
   try {
     const {walletAddress,network}=req.body;
     if (!walletAddress) return res.status(400).json({success:false,message:'Wallet address required'});
-    await db('UPDATE users SET wallet_address=$1,wallet_network=$2 WHERE id=$3',[walletAddress,network||'TRC20',req.user.id]);
+    await db('UPDATE users SET wallet_address=$1,wallet_network=$2 WHERE id=$3',[walletAddress,network||'BEP20',req.user.id]);
     res.json({success:true,message:'Wallet address updated'});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
@@ -837,7 +874,7 @@ app.post('/api/wallet/deposit', auth, async (req,res) => {
     if (!txHash)       return res.status(400).json({success:false,message:'Transaction hash required'});
     await db('UPDATE users SET balance=balance+$1 WHERE id=$2',[amt,req.user.id]);
     const {rows}=await db(`INSERT INTO transactions(user_id,type,amount,description,meta) VALUES($1,'deposit',$2,$3,$4) RETURNING *`,
-      [req.user.id,amt,`Deposit via ${network||'TRC20'}`,JSON.stringify({network,txHash})]);
+      [req.user.id,amt,`Deposit via ${network||'BEP20'}`,JSON.stringify({network,txHash})]);
     await notif(req.user.id,'deposit','Deposit Confirmed',`$${amt} USDT received`);
     res.status(201).json({success:true,message:`$${amt} deposit received`,data:{transaction:cc(rows[0])}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
@@ -1129,12 +1166,21 @@ app.post('/api/rewards/lucky', auth, async (req,res) => {
 // ── Stats ─────────────────────────────────────────────────────────────────
 app.get('/api/stats/platform', async (_,res) => {
   try {
-    const [uR,dR,wR]=await Promise.all([
+    const [uR,dR,wR,aiR]=await Promise.all([
       db('SELECT COUNT(*) FROM users'),
       db("SELECT COALESCE(SUM(amount),0) AS t FROM transactions WHERE type='deposit'"),
       db("SELECT COALESCE(SUM(amount),0) AS t FROM transactions WHERE type='withdrawal'"),
+      db("SELECT COUNT(DISTINCT user_id) AS c FROM investments WHERE status='active'"),
     ]);
-    res.json({success:true,data:{totalUsers:18340+parseInt(uR.rows[0].count),activeInvestors:11200,totalDeposits:4200000+parseFloat(dR.rows[0].t),totalWithdrawals:2900000+parseFloat(wR.rows[0].t),totalInvestments:6100000,uptimePct:99.8}});
+    const totalDep = parseFloat(dR.rows[0].t);
+    res.json({success:true,data:{
+      totalUsers      : parseInt(uR.rows[0].count),
+      activeInvestors : parseInt(aiR.rows[0].c),
+      totalDeposits   : +totalDep.toFixed(2),
+      totalWithdrawals: +parseFloat(wR.rows[0].t).toFixed(2),
+      totalInvestments: +totalDep.toFixed(2),
+      uptimePct       : 99.8,
+    }});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
