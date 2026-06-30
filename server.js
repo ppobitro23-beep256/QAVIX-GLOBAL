@@ -174,7 +174,45 @@ const initDB = async () => {
     );
     CREATE INDEX IF NOT EXISTS idx_sm_user ON support_messages(user_id);
     CREATE INDEX IF NOT EXISTS idx_sm_time ON support_messages(created_at);
+
+    -- ── Admin Panel: accounts + access control ──────────────────────────
+    CREATE TABLE IF NOT EXISTS admins (
+      id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id      UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE UNIQUE,
+      role         VARCHAR(30)   DEFAULT 'Support',
+      status       VARCHAR(20)   DEFAULT 'pending',
+      last_login   TIMESTAMPTZ,
+      created_at   TIMESTAMPTZ   DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS admin_logs (
+      id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      admin_id   UUID REFERENCES admins(id) ON DELETE SET NULL,
+      action     VARCHAR(200) NOT NULL,
+      meta       JSONB DEFAULT '{}',
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_alog_time ON admin_logs(created_at);
+
+    -- ── User/transaction columns needed for admin moderation ────────────
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'active';
+    ALTER TABLE transactions ADD COLUMN IF NOT EXISTS reviewed_by UUID REFERENCES admins(id) ON DELETE SET NULL;
+    ALTER TABLE transactions ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMPTZ;
+    ALTER TABLE transactions ADD COLUMN IF NOT EXISTS reject_reason TEXT;
   `);
+
+  // Link the Super Admin to their existing QAVIX GLOBAL user account.
+  // Admin login uses the SAME password as their regular platform account — there is no separate admin password.
+  const seedEmail = (process.env.SEED_ADMIN_EMAIL || 'rafishasan273@gmail.com').toLowerCase();
+  const { rows: seedUser } = await pool.query('SELECT id FROM users WHERE email=$1', [seedEmail]);
+  if (seedUser[0]) {
+    const { rows: existingAdmin } = await pool.query('SELECT id FROM admins WHERE user_id=$1', [seedUser[0].id]);
+    if (!existingAdmin[0]) {
+      await pool.query(`INSERT INTO admins(user_id,role,status) VALUES($1,'Super Admin','active')`, [seedUser[0].id]);
+      console.log(`✅ Linked Super Admin access to existing account: ${seedEmail} (log in with that account's password)`);
+    }
+  } else {
+    console.log(`⚠️  No QAVIX GLOBAL account found for ${seedEmail} yet — register that email on the platform first, then restart the server to link Super Admin access.`);
+  }
   console.log('✅ Neon DB tables ready');
 };
 
@@ -392,6 +430,33 @@ const auth = async (req, res, next) => {
   }
 };
 
+// ── Admin JWT + middleware ─────────────────────────────────────────────────
+const signAdmin = (id) => jwt.sign({id, isAdmin:true}, process.env.ADMIN_JWT_SECRET || process.env.JWT_SECRET, {expiresIn:'12h'});
+const adminAuth = async (req, res, next) => {
+  try {
+    const h = req.headers.authorization;
+    if (!h?.startsWith('Bearer ')) return res.status(401).json({success:false,message:'No token'});
+    const d = jwt.verify(h.split(' ')[1], process.env.ADMIN_JWT_SECRET || process.env.JWT_SECRET);
+    if (!d.isAdmin) return res.status(403).json({success:false,message:'Not an admin token'});
+    const {rows} = await db(
+      `SELECT a.id, a.role, a.status, u.id as user_id, u.name, u.email FROM admins a
+       JOIN users u ON u.id=a.user_id WHERE a.id=$1`, [d.id]);
+    if (!rows[0]) return res.status(401).json({success:false,message:'Admin not found'});
+    if (rows[0].status !== 'active') return res.status(403).json({success:false,message:'This admin account is suspended'});
+    req.admin = cc(rows[0]);
+    next();
+  } catch(e) {
+    res.status(401).json({success:false,message: e.name==='TokenExpiredError'?'Token expired':'Invalid token'});
+  }
+};
+// Restrict to specific roles, e.g. requireRole('Super Admin','Finance')
+const requireRole = (...roles) => (req, res, next) => {
+  if (!roles.includes(req.admin.role)) return res.status(403).json({success:false,message:'Insufficient permissions for this action'});
+  next();
+};
+const logAdmin = (adminId, action, meta={}) =>
+  db(`INSERT INTO admin_logs(admin_id,action,meta) VALUES($1,$2,$3)`,[adminId,action,JSON.stringify(meta)]).catch(()=>{});
+
 // ── Constants ────────────────────────────────────────────────────────────
 const PLANS = [
   { id:'bronze', name:'QAVIX BRONZE', tier:'Bronze', emoji:'🥉',
@@ -545,6 +610,8 @@ app.post('/api/auth/login', limit10, async (req,res) => {
       return res.status(401).json({success:false,message:'Invalid email or password'});
 
     const user = rows[0];
+    if (user.status === 'suspended') return res.status(403).json({success:false,message:'Your account has been suspended. Contact support for help.'});
+    if (user.status === 'banned')    return res.status(403).json({success:false,message:'Your account has been banned.'});
 
     // Step 1: credentials OK → send OTP
     if (!otp) {
@@ -872,11 +939,12 @@ app.post('/api/wallet/deposit', auth, async (req,res) => {
     const MIN=parseFloat(process.env.DEPOSIT_MIN)||10, amt=parseFloat(amount);
     if (!amt||amt<MIN) return res.status(400).json({success:false,message:`Min deposit $${MIN}`});
     if (!txHash)       return res.status(400).json({success:false,message:'Transaction hash required'});
-    await db('UPDATE users SET balance=balance+$1 WHERE id=$2',[amt,req.user.id]);
-    const {rows}=await db(`INSERT INTO transactions(user_id,type,amount,description,meta) VALUES($1,'deposit',$2,$3,$4) RETURNING *`,
+    // Deposits are held as 'pending' until an admin approves them in the admin console.
+    // Balance is only credited on approval — see PUT /api/admin/deposits/:id/approve
+    const {rows}=await db(`INSERT INTO transactions(user_id,type,amount,status,description,meta) VALUES($1,'deposit',$2,'pending',$3,$4) RETURNING *`,
       [req.user.id,amt,`Deposit via ${network||'BEP20'}`,JSON.stringify({network,txHash})]);
-    await notif(req.user.id,'deposit','Deposit Confirmed',`$${amt} USDT received`);
-    res.status(201).json({success:true,message:`$${amt} deposit received`,data:{transaction:cc(rows[0])}});
+    await notif(req.user.id,'deposit','Deposit Submitted',`$${amt} USDT submitted, awaiting confirmation`);
+    res.status(201).json({success:true,message:`$${amt} deposit submitted and is pending confirmation`,data:{transaction:cc(rows[0])}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
@@ -912,11 +980,11 @@ app.post('/api/wallet/withdraw', auth, async (req,res) => {
     await db('UPDATE users SET balance=balance-$1,total_withdrawn=total_withdrawn+$2 WHERE id=$3',[amt,net,req.user.id]);
     const {rows}=await db(
       `INSERT INTO transactions(user_id,type,amount,status,description,meta)
-       VALUES($1,'withdrawal',$2,'processing',$3,$4) RETURNING *`,
+       VALUES($1,'withdrawal',$2,'pending',$3,$4) RETURNING *`,
       [req.user.id,net,`Withdrawal to ${walletAddress}`,JSON.stringify({walletAddress,network,fee})]
     );
-    await notif(req.user.id,'withdrawal','Withdrawal Processing',`$${net} USDT sent. 1-24h processing.`);
-    res.status(201).json({success:true,message:`$${net} withdrawal submitted`,data:{transaction:cc(rows[0]),fee,netAmount:net}});
+    await notif(req.user.id,'withdrawal','Withdrawal Submitted',`$${net} USDT withdrawal submitted for review`);
+    res.status(201).json({success:true,message:`$${net} withdrawal submitted for admin review`,data:{transaction:cc(rows[0]),fee,netAmount:net}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
@@ -1362,9 +1430,389 @@ app.get('/api/support/webhook-info', async (req,res) => {
 });
 
 
+// ═══════════════════════════════════════════════════════════════════════
+//  ADMIN PANEL API — powers admin.html
+// ═══════════════════════════════════════════════════════════════════════
+const adminLimit = rateLimit({windowMs:15*60000, max:30});
+
+// ── Admin auth ──────────────────────────────────────────────────────────
+app.post('/api/admin/login', adminLimit, async (req,res) => {
+  try {
+    const {email,password} = req.body;
+    if (!email||!password) return res.status(400).json({success:false,message:'Email and password required'});
+    // Admin login uses the SAME account + password as the regular QAVIX GLOBAL platform — no separate admin password.
+    const {rows:[user]} = await db('SELECT * FROM users WHERE email=$1',[email.toLowerCase()]);
+    if (!user||!await bcrypt.compare(password,user.password))
+      return res.status(401).json({success:false,message:'Invalid email or password'});
+    const {rows:[admin]} = await db('SELECT * FROM admins WHERE user_id=$1',[user.id]);
+    if (!admin) return res.status(403).json({success:false,message:'This email is not registered as an admin'});
+    if (admin.status === 'pending')   return res.status(403).json({success:false,message:'Your admin account is awaiting approval from a Super Admin'});
+    if (admin.status !== 'active')    return res.status(403).json({success:false,message:'This admin account is suspended'});
+    await db('UPDATE admins SET last_login=NOW() WHERE id=$1',[admin.id]);
+    await logAdmin(admin.id, 'Logged in');
+    const token = signAdmin(admin.id);
+    res.json({success:true,message:'Welcome back',data:{admin:{id:admin.id,name:user.name,email:user.email,role:admin.role,status:admin.status},token}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.get('/api/admin/me', adminAuth, (req,res) => res.json({success:true,data:{admin:req.admin}}));
+
+// ── Dashboard stats ───────────────────────────────────────────────────────
+app.get('/api/admin/stats', adminAuth, async (_,res) => {
+  try {
+    const [users, deposits, withdrawals, investments, today] = await Promise.all([
+      db(`SELECT COUNT(*) total, COUNT(*) FILTER (WHERE status='active') active, COUNT(*) FILTER (WHERE created_at::date=CURRENT_DATE) today FROM users`),
+      db(`SELECT COALESCE(SUM(amount),0) total, COUNT(*) FILTER (WHERE status='pending') pending, COALESCE(SUM(amount) FILTER (WHERE created_at::date=CURRENT_DATE AND status='approved'),0) today FROM transactions WHERE type='deposit'`),
+      db(`SELECT COALESCE(SUM(amount),0) total, COUNT(*) FILTER (WHERE status='pending') pending, COALESCE(SUM(amount) FILTER (WHERE created_at::date=CURRENT_DATE),0) today FROM transactions WHERE type='withdrawal'`),
+      db(`SELECT COUNT(*) FILTER (WHERE status='active') active, COALESCE(SUM(amount) FILTER (WHERE status='active'),0) capital FROM investments`),
+      db(`SELECT COALESCE(SUM(amount),0) profit FROM transactions WHERE type='deposit' AND status='approved' AND created_at::date=CURRENT_DATE`)
+    ]);
+    res.json({success:true,data:{
+      totalUsers: parseInt(users.rows[0].total), activeUsers: parseInt(users.rows[0].active), newUsersToday: parseInt(users.rows[0].today),
+      totalDeposits: parseFloat(deposits.rows[0].total), pendingDeposits: parseInt(deposits.rows[0].pending), depositsToday: parseFloat(deposits.rows[0].today),
+      totalWithdrawals: parseFloat(withdrawals.rows[0].total), pendingWithdrawals: parseInt(withdrawals.rows[0].pending), withdrawalsToday: parseFloat(withdrawals.rows[0].today),
+      activeInvestments: parseInt(investments.rows[0].active), capitalDeployed: parseFloat(investments.rows[0].capital),
+      revenueToday: parseFloat(today.rows[0].profit)
+    }});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── Users management ──────────────────────────────────────────────────────
+app.get('/api/admin/users', adminAuth, async (req,res) => {
+  try {
+    const page = parseInt(req.query.page)||1, limit = parseInt(req.query.limit)||20;
+    const search = (req.query.search||'').trim();
+    const status = req.query.status||'';
+    let where = [], params = [];
+    if (search) { params.push(`%${search}%`); where.push(`(name ILIKE $${params.length} OR email ILIKE $${params.length} OR uid ILIKE $${params.length})`); }
+    if (status) { params.push(status); where.push(`status=$${params.length}`); }
+    const whereSql = where.length ? 'WHERE '+where.join(' AND ') : '';
+    const {rows:countRows} = await db(`SELECT COUNT(*) FROM users ${whereSql}`, params);
+    params.push(limit, (page-1)*limit);
+    const {rows} = await db(
+      `SELECT id,name,email,uid,balance,total_deposited,total_withdrawn,membership_level,status,created_at
+       FROM users ${whereSql} ORDER BY created_at DESC LIMIT $${params.length-1} OFFSET $${params.length}`, params);
+    res.json({success:true,data:{users:ccAll(rows),total:parseInt(countRows[0].count),page,limit}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.get('/api/admin/users/:id', adminAuth, async (req,res) => {
+  try {
+    const {rows} = await db('SELECT * FROM users WHERE id=$1',[req.params.id]);
+    if (!rows[0]) return res.status(404).json({success:false,message:'User not found'});
+    const [investments, transactions, referrals] = await Promise.all([
+      db('SELECT * FROM investments WHERE user_id=$1 ORDER BY created_at DESC',[req.params.id]),
+      db('SELECT * FROM transactions WHERE user_id=$1 ORDER BY created_at DESC LIMIT 50',[req.params.id]),
+      db('SELECT id,name,uid,membership_level,created_at FROM users WHERE referred_by=$1',[req.params.id]),
+    ]);
+    res.json({success:true,data:{
+      user: safe(cc(rows[0])),
+      investments: ccAll(investments.rows),
+      transactions: ccAll(transactions.rows),
+      referrals: ccAll(referrals.rows)
+    }});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.put('/api/admin/users/:id/status', adminAuth, async (req,res) => {
+  try {
+    const {status} = req.body; // active | suspended | banned
+    if (!['active','suspended','banned'].includes(status)) return res.status(400).json({success:false,message:'Invalid status'});
+    const {rows} = await db('UPDATE users SET status=$1 WHERE id=$2 RETURNING id,name,email,status',[status,req.params.id]);
+    if (!rows[0]) return res.status(404).json({success:false,message:'User not found'});
+    await notif(req.params.id,'system','Account '+status, status==='active' ? 'Your account has been reactivated.' : 'Your account has been '+status+'. Contact support for help.');
+    await logAdmin(req.admin.id, `Set user ${rows[0].email} to ${status}`, {userId:req.params.id,status});
+    res.json({success:true,message:`User is now ${status}`,data:{user:cc(rows[0])}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.post('/api/admin/users/:id/balance', adminAuth, requireRole('Super Admin','Finance'), async (req,res) => {
+  try {
+    const {type, amount, ledger, reason} = req.body; // type: 'credit' | 'debit'
+    const amt = parseFloat(amount);
+    if (!amt||amt<=0) return res.status(400).json({success:false,message:'Enter a valid amount'});
+    const column = ledger === 'Referral Income' ? 'pending_earnings' : 'balance';
+    const delta = type === 'debit' ? -amt : amt;
+    const {rows} = await db(`UPDATE users SET ${column}=${column}+$1 WHERE id=$2 RETURNING id,name,email,balance,pending_earnings`,[delta,req.params.id]);
+    if (!rows[0]) return res.status(404).json({success:false,message:'User not found'});
+    await db(`INSERT INTO transactions(user_id,type,amount,status,description,reviewed_by,reviewed_at) VALUES($1,'admin_adjustment',$2,'approved',$3,$4,NOW())`,
+      [req.params.id, delta, reason||`Manual ${type} by admin`, req.admin.id]);
+    await notif(req.params.id,'system','Balance Updated',`Your ${ledger||'Main Balance'} was ${type==='debit'?'debited':'credited'} by $${amt}.`);
+    await logAdmin(req.admin.id, `${type==='debit'?'Debited':'Credited'} $${amt} for ${rows[0].email}`, {userId:req.params.id,amount:amt,type,reason});
+    res.json({success:true,message:`$${amt} ${type==='debit'?'debited from':'credited to'} the account`,data:{user:cc(rows[0])}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.post('/api/admin/users/:id/reset-password', adminAuth, async (req,res) => {
+  try {
+    const tempPass = Math.random().toString(36).slice(-10);
+    const hash = await bcrypt.hash(tempPass, 12);
+    const {rows} = await db('UPDATE users SET password=$1 WHERE id=$2 RETURNING email',[hash,req.params.id]);
+    if (!rows[0]) return res.status(404).json({success:false,message:'User not found'});
+    await notif(req.params.id,'system','Password Reset','An admin has reset your password. Please change it after logging in.');
+    await logAdmin(req.admin.id, `Reset password for ${rows[0].email}`, {userId:req.params.id});
+    // In production, email tempPass to the user instead of returning it.
+    res.json({success:true,message:'Password reset',data:{temporaryPassword:tempPass}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── Deposit moderation ────────────────────────────────────────────────────
+app.get('/api/admin/deposits', adminAuth, async (req,res) => {
+  try {
+    const status = req.query.status||'';
+    const params = ['deposit']; let extra = '';
+    if (status) { params.push(status); extra = `AND t.status=$${params.length}`; }
+    const {rows} = await db(
+      `SELECT t.*, u.name, u.uid, u.email FROM transactions t JOIN users u ON u.id=t.user_id
+       WHERE t.type=$1 ${extra} ORDER BY t.created_at DESC LIMIT 200`, params);
+    res.json({success:true,data:{deposits:ccAll(rows)}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.put('/api/admin/deposits/:id/approve', adminAuth, async (req,res) => {
+  try {
+    const {rows:[tx]} = await db(`SELECT * FROM transactions WHERE id=$1 AND type='deposit'`,[req.params.id]);
+    if (!tx) return res.status(404).json({success:false,message:'Deposit not found'});
+    if (tx.status !== 'pending') return res.status(400).json({success:false,message:'Only pending deposits can be approved'});
+    await db('UPDATE users SET balance=balance+$1, total_deposited=total_deposited+$1 WHERE id=$2',[tx.amount,tx.user_id]);
+    await db(`UPDATE transactions SET status='approved', reviewed_by=$1, reviewed_at=NOW() WHERE id=$2`,[req.admin.id,req.params.id]);
+    await notif(tx.user_id,'deposit','Deposit Approved',`$${tx.amount} has been credited to your balance.`);
+    await logAdmin(req.admin.id, `Approved deposit $${tx.amount}`, {depositId:req.params.id,userId:tx.user_id});
+    res.json({success:true,message:'Deposit approved and credited'});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.put('/api/admin/deposits/:id/reject', adminAuth, async (req,res) => {
+  try {
+    const {reason} = req.body;
+    const {rows:[tx]} = await db(`SELECT * FROM transactions WHERE id=$1 AND type='deposit'`,[req.params.id]);
+    if (!tx) return res.status(404).json({success:false,message:'Deposit not found'});
+    if (tx.status !== 'pending') return res.status(400).json({success:false,message:'Only pending deposits can be rejected'});
+    await db(`UPDATE transactions SET status='rejected', reviewed_by=$1, reviewed_at=NOW(), reject_reason=$2 WHERE id=$3`,[req.admin.id,reason||'',req.params.id]);
+    await notif(tx.user_id,'deposit','Deposit Rejected',reason||'Your deposit could not be confirmed. Contact support if you believe this is a mistake.');
+    await logAdmin(req.admin.id, `Rejected deposit $${tx.amount}`, {depositId:req.params.id,userId:tx.user_id,reason});
+    res.json({success:true,message:'Deposit rejected'});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── Withdrawal moderation (USDT BEP20 only) ───────────────────────────────
+app.get('/api/admin/withdrawals', adminAuth, async (req,res) => {
+  try {
+    const status = req.query.status||'';
+    const params = ['withdrawal']; let extra = '';
+    if (status) { params.push(status); extra = `AND t.status=$${params.length}`; }
+    const {rows} = await db(
+      `SELECT t.*, u.name, u.uid, u.email FROM transactions t JOIN users u ON u.id=t.user_id
+       WHERE t.type=$1 ${extra} ORDER BY t.created_at DESC LIMIT 200`, params);
+    res.json({success:true,data:{withdrawals:ccAll(rows)}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.put('/api/admin/withdrawals/:id/approve', adminAuth, async (req,res) => {
+  try {
+    const {rows:[tx]} = await db(`SELECT * FROM transactions WHERE id=$1 AND type='withdrawal'`,[req.params.id]);
+    if (!tx) return res.status(404).json({success:false,message:'Withdrawal not found'});
+    if (tx.status !== 'pending') return res.status(400).json({success:false,message:'Only pending withdrawals can be approved'});
+    await db(`UPDATE transactions SET status='approved', reviewed_by=$1, reviewed_at=NOW() WHERE id=$2`,[req.admin.id,req.params.id]);
+    await notif(tx.user_id,'withdrawal','Withdrawal Approved','Your withdrawal has been approved and will be paid out shortly.');
+    await logAdmin(req.admin.id, `Approved withdrawal $${tx.amount}`, {withdrawalId:req.params.id,userId:tx.user_id});
+    res.json({success:true,message:'Withdrawal approved'});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.put('/api/admin/withdrawals/:id/reject', adminAuth, async (req,res) => {
+  try {
+    const {reason, refund} = req.body;
+    const {rows:[tx]} = await db(`SELECT * FROM transactions WHERE id=$1 AND type='withdrawal'`,[req.params.id]);
+    if (!tx) return res.status(404).json({success:false,message:'Withdrawal not found'});
+    if (tx.status !== 'pending') return res.status(400).json({success:false,message:'Only pending withdrawals can be rejected'});
+    if (refund) {
+      const meta = tx.meta || {};
+      const gross = parseFloat(tx.amount) + parseFloat(meta.fee||0);
+      await db('UPDATE users SET balance=balance+$1, total_withdrawn=total_withdrawn-$2 WHERE id=$3',[gross,tx.amount,tx.user_id]);
+    }
+    await db(`UPDATE transactions SET status='rejected', reviewed_by=$1, reviewed_at=NOW(), reject_reason=$2 WHERE id=$3`,[req.admin.id,reason||'',req.params.id]);
+    await notif(tx.user_id,'withdrawal','Withdrawal Rejected',(reason||'Your withdrawal request was rejected.') + (refund?' The amount has been refunded to your balance.':''));
+    await logAdmin(req.admin.id, `Rejected withdrawal $${tx.amount}`, {withdrawalId:req.params.id,userId:tx.user_id,reason,refund:!!refund});
+    res.json({success:true,message:'Withdrawal rejected'+(refund?' and refunded':'')});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.put('/api/admin/withdrawals/:id/paid', adminAuth, async (req,res) => {
+  try {
+    const {payoutTxnId} = req.body;
+    if (!payoutTxnId) return res.status(400).json({success:false,message:'Payout transaction ID required'});
+    const {rows:[tx]} = await db(`SELECT * FROM transactions WHERE id=$1 AND type='withdrawal'`,[req.params.id]);
+    if (!tx) return res.status(404).json({success:false,message:'Withdrawal not found'});
+    if (tx.status !== 'approved') return res.status(400).json({success:false,message:'Only approved withdrawals can be marked paid'});
+    const meta = { ...(tx.meta||{}), payoutTxnId };
+    await db(`UPDATE transactions SET status='paid', meta=$1, reviewed_by=$2, reviewed_at=NOW() WHERE id=$3`,[JSON.stringify(meta),req.admin.id,req.params.id]);
+    await notif(tx.user_id,'withdrawal','Withdrawal Paid',`$${tx.amount} USDT (BEP20) has been sent. TXN: ${payoutTxnId}`);
+    await logAdmin(req.admin.id, `Marked withdrawal paid $${tx.amount}`, {withdrawalId:req.params.id,userId:tx.user_id,payoutTxnId});
+    res.json({success:true,message:'Withdrawal marked as paid'});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── Admin accounts (Super Admin only) ──────────────────────────────────────
+// Admins are just platform users granted console access — there is no separate
+// admin password. They always log in with the same email + password they use
+// on the main QAVIX GLOBAL site.
+app.get('/api/admin/admins', adminAuth, requireRole('Super Admin'), async (_,res) => {
+  try {
+    const {rows} = await db(
+      `SELECT a.id, a.role, a.status, a.last_login, a.created_at, u.name, u.email FROM admins a
+       JOIN users u ON u.id=a.user_id ORDER BY a.created_at DESC`);
+    res.json({success:true,data:{admins:ccAll(rows)}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.post('/api/admin/admins', adminAuth, requireRole('Super Admin'), async (req,res) => {
+  try {
+    const {email, role} = req.body;
+    if (!email) return res.status(400).json({success:false,message:'Email is required'});
+    const {rows:[user]} = await db('SELECT id,name,email FROM users WHERE email=$1',[email.toLowerCase()]);
+    if (!user) return res.status(400).json({success:false,message:'This email does not have a QAVIX GLOBAL account yet. They must register on the platform first.'});
+    const {rows:exists} = await db('SELECT id FROM admins WHERE user_id=$1',[user.id]);
+    if (exists[0]) return res.status(400).json({success:false,message:'This user is already an admin'});
+    // New admins start as 'pending' — they cannot use admin access until a Super Admin approves them.
+    const {rows} = await db(
+      `INSERT INTO admins(user_id,role,status) VALUES($1,$2,'pending') RETURNING id,role,status,created_at`,
+      [user.id, role||'Support']);
+    await logAdmin(req.admin.id, `Granted admin access to ${user.email} (pending approval)`, {role});
+    res.status(201).json({success:true,message:`${user.name} added — pending your approval. They will log in with their existing QAVIX GLOBAL password.`,
+      data:{admin:{...cc(rows[0]), name:user.name, email:user.email}}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.put('/api/admin/admins/:id/approve', adminAuth, requireRole('Super Admin'), async (req,res) => {
+  try {
+    const {rows} = await db(
+      `UPDATE admins SET status='active' WHERE id=$1 AND status='pending' RETURNING id,user_id,role,status`,[req.params.id]);
+    if (!rows[0]) return res.status(404).json({success:false,message:'No pending admin found with that ID'});
+    const {rows:[user]} = await db('SELECT name,email FROM users WHERE id=$1',[rows[0].user_id]);
+    await logAdmin(req.admin.id, `Approved admin ${user.email}`, {adminId:req.params.id});
+    res.json({success:true,message:user.email+' can now log in to the console',data:{admin:{...cc(rows[0]), name:user.name, email:user.email}}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.put('/api/admin/admins/:id', adminAuth, requireRole('Super Admin'), async (req,res) => {
+  try {
+    const {role, status} = req.body;
+    const {rows} = await db(
+      `UPDATE admins SET role=COALESCE($1,role), status=COALESCE($2,status) WHERE id=$3
+       RETURNING id,user_id,role,status`, [role,status,req.params.id]);
+    if (!rows[0]) return res.status(404).json({success:false,message:'Admin not found'});
+    const {rows:[user]} = await db('SELECT name,email FROM users WHERE id=$1',[rows[0].user_id]);
+    await logAdmin(req.admin.id, `Updated admin ${user.email}`, {role,status});
+    res.json({success:true,message:'Admin updated',data:{admin:{...cc(rows[0]), name:user.name, email:user.email}}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.delete('/api/admin/admins/:id', adminAuth, requireRole('Super Admin'), async (req,res) => {
+  try {
+    if (req.params.id === req.admin.id) return res.status(400).json({success:false,message:'You cannot remove your own account'});
+    const {rows} = await db('DELETE FROM admins WHERE id=$1 RETURNING user_id',[req.params.id]);
+    if (!rows[0]) return res.status(404).json({success:false,message:'Admin not found'});
+    await logAdmin(req.admin.id, `Removed admin access from user ${rows[0].user_id}`);
+    res.json({success:true,message:'Admin access removed'});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── Plans (config-based, with real aggregated stats) ───────────────────────
+app.get('/api/admin/plans', adminAuth, async (_,res) => {
+  try {
+    const {rows} = await db(
+      `SELECT plan_id, COUNT(*) FILTER (WHERE status='active') active_count,
+              COALESCE(SUM(amount) FILTER (WHERE status='active'),0) capital,
+              COALESCE(SUM(earned_so_far),0) roi_paid
+       FROM investments GROUP BY plan_id`);
+    const byPlan = {}; rows.forEach(r=> byPlan[r.plan_id] = r);
+    const plans = PLANS.map(p => ({
+      id:p.id, name:p.tier, dailyRate:p.rate*100, days:p.days, min:p.min, max:p.max,
+      activeCount: parseInt(byPlan[p.id]?.active_count||0),
+      capital: parseFloat(byPlan[p.id]?.capital||0),
+      roiPaid: parseFloat(byPlan[p.id]?.roi_paid||0),
+    }));
+    res.json({success:true,data:{plans}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── Investments (real records from the investments table) ─────────────────
+app.get('/api/admin/investments', adminAuth, async (req,res) => {
+  try {
+    const status = req.query.status||'';
+    const search = (req.query.search||'').trim();
+    let where = [], params = [];
+    if (status) { params.push(status); where.push(`i.status=$${params.length}`); }
+    if (search) { params.push(`%${search}%`); where.push(`(u.name ILIKE $${params.length} OR u.uid ILIKE $${params.length})`); }
+    const whereSql = where.length ? 'WHERE '+where.join(' AND ') : '';
+    const {rows} = await db(
+      `SELECT i.*, u.name, u.uid FROM investments i JOIN users u ON u.id=i.user_id
+       ${whereSql} ORDER BY i.created_at DESC LIMIT 200`, params);
+    const [{rows:kpi}] = await Promise.all([
+      db(`SELECT COUNT(*) FILTER (WHERE status='active') active, COALESCE(SUM(amount) FILTER (WHERE status='active'),0) capital,
+                 COALESCE(SUM(earned_so_far),0) roi_paid, COUNT(*) FILTER (WHERE status='completed') completed FROM investments`)
+    ]);
+    res.json({success:true,data:{investments:ccAll(rows), stats:cc(kpi[0])}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── Referral system (real commission data from transactions) ───────────────
+app.get('/api/admin/referrals/stats', adminAuth, async (_,res) => {
+  try {
+    const [referrers, paid, top] = await Promise.all([
+      db(`SELECT COUNT(DISTINCT referred_by) c FROM users WHERE referred_by IS NOT NULL`),
+      db(`SELECT COALESCE(SUM(amount),0) total FROM transactions WHERE type='commission' AND created_at > NOW() - INTERVAL '30 days'`),
+      db(`SELECT u.name, u.uid, COALESCE(SUM(t.amount),0) earned FROM transactions t JOIN users u ON u.id=t.user_id
+          WHERE t.type='commission' AND t.created_at > NOW() - INTERVAL '30 days' GROUP BY u.id,u.name,u.uid ORDER BY earned DESC LIMIT 1`)
+    ]);
+    res.json({success:true,data:{
+      totalReferrers: parseInt(referrers.rows[0].c),
+      rewardsPaid30d: parseFloat(paid.rows[0].total),
+      topEarner: top.rows[0] ? {name:top.rows[0].name, uid:top.rows[0].uid, amount:parseFloat(top.rows[0].earned)} : null,
+    }});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.get('/api/admin/referrals/levels', adminAuth, async (_,res) => {
+  try {
+    const {rows} = await db(
+      `SELECT (meta->>'lvl')::int AS level, COUNT(*) referrers, COALESCE(SUM(amount),0) paid
+       FROM transactions WHERE type='commission' AND created_at > NOW() - INTERVAL '30 days'
+       GROUP BY (meta->>'lvl')::int ORDER BY level`);
+    const byLevel = {}; rows.forEach(r=> byLevel[r.level] = r);
+    const levels = Object.entries(COMM).map(([lvl,pct]) => ({
+      level: parseInt(lvl), commissionPct: pct,
+      referrers: parseInt(byLevel[lvl]?.referrers||0),
+      paid30d: parseFloat(byLevel[lvl]?.paid||0),
+    }));
+    res.json({success:true,data:{levels}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.get('/api/admin/referrals/earnings', adminAuth, async (req,res) => {
+  try {
+    const {rows} = await db(
+      `SELECT t.*, u.name AS referrer_name, u.uid AS referrer_uid FROM transactions t
+       JOIN users u ON u.id=t.user_id WHERE t.type='commission' ORDER BY t.created_at DESC LIMIT 50`);
+    res.json({success:true,data:{earnings:ccAll(rows)}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── Admin activity logs ───────────────────────────────────────────────────
+app.get('/api/admin/logs', adminAuth, async (req,res) => {
+  try {
+    const {rows} = await db(
+      `SELECT al.*, a.name as admin_name, a.email as admin_email FROM admin_logs al
+       LEFT JOIN admins a ON a.id=al.admin_id ORDER BY al.created_at DESC LIMIT 200`);
+    res.json({success:true,data:{logs:ccAll(rows)}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
 // ── 404 & error handler ───────────────────────────────────────────────────
 app.use((_,res)=>res.status(404).json({success:false,message:'Route not found'}));
 app.use((e,req,res,_)=>{console.error(e.message); res.status(500).json({success:false,message:e.message});});
+
 
 // ── Daily Profit Cron ────────────────────────────────────────────────────
 const runDailyProfits = async () => {
