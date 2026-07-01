@@ -1850,6 +1850,34 @@ app.get('/api/admin/stats', adminAuth, async (_,res) => {
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
+// ── Global search ─────────────────────────────────────────────────────────
+app.get('/api/admin/search', adminAuth, async (req, res) => {
+  try {
+    const q = (req.query.q||'').trim();
+    if (q.length < 2) return res.json({success:true, data:{users:[], deposits:[], withdrawals:[]}});
+    const like = `%${q}%`;
+    const [userRows, depRows, witRows] = await Promise.all([
+      db(`SELECT u.id, u.name, u.email, u.uid, u.status, u.membership_level
+          FROM users u
+          WHERE u.name ILIKE $1 OR u.email ILIKE $1 OR u.uid::text ILIKE $1
+          LIMIT 5`, [like]),
+      db(`SELECT t.id, t.amount, t.status, t.created_at, u.name as user_name, u.email as user_email
+          FROM transactions t JOIN users u ON u.id=t.user_id
+          WHERE t.type='deposit' AND (u.name ILIKE $1 OR u.email ILIKE $1 OR t.amount::text ILIKE $1)
+          ORDER BY t.created_at DESC LIMIT 5`, [like]),
+      db(`SELECT t.id, t.amount, t.status, t.created_at, u.name as user_name, u.email as user_email
+          FROM transactions t JOIN users u ON u.id=t.user_id
+          WHERE t.type='withdrawal' AND (u.name ILIKE $1 OR u.email ILIKE $1 OR t.amount::text ILIKE $1)
+          ORDER BY t.created_at DESC LIMIT 5`, [like]),
+    ]);
+    res.json({success:true, data:{
+      users: ccAll(userRows.rows),
+      deposits: ccAll(depRows.rows),
+      withdrawals: ccAll(witRows.rows),
+    }});
+  } catch(e){ res.status(500).json({success:false, message:e.message}); }
+});
+
 // ── Notification bell — actionable items needing admin attention ──────────
 app.get('/api/admin/notifications', adminAuth, async (req,res) => {
   try {
