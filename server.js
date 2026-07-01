@@ -2037,7 +2037,7 @@ app.get('/api/admin/users/:id/team', adminAuth, requirePermission('users'), asyn
       byLvl[r.lvl].push({id:r.id,name:r.name,uid:r.uid,level:r.membership_level,status:activeSet.has(r.id)?'active':'inactive',joinDate:r.created_at});
     });
     const levels = Object.entries(byLvl).map(([l,m])=>({level:parseInt(l),count:m.length,commission:LIVE_COMM[l]||0,members:m}));
-    res.json({success:true,data:{totalMembers:rows.length,levels}});
+    res.json({success:true,data:{totalMembers:rows.length,levels,commissionRates:LIVE_COMM}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
