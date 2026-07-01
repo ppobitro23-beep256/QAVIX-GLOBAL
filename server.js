@@ -1986,6 +1986,71 @@ app.get('/api/admin/users/:id', adminAuth, requirePermission('users'), async (re
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
+app.put('/api/admin/users/:id/wallet', adminAuth, requirePermission('users'), async (req,res) => {
+  try {
+    const {walletAddress, network} = req.body;
+    if(!walletAddress) return res.status(400).json({success:false,message:'Wallet address required'});
+    await db('UPDATE users SET wallet_address=$1, wallet_network=$2 WHERE id=$3',[walletAddress, network||'BEP20', req.params.id]);
+    await logAdmin(req.admin.id, `Updated wallet address for user ${req.params.id}`, {network});
+    res.json({success:true,message:'Wallet address updated'});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.get('/api/admin/users/:id/login-history', adminAuth, requirePermission('users'), async (req,res) => {
+  try {
+    const {rows} = await db(
+      `SELECT * FROM login_history WHERE user_id=$1 ORDER BY created_at DESC LIMIT 30`,
+      [req.params.id]);
+    res.json({success:true,data:{history:ccAll(rows)}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.get('/api/admin/users/:id/devices', adminAuth, requirePermission('users'), async (req,res) => {
+  try {
+    const {rows} = await db(
+      `SELECT id, device, ip, created_at, updated_at FROM user_sessions WHERE user_id=$1 ORDER BY COALESCE(updated_at,created_at) DESC LIMIT 20`,
+      [req.params.id]);
+    res.json({success:true,data:{devices:ccAll(rows)}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.get('/api/admin/users/:id/team', adminAuth, requirePermission('users'), async (req,res) => {
+  try {
+    const {rows} = await db(`
+      WITH RECURSIVE t AS (
+        SELECT id,name,uid,membership_level,created_at,1 AS lvl FROM users WHERE referred_by=$1
+        UNION ALL
+        SELECT u.id,u.name,u.uid,u.membership_level,u.created_at,t.lvl+1
+        FROM users u JOIN t ON u.referred_by=t.id WHERE t.lvl<10
+      ) SELECT * FROM t ORDER BY lvl,created_at
+    `,[req.params.id]);
+    let activeSet = new Set();
+    if(rows.length){
+      const ids = rows.map(r=>r.id);
+      const ph = ids.map((_,i)=>`$${i+1}`).join(',');
+      const {rows:ar} = await db(`SELECT DISTINCT user_id FROM investments WHERE status='active' AND user_id IN (${ph})`,ids);
+      ar.forEach(r=>activeSet.add(r.user_id));
+    }
+    const byLvl={};
+    rows.forEach(r=>{
+      if(!byLvl[r.lvl]) byLvl[r.lvl]=[];
+      byLvl[r.lvl].push({id:r.id,name:r.name,uid:r.uid,level:r.membership_level,status:activeSet.has(r.id)?'active':'inactive',joinDate:r.created_at});
+    });
+    const levels = Object.entries(byLvl).map(([l,m])=>({level:parseInt(l),count:m.length,commission:LIVE_COMM[l]||0,members:m}));
+    res.json({success:true,data:{totalMembers:rows.length,levels}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.get('/api/admin/users/:id/history', adminAuth, requirePermission('users'), async (req,res) => {
+  try {
+    const {rows} = await db(
+      `SELECT * FROM transactions WHERE user_id=$1 ORDER BY created_at DESC LIMIT 100`,
+      [req.params.id]);
+    res.json({success:true,data:{history:ccAll(rows)}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+
 app.put('/api/admin/users/:id/status', adminAuth, requirePermission('users'), async (req,res) => {
   try {
     const {status} = req.body; // active | suspended | banned
