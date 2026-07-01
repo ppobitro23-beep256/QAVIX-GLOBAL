@@ -1770,6 +1770,8 @@ app.post('/api/admin/login', adminLimit, async (req,res) => {
   const deviceHash = crypto.createHash('sha256').update(ip + '|' + (req.headers['user-agent']||'')).digest('hex');
   try {
     const {email,password,otp,remember} = req.body;
+    if (!email||!password) return res.status(400).json({success:false,message:'Email and password required'});
+    const lcEmail = email.toLowerCase();
     const {rows:recentFails} = await db(
       `SELECT COUNT(*) c FROM admin_login_attempts WHERE email=$1 AND success=false AND created_at > NOW() - INTERVAL '15 minutes'`,
       [lcEmail]);
