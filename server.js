@@ -4,6 +4,7 @@
 require('dotenv').config();
 
 const express      = require('express');
+const crypto       = require('crypto');
 const { Pool }     = require('pg');
 const bcrypt       = require('bcryptjs');
 const jwt          = require('jsonwebtoken');
@@ -174,6 +175,7 @@ const initDB = async () => {
     );
     CREATE INDEX IF NOT EXISTS idx_sm_user ON support_messages(user_id);
     CREATE INDEX IF NOT EXISTS idx_sm_time ON support_messages(created_at);
+    ALTER TABLE support_messages ADD COLUMN IF NOT EXISTS read_by_admin BOOLEAN DEFAULT FALSE;
 
     -- ── Admin Panel: accounts + access control ──────────────────────────
     CREATE TABLE IF NOT EXISTS admins (
@@ -192,6 +194,130 @@ const initDB = async () => {
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
     CREATE INDEX IF NOT EXISTS idx_alog_time ON admin_logs(created_at);
+
+    CREATE TABLE IF NOT EXISTS settings (
+      key        VARCHAR(50) PRIMARY KEY,
+      value      JSONB NOT NULL,
+      updated_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_by UUID REFERENCES admins(id) ON DELETE SET NULL
+    );
+
+    -- ── Phase 3: Security essentials ─────────────────────────────────────
+    CREATE TABLE IF NOT EXISTS admin_login_attempts (
+      id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      email      VARCHAR(150) NOT NULL,
+      ip         VARCHAR(64)  NOT NULL,
+      success    BOOLEAN      NOT NULL,
+      reason     VARCHAR(100) DEFAULT '',
+      created_at TIMESTAMPTZ  DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_alogin_email ON admin_login_attempts(email, created_at);
+    CREATE INDEX IF NOT EXISTS idx_alogin_time  ON admin_login_attempts(created_at);
+
+    CREATE TABLE IF NOT EXISTS admin_ip_whitelist (
+      id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      ip_address VARCHAR(64) NOT NULL UNIQUE,
+      label      VARCHAR(100) DEFAULT '',
+      added_by   UUID REFERENCES admins(id) ON DELETE SET NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    -- ── Phase 5: Announcements (popup/banner shown on index.html) ───────
+    CREATE TABLE IF NOT EXISTS announcements (
+      id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      title       VARCHAR(150) NOT NULL,
+      message     TEXT NOT NULL,
+      type        VARCHAR(20)  DEFAULT 'banner', -- 'banner' or 'popup'
+      style       VARCHAR(20)  DEFAULT 'info',   -- 'info','success','warning','urgent'
+      is_active   BOOLEAN      DEFAULT TRUE,
+      starts_at   TIMESTAMPTZ  DEFAULT NOW(),
+      ends_at     TIMESTAMPTZ,
+      created_by  UUID REFERENCES admins(id) ON DELETE SET NULL,
+      created_at  TIMESTAMPTZ  DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_ann_active ON announcements(is_active, starts_at, ends_at);
+
+    -- ── Phase 6: Content Management (FAQ / Banners / News / Terms / Privacy) ──
+    CREATE TABLE IF NOT EXISTS content_faq (
+      id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      question    VARCHAR(300) NOT NULL,
+      answer      TEXT NOT NULL,
+      category    VARCHAR(60)  DEFAULT 'General',
+      sort_order  INTEGER      DEFAULT 0,
+      is_active   BOOLEAN      DEFAULT TRUE,
+      created_at  TIMESTAMPTZ  DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS content_banners (
+      id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      title       VARCHAR(150) NOT NULL,
+      subtitle    VARCHAR(250) DEFAULT '',
+      image_url   TEXT         DEFAULT '',
+      link_url    TEXT         DEFAULT '',
+      sort_order  INTEGER      DEFAULT 0,
+      is_active   BOOLEAN      DEFAULT TRUE,
+      created_at  TIMESTAMPTZ  DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS content_news (
+      id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      title         VARCHAR(200) NOT NULL,
+      excerpt       VARCHAR(300) DEFAULT '',
+      body          TEXT NOT NULL,
+      image_url     TEXT DEFAULT '',
+      is_published  BOOLEAN DEFAULT TRUE,
+      published_at  TIMESTAMPTZ DEFAULT NOW(),
+      created_by    UUID REFERENCES admins(id) ON DELETE SET NULL,
+      created_at    TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    -- Long-form static pages: Terms of Service, Privacy Policy, About, etc.
+    CREATE TABLE IF NOT EXISTS content_pages (
+      slug        VARCHAR(50) PRIMARY KEY,
+      title       VARCHAR(150) NOT NULL,
+      body        TEXT NOT NULL DEFAULT '',
+      updated_by  UUID REFERENCES admins(id) ON DELETE SET NULL,
+      updated_at  TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    -- ── Reports gap-fill: manual loss/bad-debt entries (Loss Report) ────────
+    CREATE TABLE IF NOT EXISTS loss_entries (
+      id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      amount      NUMERIC(14,2) NOT NULL,
+      category    VARCHAR(60)   DEFAULT 'Bad Debt',
+      reason      TEXT          NOT NULL,
+      created_by  UUID REFERENCES admins(id) ON DELETE SET NULL,
+      created_at  TIMESTAMPTZ   DEFAULT NOW()
+    );
+
+    -- ── API Keys (Settings → API Keys) ───────────────────────────────────
+    CREATE TABLE IF NOT EXISTS api_keys (
+      id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      name        VARCHAR(100) NOT NULL,
+      key_prefix  VARCHAR(12)  NOT NULL,
+      key_hash    TEXT         NOT NULL,
+      created_by  UUID REFERENCES admins(id) ON DELETE SET NULL,
+      last_used_at TIMESTAMPTZ,
+      revoked     BOOLEAN      DEFAULT FALSE,
+      created_at  TIMESTAMPTZ  DEFAULT NOW()
+    );
+
+    -- ── Admin 2FA / device verification ──────────────────────────────────
+    CREATE TABLE IF NOT EXISTS admin_known_devices (
+      id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      admin_id    UUID NOT NULL REFERENCES admins(id) ON DELETE CASCADE,
+      device_hash VARCHAR(64) NOT NULL,
+      label       VARCHAR(150) DEFAULT '',
+      first_seen  TIMESTAMPTZ DEFAULT NOW(),
+      last_seen   TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(admin_id, device_hash)
+    );
+
+    -- Add permissions column to admins if it doesn't exist yet
+    ALTER TABLE admins ADD COLUMN IF NOT EXISTS permissions JSONB DEFAULT '{}'::jsonb;
+    -- Add admin column to admin_logs for filtering
+    CREATE INDEX IF NOT EXISTS idx_alog_admin ON admin_logs(admin_id);
+    CREATE INDEX IF NOT EXISTS idx_alog_action ON admin_logs USING gin(to_tsvector('english', action));
 
     -- ── User/transaction columns needed for admin moderation ────────────
     ALTER TABLE users ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'active';
@@ -214,6 +340,7 @@ const initDB = async () => {
     console.log(`⚠️  No QAVIX GLOBAL account found for ${seedEmail} yet — register that email on the platform first, then restart the server to link Super Admin access.`);
   }
   console.log('✅ Neon DB tables ready');
+  await loadSettingsCache();
 };
 
 // ── Helpers ──────────────────────────────────────────────────────────────
@@ -241,7 +368,7 @@ const sendEmail = async (toEmail, toName, subject, htmlBody) => {
       'api-key'      : process.env.BREVO_API_KEY,
     },
     body: JSON.stringify({
-      sender     : { name: 'QAVIX GLOBAL', email: process.env.BREVO_SENDER_EMAIL },
+      sender     : { name: LIVE_EMAIL_SENDER.fromName || 'QAVIX GLOBAL', email: LIVE_EMAIL_SENDER.fromEmail || process.env.BREVO_SENDER_EMAIL },
       to         : [{ email: toEmail, name: toName || toEmail }],
       subject    : subject,
       htmlContent: htmlBody,
@@ -264,6 +391,7 @@ const OTP_CONFIG = {
   withdraw_password : { expiry: 5,  subject: '🔐 QAVIX Withdrawal Password Change', action: 'change your withdrawal password'},
   change_email      : { expiry: 5,  subject: '📧 QAVIX Email Change Verification',  action: 'change your email'             },
   change_password   : { expiry: 5,  subject: '🔑 QAVIX Password Change',            action: 'change your login password'    },
+  admin_login       : { expiry: 5,  subject: '🛡️ QAVIX Admin Panel — New Sign-in',  action: 'verify this admin sign-in'     },
 };
 
 const MAX_RESENDS   = 3;   // max resend attempts in 10 minutes
@@ -328,7 +456,11 @@ const buildOTPEmail = (otp, purpose, expiryMin) => `
 // ── OTP Service ──────────────────────────────────────────────────────────
 
 // Generate secure 6-digit OTP
-const genOTP = () => String(Math.floor(100000 + Math.random() * 900000));
+const genOTP = () => {
+  const len = LIVE_OTP?.codeLength || 6;
+  const min = Math.pow(10, len-1), max = Math.pow(10, len)-1;
+  return String(Math.floor(min + Math.random() * (max-min)));
+};
 
 // Rate limit check — max 3 sends per email+purpose in 10 minutes
 const checkOTPRateLimit = async (email, purpose) => {
@@ -343,7 +475,8 @@ const checkOTPRateLimit = async (email, purpose) => {
 
 // Save OTP (hashed) and record rate limit
 const saveOTP = async (userId, email, otp, purpose, meta={}, expiryMin) => {
-  const min = expiryMin || OTP_CONFIG[purpose]?.expiry || 5;
+  const liveOverride = purpose==='login' ? LIVE_OTP.loginExpiryMin : purpose==='withdraw' ? LIVE_OTP.withdrawExpiryMin : purpose==='register' ? LIVE_OTP.registerExpiryMin : null;
+  const min = expiryMin || liveOverride || OTP_CONFIG[purpose]?.expiry || 5;
   // Invalidate previous OTPs for same email+purpose
   await db(
     `UPDATE otp_codes SET used=TRUE WHERE email=$1 AND purpose=$2 AND used=FALSE`,
@@ -431,7 +564,7 @@ const auth = async (req, res, next) => {
 };
 
 // ── Admin JWT + middleware ─────────────────────────────────────────────────
-const signAdmin = (id) => jwt.sign({id, isAdmin:true}, process.env.ADMIN_JWT_SECRET || process.env.JWT_SECRET, {expiresIn:'12h'});
+const signAdmin = (id, remember=false) => jwt.sign({id, isAdmin:true}, process.env.ADMIN_JWT_SECRET || process.env.JWT_SECRET, {expiresIn: remember ? '30d' : '12h'});
 const adminAuth = async (req, res, next) => {
   try {
     const h = req.headers.authorization;
@@ -439,7 +572,7 @@ const adminAuth = async (req, res, next) => {
     const d = jwt.verify(h.split(' ')[1], process.env.ADMIN_JWT_SECRET || process.env.JWT_SECRET);
     if (!d.isAdmin) return res.status(403).json({success:false,message:'Not an admin token'});
     const {rows} = await db(
-      `SELECT a.id, a.role, a.status, u.id as user_id, u.name, u.email FROM admins a
+      `SELECT a.id, a.role, a.status, a.permissions, u.id as user_id, u.name, u.email FROM admins a
        JOIN users u ON u.id=a.user_id WHERE a.id=$1`, [d.id]);
     if (!rows[0]) return res.status(401).json({success:false,message:'Admin not found'});
     if (rows[0].status !== 'active') return res.status(403).json({success:false,message:'This admin account is suspended'});
@@ -454,11 +587,38 @@ const requireRole = (...roles) => (req, res, next) => {
   if (!roles.includes(req.admin.role)) return res.status(403).json({success:false,message:'Insufficient permissions for this action'});
   next();
 };
+
+// Default permission matrix per role — what each role can do out of the box.
+// Super Admin always gets everything and cannot be restricted.
+// These are used when an admin has no custom permissions saved yet.
+const DEFAULT_ROLE_PERMISSIONS = {
+  'Super Admin': { dashboard:true, users:true, deposits:true, withdrawals:true, plans:true, investments:true, referral:true, reports:true, settings:true, security:true, support:true, announcements:true, content:true, admins:true, logs:true, backup:true },
+  'Moderator':   { dashboard:true, users:true, deposits:true, withdrawals:false, plans:false, investments:true, referral:true, reports:true, settings:false, security:false, support:true, announcements:true, content:true, admins:false, logs:false, backup:false },
+  'Finance':     { dashboard:true, users:false, deposits:true, withdrawals:true, plans:true, investments:true, referral:true, reports:true, settings:false, security:false, support:false, announcements:false, content:false, admins:false, logs:true, backup:true },
+  'Support':     { dashboard:true, users:true, deposits:false, withdrawals:false, plans:false, investments:false, referral:false, reports:false, settings:false, security:false, support:true, announcements:false, content:false, admins:false, logs:false, backup:false },
+};
+
+// Check if an admin has permission for a given module key.
+// Super Admin always passes; others check custom permissions, falling back to role defaults.
+const hasPermission = (admin, module) => {
+  if (admin.role === 'Super Admin') return true;
+  const perms = admin.permissions && Object.keys(admin.permissions).length > 0
+    ? admin.permissions
+    : (DEFAULT_ROLE_PERMISSIONS[admin.role] || {});
+  return !!perms[module];
+};
+
+// requirePermission middleware — used on page-level routes to enforce module access
+const requirePermission = (module) => async (req, res, next) => {
+  if (!req.admin) return res.status(401).json({success:false,message:'Not authenticated'});
+  if (!hasPermission(req.admin, module)) return res.status(403).json({success:false,message:`Your role does not have access to: ${module}`});
+  next();
+};
 const logAdmin = (adminId, action, meta={}) =>
   db(`INSERT INTO admin_logs(admin_id,action,meta) VALUES($1,$2,$3)`,[adminId,action,JSON.stringify(meta)]).catch(()=>{});
 
 // ── Constants ────────────────────────────────────────────────────────────
-const PLANS = [
+const DEFAULT_PLANS = [
   { id:'bronze', name:'QAVIX BRONZE', tier:'Bronze', emoji:'🥉',
     rate:0.055, days:20, min:5,   max:20,   recommended:false,
     color:'#CD7F32', description:'Entry-level plan for new investors' },
@@ -472,7 +632,64 @@ const PLANS = [
     rate:0.075, days:20, min:301, max:1000, recommended:false,
     color:'#9B7AE8', description:'Maximum returns for serious investors' },
 ];
-const COMM = {1:10, 2:5, 3:2, 4:1, 5:1, 6:1, 7:1, 8:1, 9:1, 10:1};
+const DEFAULT_COMM = {1:10, 2:5, 3:2, 4:1, 5:1, 6:1, 7:1, 8:1, 9:1, 10:1};
+// Rank used to decide whether a new plan purchase upgrades a user's displayed membership level.
+const TIER_RANK = { starter:0, bronze:1, silver:2, gold:3, elite:4 };
+const DEFAULT_PAYMENT = {
+  depositMin: parseFloat(process.env.DEPOSIT_MIN)||10,
+  withdrawalMin: parseFloat(process.env.WITHDRAWAL_MIN)||2,
+  withdrawalMax: parseFloat(process.env.WITHDRAWAL_MAX)||10000,
+  withdrawalFeePercent: 5,
+  network: 'BEP20',
+};
+const DEFAULT_REFERRAL = { enabled: true };
+const DEFAULT_MAINTENANCE = { enabled: false, message: 'We are performing scheduled maintenance and will be back shortly.' };
+const DEFAULT_SECURITY = { ipWhitelistEnabled: false, adminTwoFactorEnabled: false };
+const DEFAULT_GENERAL = { siteName: 'QAVIX GLOBAL', supportEmail: 'support@qavixglobal.com', timezone: 'UTC', language: 'en' };
+const DEFAULT_BRANDING = { logoUrl: '', primaryColor: '#C9A227', theme: 'light' };
+// Email delivery actually runs on the Brevo HTTP API (see sendEmail) — there is no
+// raw SMTP host/port/user/password in this stack, so this only exposes the two
+// fields that genuinely change Brevo's outgoing emails. The Brevo API key itself
+// stays in .env since it's a secret, not something to expose through the panel.
+const DEFAULT_EMAIL_SENDER = { fromName: 'QAVIX GLOBAL', fromEmail: '' };
+const DEFAULT_OTP = { codeLength: 6, loginExpiryMin: 5, withdrawExpiryMin: 3, registerExpiryMin: 5, loginOtpEnabled: true, withdrawOtpEnabled: true };
+
+// Live, DB-backed config — admins can edit these via /api/admin/settings/*.
+// Falls back to the DEFAULT_* values above until the settings table has rows.
+let LIVE_PLANS = DEFAULT_PLANS.map(p=>({...p}));
+let LIVE_COMM = {...DEFAULT_COMM};
+let LIVE_PAYMENT = {...DEFAULT_PAYMENT};
+let LIVE_REFERRAL = {...DEFAULT_REFERRAL};
+let LIVE_MAINTENANCE = {...DEFAULT_MAINTENANCE};
+let LIVE_SECURITY = {...DEFAULT_SECURITY};
+let LIVE_GENERAL = {...DEFAULT_GENERAL};
+let LIVE_BRANDING = {...DEFAULT_BRANDING};
+let LIVE_EMAIL_SENDER = {...DEFAULT_EMAIL_SENDER};
+let LIVE_OTP = {...DEFAULT_OTP};
+
+// Extract the real client IP, accounting for Render's reverse proxy.
+const getClientIp = (req) =>
+  req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || req.connection?.remoteAddress || 'unknown';
+
+const loadSettingsCache = async () => {
+  try {
+    const {rows} = await pool.query('SELECT key,value FROM settings');
+    rows.forEach(r => {
+      if (r.key === 'plans') LIVE_PLANS = r.value;
+      if (r.key === 'commission') LIVE_COMM = r.value;
+      if (r.key === 'payment') LIVE_PAYMENT = {...DEFAULT_PAYMENT, ...r.value};
+      if (r.key === 'referral') LIVE_REFERRAL = {...DEFAULT_REFERRAL, ...r.value};
+      if (r.key === 'maintenance') LIVE_MAINTENANCE = {...DEFAULT_MAINTENANCE, ...r.value};
+      if (r.key === 'security') LIVE_SECURITY = {...DEFAULT_SECURITY, ...r.value};
+      if (r.key === 'general') LIVE_GENERAL = {...DEFAULT_GENERAL, ...r.value};
+      if (r.key === 'branding') LIVE_BRANDING = {...DEFAULT_BRANDING, ...r.value};
+      if (r.key === 'smtp') LIVE_EMAIL_SENDER = {...DEFAULT_EMAIL_SENDER, ...r.value};
+      if (r.key === 'otp') LIVE_OTP = {...DEFAULT_OTP, ...r.value};
+    });
+    console.log('✅ Settings cache loaded from DB');
+  } catch(e){ console.log('⚠️  Could not load settings cache, using defaults:', e.message); }
+};
+
 const REWARDS = [
   {id:'daily',  name:'Daily Check-in',      amount:0.50,  cd:24  },
   {id:'weekly', name:'Weekly Reward',       amount:5.00,  cd:168 },
@@ -483,11 +700,12 @@ const REWARDS = [
 
 // Pay referral commissions up the chain
 const payComm = async (investorId, amount) => {
+  if (!LIVE_REFERRAL.enabled) return;
   let cur = investorId;
   for (let lvl=1; lvl<=10; lvl++) {
     const {rows} = await db('SELECT id,name,referred_by FROM users WHERE id=$1',[cur]);
     if (!rows[0]?.referred_by) break;
-    const earned = +((amount*(COMM[lvl]||0))/100).toFixed(2);
+    const earned = +((amount*(LIVE_COMM[lvl]||0))/100).toFixed(2);
     await db('UPDATE users SET pending_earnings=pending_earnings+$1 WHERE id=$2',[earned, rows[0].referred_by]);
     await db(`INSERT INTO transactions(user_id,type,amount,description,meta) VALUES($1,'commission',$2,$3,$4)`,
       [rows[0].referred_by, earned, `Level ${lvl} commission from ${rows[0].name}`, JSON.stringify({from:investorId,lvl})]);
@@ -513,6 +731,37 @@ app.options('*', cors());
 app.use(express.json({limit:'10kb'}));
 app.use(rateLimit({windowMs:15*60000, max:300, skip:r=>r.path==='/api/health'}));
 
+// ── Maintenance mode (admins and health checks always pass through) ────────
+app.use((req,res,next) => {
+  if (!LIVE_MAINTENANCE.enabled) return next();
+  if (req.path.startsWith('/api/admin') || req.path === '/api/health') return next();
+  res.status(503).json({success:false, maintenance:true, message: LIVE_MAINTENANCE.message});
+});
+
+// ── Admin IP whitelist (only enforced when toggled on in Security settings) ─
+app.use(async (req,res,next) => {
+  if (!req.path.startsWith('/api/admin')) return next();
+  if (!LIVE_SECURITY.ipWhitelistEnabled) return next();
+  // Exempt only the toggle endpoint: an admin who already holds a valid token from
+  // before their IP changed can still reach it to turn the restriction off, even
+  // though every other admin route is blocked for them. Login itself is NOT
+  // exempted — exempting it would let anyone with valid credentials (but a
+  // non-whitelisted IP) log in and then immediately call this same toggle to
+  // disable the whole protection, which would defeat the point of the feature.
+  if (req.path === '/api/admin/security/ip-whitelist/toggle') return next();
+  const ip = getClientIp(req);
+  try {
+    const {rows:countRows} = await db('SELECT COUNT(*) c FROM admin_ip_whitelist');
+    // Safety net: an enabled whitelist with zero entries would lock out every
+    // admin with no way back in (including via the toggle, since reaching it
+    // requires logging in first). Treat that as misconfigured and fail open.
+    if (parseInt(countRows[0].c) === 0) return next();
+    const {rows} = await db('SELECT 1 FROM admin_ip_whitelist WHERE ip_address=$1',[ip]);
+    if (!rows[0]) return res.status(403).json({success:false,message:`Access denied: IP ${ip} is not whitelisted for admin access`});
+    next();
+  } catch(e){ next(); } // fail open on DB errors so a transient issue doesn't lock everyone out
+});
+
 const limit10 = rateLimit({windowMs:15*60000, max:10});
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -522,6 +771,65 @@ const limit10 = rateLimit({windowMs:15*60000, max:10});
 // Health
 app.get('/',           (_,res)=>res.json({success:true,message:'🏦 QAVIX GLOBAL API',db:pool?'Neon ✅':'No DB ⚠️'}));
 app.get('/api/health', (_,res)=>res.json({success:true,status:'healthy',uptime:process.uptime()}));
+
+// ── Public: active announcements (used by index.html banner/popup) ─────────
+app.get('/api/announcements/active', async (_,res) => {
+  try {
+    const {rows} = await db(
+      `SELECT id,title,message,type,style FROM announcements
+       WHERE is_active=true AND starts_at<=NOW() AND (ends_at IS NULL OR ends_at>NOW())
+       ORDER BY created_at DESC`);
+    res.json({success:true,data:{announcements:ccAll(rows)}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── Public: Content Management read endpoints (used by index.html) ────────
+// Also expose branding for CSS variable injection on page load
+app.get('/api/content/branding', async (_,res) => {
+  res.json({success:true,data:LIVE_BRANDING});
+});
+
+// ── Public: payment limits & fee (used by index.html withdrawal form) ────
+app.get('/api/content/payment-info', async (_,res) => {
+  res.json({success:true,data:{
+    depositMin: LIVE_PAYMENT.depositMin,
+    withdrawalMin: LIVE_PAYMENT.withdrawalMin,
+    withdrawalMax: LIVE_PAYMENT.withdrawalMax,
+    withdrawalFeePercent: LIVE_PAYMENT.withdrawalFeePercent,
+  }});
+});
+
+app.get('/api/content/faq', async (_,res) => {
+  try {
+    const {rows} = await db(`SELECT id,question,answer,category FROM content_faq WHERE is_active=true ORDER BY sort_order ASC, created_at ASC`);
+    res.json({success:true,data:{faqs:ccAll(rows)}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.get('/api/content/banners', async (_,res) => {
+  try {
+    const {rows} = await db(`SELECT id,title,subtitle,image_url,link_url FROM content_banners WHERE is_active=true ORDER BY sort_order ASC, created_at ASC`);
+    res.json({success:true,data:{banners:ccAll(rows)}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.get('/api/content/news', async (req,res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit)||20, 50);
+    const {rows} = await db(
+      `SELECT id,title,excerpt,body,image_url,published_at FROM content_news
+       WHERE is_published=true ORDER BY published_at DESC LIMIT $1`,[limit]);
+    res.json({success:true,data:{news:ccAll(rows)}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.get('/api/content/pages/:slug', async (req,res) => {
+  try {
+    const {rows} = await db('SELECT slug,title,body,updated_at FROM content_pages WHERE slug=$1',[req.params.slug]);
+    if (!rows[0]) return res.status(404).json({success:false,message:'Page not found'});
+    res.json({success:true,data:{page:cc(rows[0])}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
 
 // ── Auth ─────────────────────────────────────────────────────────────────
 // ── Registration — Step 1: Send OTP ──────────────────────────────────────
@@ -613,14 +921,14 @@ app.post('/api/auth/login', limit10, async (req,res) => {
     if (user.status === 'suspended') return res.status(403).json({success:false,message:'Your account has been suspended. Contact support for help.'});
     if (user.status === 'banned')    return res.status(403).json({success:false,message:'Your account has been banned.'});
 
-    // Step 1: credentials OK → send OTP
-    if (!otp) {
+    // Step 1: credentials OK → send OTP (unless login OTP has been turned off in Settings)
+    if (!otp && LIVE_OTP.loginOtpEnabled) {
       await issueOTP(user.id, user.email, 'login');
-      return res.json({success:true,requireOtp:true,message:'OTP sent to your email. Valid for 5 minutes.'});
+      return res.json({success:true,requireOtp:true,message:`OTP sent to your email. Valid for ${LIVE_OTP.loginExpiryMin} minutes.`});
     }
 
-    // Step 2: verify OTP → issue tokens
-    await verifyOTP(user.email, otp, 'login');
+    // Step 2: verify OTP → issue tokens (skipped entirely when login OTP is disabled)
+    if (otp) await verifyOTP(user.email, otp, 'login');
     await db('UPDATE users SET last_login=NOW() WHERE id=$1',[user.id]);
     const ip  = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || req.connection?.remoteAddress || 'unknown';
     const dev = req.headers['user-agent'] || 'Unknown device';
@@ -863,7 +1171,7 @@ app.get('/api/plans', auth, async (req,res) => {
   try {
     const {rows} = await db("SELECT plan_id FROM investments WHERE user_id=$1 AND status='active'",[req.user.id]);
     const active = rows.map(r=>r.plan_id);
-    res.json({success:true, data:{plans: PLANS.map(p=>({
+    res.json({success:true, data:{plans: LIVE_PLANS.map(p=>({
       ...p,
       isActive      : active.includes(p.id),
       dailyExample  : +(p.min * p.rate).toFixed(2),
@@ -877,9 +1185,10 @@ app.get('/api/plans', auth, async (req,res) => {
 app.post('/api/plans/purchase', auth, async (req,res) => {
   try {
     const {planId,amount}=req.body;
-    const plan=PLANS.find(p=>p.id===planId);
+    const plan=LIVE_PLANS.find(p=>p.id===planId);
     if (!plan) return res.status(404).json({success:false,message:'Plan not found'});
-    const {rows:[u]}=await db('SELECT balance FROM users WHERE id=$1',[req.user.id]);
+    if (plan.status === 'paused') return res.status(400).json({success:false,message:`${plan.tier} is temporarily unavailable`});
+    const {rows:[u]}=await db('SELECT balance,membership_level FROM users WHERE id=$1',[req.user.id]);
     const amt = parseFloat(amount);
     if (!amt || isNaN(amt))       return res.status(400).json({success:false,message:'Invalid amount'});
     if (amt < plan.min)           return res.status(400).json({success:false,message:`Minimum for ${plan.tier} is $${plan.min}`});
@@ -897,6 +1206,11 @@ app.post('/api/plans/purchase', auth, async (req,res) => {
     );
     // Deduct from balance — capital is locked permanently
     await db('UPDATE users SET balance=balance-$1,total_deposited=total_deposited+$1 WHERE id=$2',[amt,req.user.id]);
+    // Reflect the highest plan tier ever reached as the user's membership level
+    // (e.g. team tree badges, admin Users list "Plan" column, leaderboards).
+    if (TIER_RANK[planId] > (TIER_RANK[u.membership_level] ?? 0)) {
+      await db('UPDATE users SET membership_level=$1 WHERE id=$2',[planId, req.user.id]);
+    }
     await payComm(req.user.id, amt);
     await notif(req.user.id,'investment',`${plan.name} activated!`,
       `Daily profit: $${daily.toFixed(2)} for ${plan.days} days. Capital is locked.`);
@@ -936,7 +1250,7 @@ app.get('/api/wallet/transactions', auth, async (req,res) => {
 app.post('/api/wallet/deposit', auth, async (req,res) => {
   try {
     const {amount,network,txHash}=req.body;
-    const MIN=parseFloat(process.env.DEPOSIT_MIN)||10, amt=parseFloat(amount);
+    const MIN=LIVE_PAYMENT.depositMin, amt=parseFloat(amount);
     if (!amt||amt<MIN) return res.status(400).json({success:false,message:`Min deposit $${MIN}`});
     if (!txHash)       return res.status(400).json({success:false,message:'Transaction hash required'});
     // Deposits are held as 'pending' until an admin approves them in the admin console.
@@ -951,8 +1265,8 @@ app.post('/api/wallet/deposit', auth, async (req,res) => {
 app.post('/api/wallet/withdraw', auth, async (req,res) => {
   try {
     const {amount,walletAddress,network,withdrawalPassword,otp} = req.body;
-    const MIN = parseFloat(process.env.WITHDRAWAL_MIN) || 2;
-    const MAX = parseFloat(process.env.WITHDRAWAL_MAX) || 10000;
+    const MIN = LIVE_PAYMENT.withdrawalMin;
+    const MAX = LIVE_PAYMENT.withdrawalMax;
     const amt = parseFloat(amount);
     if (!amt||amt<MIN) return res.status(400).json({success:false,message:`Minimum withdrawal is $${MIN} USDT`});
     if (amt>MAX)       return res.status(400).json({success:false,message:`Max withdrawal $${MAX}`});
@@ -968,15 +1282,15 @@ app.post('/api/wallet/withdraw', auth, async (req,res) => {
     if (!withdrawalPassword) return res.status(400).json({success:false,message:'Withdrawal password required'});
     if (!await bcrypt.compare(withdrawalPassword,u.withdrawal_pass)) return res.status(400).json({success:false,message:'Incorrect withdrawal password'});
 
-    const fee = +(amt * 0.05).toFixed(2);
+    const fee = +(amt * (LIVE_PAYMENT.withdrawalFeePercent/100)).toFixed(2);
     const net = +(amt - fee).toFixed(2);
 
-    // OTP step
-    if (!otp) {
+    // OTP step (skipped entirely when withdrawal OTP has been turned off in Settings)
+    if (!otp && LIVE_OTP.withdrawOtpEnabled) {
       await issueOTP(req.user.id, u.email, 'withdraw', {amount:amt, walletAddress, network, fee, net});
-      return res.json({success:true,requireOtp:true,message:'OTP sent to confirm withdrawal. Valid for 3 minutes.',data:{fee,netAmount:net}});
+      return res.json({success:true,requireOtp:true,message:`OTP sent to confirm withdrawal. Valid for ${LIVE_OTP.withdrawExpiryMin} minutes.`,data:{fee,netAmount:net}});
     }
-    await verifyOTP(u.email, otp, 'withdraw');
+    if (otp) await verifyOTP(u.email, otp, 'withdraw');
     await db('UPDATE users SET balance=balance-$1,total_withdrawn=total_withdrawn+$2 WHERE id=$3',[amt,net,req.user.id]);
     const {rows}=await db(
       `INSERT INTO transactions(user_id,type,amount,status,description,meta)
@@ -993,7 +1307,7 @@ app.get('/api/referral/info', auth, async (req,res) => {
   try {
     const {rows}=await db('SELECT referral_code FROM users WHERE id=$1',[req.user.id]);
     const code=rows[0].referral_code;
-    res.json({success:true,data:{referralCode:code,referralLink:`https://qavixglobal.pages.dev/?ref=${code}`,commissionRates:COMM}});
+    res.json({success:true,data:{referralCode:code,referralLink:`https://qavixglobal.pages.dev/?ref=${code}`,commissionRates:LIVE_COMM}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
@@ -1058,7 +1372,7 @@ app.get('/api/referral/team', auth, async (req,res) => {
         level:r.membership_level, joinDate:r.created_at
       });
     });
-    res.json({success:true,data:{totalMembers:rows.length,levels:Object.entries(byLvl).map(([l,m])=>({level:parseInt(l),count:m.length,commission:COMM[l]||0,members:m}))}});
+    res.json({success:true,data:{totalMembers:rows.length,levels:Object.entries(byLvl).map(([l,m])=>({level:parseInt(l),count:m.length,commission:LIVE_COMM[l]||0,members:m}))}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
@@ -1267,6 +1581,7 @@ app.get('/api/stats/leaderboard', async (_,res) => {
 const TG_TOKEN   = process.env.TELEGRAM_BOT_TOKEN || '8850489978:AAFvF7bpKrovFwwjpMgGxw4v8WmJclbMGWI';
 const TG_CHAT_ID = process.env.TELEGRAM_CHAT_ID   || '6874570336';
 const TG_API     = `https://api.telegram.org/bot${TG_TOKEN}`;
+let LAST_AUTO_BACKUP = null; // ISO timestamp of the last automatic daily backup sent to Telegram
 
 // Send message to admin Telegram
 const tgSend = async (text, opts={}) => {
@@ -1279,6 +1594,20 @@ const tgSend = async (text, opts={}) => {
     const data = await r.json();
     return data.ok ? data.result : null;
   } catch(e) { console.error('TG send error:', e.message); return null; }
+};
+
+// Send a file (e.g. backup .json) to admin Telegram — used since Render has no
+// persistent disk; Telegram chat history becomes the off-site backup storage.
+const tgSendDocument = async (buffer, filename, caption='') => {
+  try {
+    const form = new FormData();
+    form.append('chat_id', TG_CHAT_ID);
+    if (caption) form.append('caption', caption);
+    form.append('document', new Blob([buffer], {type:'application/json'}), filename);
+    const r = await fetch(`${TG_API}/sendDocument`, { method:'POST', body: form });
+    const data = await r.json();
+    return data.ok ? data.result : null;
+  } catch(e) { console.error('TG document send error:', e.message); return null; }
 };
 
 // User sends a message → saved to DB + forwarded to Telegram
@@ -1437,20 +1766,62 @@ const adminLimit = rateLimit({windowMs:15*60000, max:30});
 
 // ── Admin auth ──────────────────────────────────────────────────────────
 app.post('/api/admin/login', adminLimit, async (req,res) => {
+  const ip = getClientIp(req);
+  const deviceHash = crypto.createHash('sha256').update(ip + '|' + (req.headers['user-agent']||'')).digest('hex');
   try {
-    const {email,password} = req.body;
-    if (!email||!password) return res.status(400).json({success:false,message:'Email and password required'});
+    const {email,password,otp,remember} = req.body;
+    const {rows:recentFails} = await db(
+      `SELECT COUNT(*) c FROM admin_login_attempts WHERE email=$1 AND success=false AND created_at > NOW() - INTERVAL '15 minutes'`,
+      [lcEmail]);
+    if (parseInt(recentFails[0].c) >= 5) {
+      await db('INSERT INTO admin_login_attempts(email,ip,success,reason) VALUES($1,$2,false,$3)',[lcEmail,ip,'Locked out']).catch(()=>{});
+      return res.status(429).json({success:false,message:'Too many failed login attempts. Try again in 15 minutes.'});
+    }
+
     // Admin login uses the SAME account + password as the regular QAVIX GLOBAL platform — no separate admin password.
-    const {rows:[user]} = await db('SELECT * FROM users WHERE email=$1',[email.toLowerCase()]);
-    if (!user||!await bcrypt.compare(password,user.password))
+    const {rows:[user]} = await db('SELECT * FROM users WHERE email=$1',[lcEmail]);
+    if (!user||!await bcrypt.compare(password,user.password)) {
+      await db('INSERT INTO admin_login_attempts(email,ip,success,reason) VALUES($1,$2,false,$3)',[lcEmail,ip,'Invalid credentials']).catch(()=>{});
       return res.status(401).json({success:false,message:'Invalid email or password'});
+    }
     const {rows:[admin]} = await db('SELECT * FROM admins WHERE user_id=$1',[user.id]);
-    if (!admin) return res.status(403).json({success:false,message:'This email is not registered as an admin'});
-    if (admin.status === 'pending')   return res.status(403).json({success:false,message:'Your admin account is awaiting approval from a Super Admin'});
-    if (admin.status !== 'active')    return res.status(403).json({success:false,message:'This admin account is suspended'});
+    if (!admin) {
+      await db('INSERT INTO admin_login_attempts(email,ip,success,reason) VALUES($1,$2,false,$3)',[lcEmail,ip,'Not an admin']).catch(()=>{});
+      return res.status(403).json({success:false,message:'This email is not registered as an admin'});
+    }
+    if (admin.status === 'pending') {
+      await db('INSERT INTO admin_login_attempts(email,ip,success,reason) VALUES($1,$2,false,$3)',[lcEmail,ip,'Pending approval']).catch(()=>{});
+      return res.status(403).json({success:false,message:'Your admin account is awaiting approval from a Super Admin'});
+    }
+    if (admin.status !== 'active') {
+      await db('INSERT INTO admin_login_attempts(email,ip,success,reason) VALUES($1,$2,false,$3)',[lcEmail,ip,'Suspended']).catch(()=>{});
+      return res.status(403).json({success:false,message:'This admin account is suspended'});
+    }
+
+    // ── 2FA / new-device verification ──────────────────────────────────
+    // Triggers an email OTP step when: Admin 2FA is turned ON in Security settings,
+    // OR this admin has never signed in from this device+IP combination before.
+    const {rows:knownDevice} = await db(
+      'SELECT 1 FROM admin_known_devices WHERE admin_id=$1 AND device_hash=$2',[admin.id, deviceHash]);
+    const needsOtp = LIVE_SECURITY.adminTwoFactorEnabled || !knownDevice[0];
+
+    if (needsOtp && !otp) {
+      await issueOTP(user.id, user.email, 'admin_login', {adminId:admin.id, deviceHash});
+      return res.json({success:true, requireOtp:true,
+        message: knownDevice[0] ? 'Verification code sent to your email.' : 'New device detected — verification code sent to your email.'});
+    }
+    if (needsOtp && otp) {
+      await verifyOTP(user.email, otp, 'admin_login');
+      await db(
+        `INSERT INTO admin_known_devices(admin_id,device_hash,label) VALUES($1,$2,$3)
+         ON CONFLICT (admin_id,device_hash) DO UPDATE SET last_seen=NOW()`,
+        [admin.id, deviceHash, (req.headers['user-agent']||'Unknown device').slice(0,150)]);
+    }
+
+    await db('INSERT INTO admin_login_attempts(email,ip,success) VALUES($1,$2,true)',[lcEmail,ip]).catch(()=>{});
     await db('UPDATE admins SET last_login=NOW() WHERE id=$1',[admin.id]);
-    await logAdmin(admin.id, 'Logged in');
-    const token = signAdmin(admin.id);
+    await logAdmin(admin.id, 'Logged in', {ip});
+    const token = signAdmin(admin.id, !!remember);
     res.json({success:true,message:'Welcome back',data:{admin:{id:admin.id,name:user.name,email:user.email,role:admin.role,status:admin.status},token}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
@@ -1477,26 +1848,97 @@ app.get('/api/admin/stats', adminAuth, async (_,res) => {
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
-// ── Users management ──────────────────────────────────────────────────────
-app.get('/api/admin/users', adminAuth, async (req,res) => {
+// ── Notification bell — actionable items needing admin attention ──────────
+app.get('/api/admin/notifications', adminAuth, async (req,res) => {
+  try {
+    const [depRows, witRows, pendingAdminRows, unreadChatRows] = await Promise.all([
+      db(`SELECT t.id, t.amount, t.created_at, u.name FROM transactions t JOIN users u ON u.id=t.user_id
+          WHERE t.type='deposit' AND t.status='pending' ORDER BY t.created_at DESC LIMIT 5`),
+      db(`SELECT t.id, t.amount, t.created_at, u.name FROM transactions t JOIN users u ON u.id=t.user_id
+          WHERE t.type='withdrawal' AND t.status='pending' ORDER BY t.created_at DESC LIMIT 5`),
+      db(`SELECT a.id, a.created_at, u.name FROM admins a JOIN users u ON u.id=a.user_id
+          WHERE a.status='pending' ORDER BY a.created_at DESC LIMIT 5`),
+      db(`SELECT user_id, COUNT(*) c, MAX(created_at) last FROM support_messages
+          WHERE direction='user' AND read_by_admin=false GROUP BY user_id ORDER BY last DESC LIMIT 5`),
+    ]);
+    const [{rows:depCount}, {rows:witCount}, {rows:apprCount}, {rows:chatCount}] = await Promise.all([
+      db(`SELECT COUNT(*) c FROM transactions WHERE type='deposit' AND status='pending'`),
+      db(`SELECT COUNT(*) c FROM transactions WHERE type='withdrawal' AND status='pending'`),
+      db(`SELECT COUNT(*) c FROM admins WHERE status='pending'`),
+      db(`SELECT COUNT(*) c FROM support_messages WHERE direction='user' AND read_by_admin=false`),
+    ]);
+    const items = [
+      ...depRows.rows.map(r=>({type:'deposit', page:'deposits', label:`New deposit request from ${r.name}`, sub:`$${parseFloat(r.amount).toLocaleString()}`, time:r.created_at})),
+      ...witRows.rows.map(r=>({type:'withdrawal', page:'withdrawals', label:`New withdrawal request from ${r.name}`, sub:`$${parseFloat(r.amount).toLocaleString()}`, time:r.created_at})),
+      ...pendingAdminRows.rows.map(r=>({type:'admin', page:'admins', label:`${r.name} is awaiting admin approval`, sub:'', time:r.created_at})),
+      ...unreadChatRows.rows.map(r=>({type:'chat', page:'support', label:`${r.c} unread message(s) in support chat`, sub:'', time:r.last})),
+    ].sort((a,b)=> new Date(b.time)-new Date(a.time)).slice(0,15);
+    res.json({success:true,data:{
+      counts: {
+        pendingDeposits: parseInt(depCount[0].c), pendingWithdrawals: parseInt(witCount[0].c),
+        pendingApprovals: parseInt(apprCount[0].c), unreadChats: parseInt(chatCount[0].c),
+      },
+      items: items.map(i=>({...i, time:i.time})),
+    }});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+
+app.get('/api/admin/users', adminAuth, requirePermission('users'), async (req,res) => {
   try {
     const page = parseInt(req.query.page)||1, limit = parseInt(req.query.limit)||20;
     const search = (req.query.search||'').trim();
     const status = req.query.status||'';
+    const plan = (req.query.plan||'').toLowerCase();
+    const dateRange = req.query.dateRange||'';
     let where = [], params = [];
     if (search) { params.push(`%${search}%`); where.push(`(name ILIKE $${params.length} OR email ILIKE $${params.length} OR uid ILIKE $${params.length})`); }
     if (status) { params.push(status); where.push(`status=$${params.length}`); }
+    if (plan) { params.push(plan); where.push(`membership_level=$${params.length}`); }
+    if (dateRange === '7d') where.push(`created_at > NOW() - INTERVAL '7 days'`);
+    if (dateRange === '30d') where.push(`created_at > NOW() - INTERVAL '30 days'`);
+    if (dateRange === 'year') where.push(`created_at > date_trunc('year', NOW())`);
     const whereSql = where.length ? 'WHERE '+where.join(' AND ') : '';
     const {rows:countRows} = await db(`SELECT COUNT(*) FROM users ${whereSql}`, params);
     params.push(limit, (page-1)*limit);
     const {rows} = await db(
       `SELECT id,name,email,uid,balance,total_deposited,total_withdrawn,membership_level,status,created_at
        FROM users ${whereSql} ORDER BY created_at DESC LIMIT $${params.length-1} OFFSET $${params.length}`, params);
-    res.json({success:true,data:{users:ccAll(rows),total:parseInt(countRows[0].count),page,limit}});
+    const {rows:statusRows} = await db(`SELECT COUNT(*) total, COUNT(*) FILTER (WHERE status='active') active,
+      COUNT(*) FILTER (WHERE status='suspended') suspended, COUNT(*) FILTER (WHERE status='banned') banned FROM users`);
+    res.json({success:true,data:{users:ccAll(rows),total:parseInt(countRows[0].count),page,limit,statusCounts:cc(statusRows[0])}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
-app.get('/api/admin/users/:id', adminAuth, async (req,res) => {
+app.get('/api/admin/users/export', adminAuth, requirePermission('users'), async (req,res) => {
+  try {
+    const search = (req.query.search||'').trim();
+    const status = req.query.status||'';
+    const plan = (req.query.plan||'').toLowerCase();
+    const dateRange = req.query.dateRange||'';
+    let where = [], params = [];
+    if (search) { params.push(`%${search}%`); where.push(`(name ILIKE $${params.length} OR email ILIKE $${params.length} OR uid ILIKE $${params.length})`); }
+    if (status) { params.push(status); where.push(`status=$${params.length}`); }
+    if (plan) { params.push(plan); where.push(`membership_level=$${params.length}`); }
+    if (dateRange === '7d') where.push(`created_at > NOW() - INTERVAL '7 days'`);
+    if (dateRange === '30d') where.push(`created_at > NOW() - INTERVAL '30 days'`);
+    if (dateRange === 'year') where.push(`created_at > date_trunc('year', NOW())`);
+    const whereSql = where.length ? 'WHERE '+where.join(' AND ') : '';
+    const {rows} = await db(
+      `SELECT name,email,uid,balance,total_deposited,total_withdrawn,membership_level,status,created_at
+       FROM users ${whereSql} ORDER BY created_at DESC`, params);
+    const csv = toCsv(ccAll(rows), [
+      {key:'name',label:'Name'}, {key:'email',label:'Email'}, {key:'uid',label:'UID'},
+      {key:'balance',label:'Balance'}, {key:'totalDeposited',label:'Total Deposited'},
+      {key:'totalWithdrawn',label:'Total Withdrawn'}, {key:'membershipLevel',label:'Membership'},
+      {key:'status',label:'Status'}, {key:'createdAt',label:'Joined'},
+    ]);
+    await logAdmin(req.admin.id, 'Exported users CSV', {count:rows.length});
+    sendCsv(res, `qavix-users-${new Date().toISOString().slice(0,10)}.csv`, csv);
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.get('/api/admin/users/:id', adminAuth, requirePermission('users'), async (req,res) => {
   try {
     const {rows} = await db('SELECT * FROM users WHERE id=$1',[req.params.id]);
     if (!rows[0]) return res.status(404).json({success:false,message:'User not found'});
@@ -1514,7 +1956,7 @@ app.get('/api/admin/users/:id', adminAuth, async (req,res) => {
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
-app.put('/api/admin/users/:id/status', adminAuth, async (req,res) => {
+app.put('/api/admin/users/:id/status', adminAuth, requirePermission('users'), async (req,res) => {
   try {
     const {status} = req.body; // active | suspended | banned
     if (!['active','suspended','banned'].includes(status)) return res.status(400).json({success:false,message:'Invalid status'});
@@ -1543,7 +1985,7 @@ app.post('/api/admin/users/:id/balance', adminAuth, requireRole('Super Admin','F
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
-app.post('/api/admin/users/:id/reset-password', adminAuth, async (req,res) => {
+app.post('/api/admin/users/:id/reset-password', adminAuth, requirePermission('users'), async (req,res) => {
   try {
     const tempPass = Math.random().toString(36).slice(-10);
     const hash = await bcrypt.hash(tempPass, 12);
@@ -1557,19 +1999,46 @@ app.post('/api/admin/users/:id/reset-password', adminAuth, async (req,res) => {
 });
 
 // ── Deposit moderation ────────────────────────────────────────────────────
-app.get('/api/admin/deposits', adminAuth, async (req,res) => {
+app.get('/api/admin/deposits', adminAuth, requirePermission('deposits'), async (req,res) => {
+  try {
+    const page = parseInt(req.query.page)||1, limit = Math.min(parseInt(req.query.limit)||20, 100);
+    const status = req.query.status||'';
+    const params = ['deposit']; let extra = '';
+    if (status) { params.push(status); extra = `AND t.status=$${params.length}`; }
+    const {rows:countRows} = await db(`SELECT COUNT(*) FROM transactions t WHERE t.type=$1 ${extra}`, params);
+    params.push(limit, (page-1)*limit);
+    const {rows} = await db(
+      `SELECT t.*, u.name, u.uid, u.email FROM transactions t JOIN users u ON u.id=t.user_id
+       WHERE t.type=$1 ${extra} ORDER BY t.created_at DESC LIMIT $${params.length-1} OFFSET $${params.length}`, params);
+    const {rows:kpi} = await db(`
+      SELECT
+        COALESCE(SUM(amount) FILTER (WHERE created_at > NOW() - INTERVAL '30 days' AND status='approved'),0) total_30d,
+        COUNT(*) FILTER (WHERE status='pending') pending,
+        COUNT(*) FILTER (WHERE status='approved' AND reviewed_at::date=CURRENT_DATE) approved_today,
+        COUNT(*) FILTER (WHERE status='rejected' AND created_at > NOW() - INTERVAL '30 days') rejected_30d
+      FROM transactions WHERE type='deposit'`);
+    res.json({success:true,data:{deposits:ccAll(rows), total:parseInt(countRows[0].count), page, limit, kpis:cc(kpi[0])}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.get('/api/admin/deposits/export', adminAuth, requirePermission('deposits'), async (req,res) => {
   try {
     const status = req.query.status||'';
     const params = ['deposit']; let extra = '';
     if (status) { params.push(status); extra = `AND t.status=$${params.length}`; }
     const {rows} = await db(
-      `SELECT t.*, u.name, u.uid, u.email FROM transactions t JOIN users u ON u.id=t.user_id
-       WHERE t.type=$1 ${extra} ORDER BY t.created_at DESC LIMIT 200`, params);
-    res.json({success:true,data:{deposits:ccAll(rows)}});
+      `SELECT t.created_at, u.name, u.uid, u.email, t.amount, t.status, t.description FROM transactions t
+       JOIN users u ON u.id=t.user_id WHERE t.type=$1 ${extra} ORDER BY t.created_at DESC`, params);
+    const csv = toCsv(ccAll(rows), [
+      {key:'createdAt',label:'Date'}, {key:'name',label:'User'}, {key:'uid',label:'UID'},
+      {key:'email',label:'Email'}, {key:'amount',label:'Amount'}, {key:'status',label:'Status'}, {key:'description',label:'Description'},
+    ]);
+    await logAdmin(req.admin.id, 'Exported deposits CSV', {count:rows.length});
+    sendCsv(res, `qavix-deposits-${new Date().toISOString().slice(0,10)}.csv`, csv);
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
-app.put('/api/admin/deposits/:id/approve', adminAuth, async (req,res) => {
+app.put('/api/admin/deposits/:id/approve', adminAuth, requirePermission('deposits'), async (req,res) => {
   try {
     const {rows:[tx]} = await db(`SELECT * FROM transactions WHERE id=$1 AND type='deposit'`,[req.params.id]);
     if (!tx) return res.status(404).json({success:false,message:'Deposit not found'});
@@ -1582,7 +2051,7 @@ app.put('/api/admin/deposits/:id/approve', adminAuth, async (req,res) => {
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
-app.put('/api/admin/deposits/:id/reject', adminAuth, async (req,res) => {
+app.put('/api/admin/deposits/:id/reject', adminAuth, requirePermission('deposits'), async (req,res) => {
   try {
     const {reason} = req.body;
     const {rows:[tx]} = await db(`SELECT * FROM transactions WHERE id=$1 AND type='deposit'`,[req.params.id]);
@@ -1595,20 +2064,66 @@ app.put('/api/admin/deposits/:id/reject', adminAuth, async (req,res) => {
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
+app.post('/api/admin/deposits/bulk-approve', adminAuth, requirePermission('deposits'), async (req,res) => {
+  try {
+    const { ids } = req.body;
+    if (!Array.isArray(ids) || !ids.length) return res.status(400).json({success:false,message:'No deposits selected'});
+    let approved = 0, skipped = 0;
+    for (const id of ids) {
+      const {rows:[tx]} = await db(`SELECT * FROM transactions WHERE id=$1 AND type='deposit'`,[id]);
+      if (!tx || tx.status !== 'pending') { skipped++; continue; }
+      await db('UPDATE users SET balance=balance+$1, total_deposited=total_deposited+$1 WHERE id=$2',[tx.amount,tx.user_id]);
+      await db(`UPDATE transactions SET status='approved', reviewed_by=$1, reviewed_at=NOW() WHERE id=$2`,[req.admin.id,id]);
+      await notif(tx.user_id,'deposit','Deposit Approved',`$${tx.amount} has been credited to your balance.`);
+      approved++;
+    }
+    await logAdmin(req.admin.id, `Bulk-approved ${approved} deposit(s)`, {ids, skipped});
+    res.json({success:true,message:`${approved} deposit(s) approved${skipped?`, ${skipped} skipped (not pending)`:''}`,data:{approved,skipped}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
 // ── Withdrawal moderation (USDT BEP20 only) ───────────────────────────────
-app.get('/api/admin/withdrawals', adminAuth, async (req,res) => {
+app.get('/api/admin/withdrawals', adminAuth, requirePermission('withdrawals'), async (req,res) => {
+  try {
+    const page = parseInt(req.query.page)||1, limit = Math.min(parseInt(req.query.limit)||20, 100);
+    const status = req.query.status||'';
+    const params = ['withdrawal']; let extra = '';
+    if (status) { params.push(status); extra = `AND t.status=$${params.length}`; }
+    const {rows:countRows} = await db(`SELECT COUNT(*) FROM transactions t WHERE t.type=$1 ${extra}`, params);
+    params.push(limit, (page-1)*limit);
+    const {rows} = await db(
+      `SELECT t.*, u.name, u.uid, u.email FROM transactions t JOIN users u ON u.id=t.user_id
+       WHERE t.type=$1 ${extra} ORDER BY t.created_at DESC LIMIT $${params.length-1} OFFSET $${params.length}`, params);
+    const {rows:kpi} = await db(`
+      SELECT
+        COALESCE(SUM(amount) FILTER (WHERE status='paid' AND created_at > NOW() - INTERVAL '30 days'),0) total_paid_30d,
+        COUNT(*) FILTER (WHERE status='pending') pending,
+        COUNT(*) FILTER (WHERE status='approved') awaiting_pay,
+        COUNT(*) FILTER (WHERE status='rejected' AND created_at > NOW() - INTERVAL '30 days') rejected_30d
+      FROM transactions WHERE type='withdrawal'`);
+    res.json({success:true,data:{withdrawals:ccAll(rows), total:parseInt(countRows[0].count), page, limit, kpis:cc(kpi[0])}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.get('/api/admin/withdrawals/export', adminAuth, requirePermission('withdrawals'), async (req,res) => {
   try {
     const status = req.query.status||'';
     const params = ['withdrawal']; let extra = '';
     if (status) { params.push(status); extra = `AND t.status=$${params.length}`; }
     const {rows} = await db(
-      `SELECT t.*, u.name, u.uid, u.email FROM transactions t JOIN users u ON u.id=t.user_id
-       WHERE t.type=$1 ${extra} ORDER BY t.created_at DESC LIMIT 200`, params);
-    res.json({success:true,data:{withdrawals:ccAll(rows)}});
+      `SELECT t.created_at, u.name, u.uid, u.email, t.amount, t.status, t.description, t.meta FROM transactions t
+       JOIN users u ON u.id=t.user_id WHERE t.type=$1 ${extra} ORDER BY t.created_at DESC`, params);
+    const csv = toCsv(ccAll(rows).map(r=>({...r, walletAddress:r.meta?.walletAddress||'', network:r.meta?.network||'', fee:r.meta?.fee||''})), [
+      {key:'createdAt',label:'Date'}, {key:'name',label:'User'}, {key:'uid',label:'UID'},
+      {key:'email',label:'Email'}, {key:'amount',label:'Net Amount'}, {key:'fee',label:'Fee'},
+      {key:'walletAddress',label:'Wallet Address'}, {key:'network',label:'Network'}, {key:'status',label:'Status'},
+    ]);
+    await logAdmin(req.admin.id, 'Exported withdrawals CSV', {count:rows.length});
+    sendCsv(res, `qavix-withdrawals-${new Date().toISOString().slice(0,10)}.csv`, csv);
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
-app.put('/api/admin/withdrawals/:id/approve', adminAuth, async (req,res) => {
+app.put('/api/admin/withdrawals/:id/approve', adminAuth, requirePermission('withdrawals'), async (req,res) => {
   try {
     const {rows:[tx]} = await db(`SELECT * FROM transactions WHERE id=$1 AND type='withdrawal'`,[req.params.id]);
     if (!tx) return res.status(404).json({success:false,message:'Withdrawal not found'});
@@ -1620,7 +2135,7 @@ app.put('/api/admin/withdrawals/:id/approve', adminAuth, async (req,res) => {
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
-app.put('/api/admin/withdrawals/:id/reject', adminAuth, async (req,res) => {
+app.put('/api/admin/withdrawals/:id/reject', adminAuth, requirePermission('withdrawals'), async (req,res) => {
   try {
     const {reason, refund} = req.body;
     const {rows:[tx]} = await db(`SELECT * FROM transactions WHERE id=$1 AND type='withdrawal'`,[req.params.id]);
@@ -1638,7 +2153,7 @@ app.put('/api/admin/withdrawals/:id/reject', adminAuth, async (req,res) => {
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
-app.put('/api/admin/withdrawals/:id/paid', adminAuth, async (req,res) => {
+app.put('/api/admin/withdrawals/:id/paid', adminAuth, requirePermission('withdrawals'), async (req,res) => {
   try {
     const {payoutTxnId} = req.body;
     if (!payoutTxnId) return res.status(400).json({success:false,message:'Payout transaction ID required'});
@@ -1653,6 +2168,23 @@ app.put('/api/admin/withdrawals/:id/paid', adminAuth, async (req,res) => {
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
+app.post('/api/admin/withdrawals/bulk-approve', adminAuth, requirePermission('withdrawals'), async (req,res) => {
+  try {
+    const { ids } = req.body;
+    if (!Array.isArray(ids) || !ids.length) return res.status(400).json({success:false,message:'No withdrawals selected'});
+    let approved = 0, skipped = 0;
+    for (const id of ids) {
+      const {rows:[tx]} = await db(`SELECT * FROM transactions WHERE id=$1 AND type='withdrawal'`,[id]);
+      if (!tx || tx.status !== 'pending') { skipped++; continue; }
+      await db(`UPDATE transactions SET status='approved', reviewed_by=$1, reviewed_at=NOW() WHERE id=$2`,[req.admin.id,id]);
+      await notif(tx.user_id,'withdrawal','Withdrawal Approved','Your withdrawal has been approved and will be paid out shortly.');
+      approved++;
+    }
+    await logAdmin(req.admin.id, `Bulk-approved ${approved} withdrawal(s)`, {ids, skipped});
+    res.json({success:true,message:`${approved} withdrawal(s) approved${skipped?`, ${skipped} skipped (not pending)`:''}`,data:{approved,skipped}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
 // ── Admin accounts (Super Admin only) ──────────────────────────────────────
 // Admins are just platform users granted console access — there is no separate
 // admin password. They always log in with the same email + password they use
@@ -1660,9 +2192,21 @@ app.put('/api/admin/withdrawals/:id/paid', adminAuth, async (req,res) => {
 app.get('/api/admin/admins', adminAuth, requireRole('Super Admin'), async (_,res) => {
   try {
     const {rows} = await db(
-      `SELECT a.id, a.role, a.status, a.last_login, a.created_at, u.name, u.email FROM admins a
+      `SELECT a.id, a.role, a.status, a.last_login, a.created_at, a.permissions, u.name, u.email FROM admins a
        JOIN users u ON u.id=a.user_id ORDER BY a.created_at DESC`);
-    res.json({success:true,data:{admins:ccAll(rows)}});
+    res.json({success:true,data:{admins:ccAll(rows), defaultPermissions:DEFAULT_ROLE_PERMISSIONS}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// Update a single admin's custom permissions (Super Admin only)
+app.put('/api/admin/admins/:id/permissions', adminAuth, requireRole('Super Admin'), async (req,res) => {
+  try {
+    const {permissions} = req.body;
+    if (!permissions || typeof permissions !== 'object') return res.status(400).json({success:false,message:'Permissions object required'});
+    const {rows:[a]} = await db(`UPDATE admins SET permissions=$1 WHERE id=$2 RETURNING id`,[JSON.stringify(permissions), req.params.id]);
+    if (!a) return res.status(404).json({success:false,message:'Admin not found'});
+    await logAdmin(req.admin.id, 'Updated admin permissions', {targetAdminId:req.params.id});
+    res.json({success:true,message:'Permissions updated — takes effect on next request by that admin'});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
@@ -1719,7 +2263,7 @@ app.delete('/api/admin/admins/:id', adminAuth, requireRole('Super Admin'), async
 });
 
 // ── Plans (config-based, with real aggregated stats) ───────────────────────
-app.get('/api/admin/plans', adminAuth, async (_,res) => {
+app.get('/api/admin/plans', adminAuth, requirePermission('plans'), async (_,res) => {
   try {
     const {rows} = await db(
       `SELECT plan_id, COUNT(*) FILTER (WHERE status='active') active_count,
@@ -1727,7 +2271,7 @@ app.get('/api/admin/plans', adminAuth, async (_,res) => {
               COALESCE(SUM(earned_so_far),0) roi_paid
        FROM investments GROUP BY plan_id`);
     const byPlan = {}; rows.forEach(r=> byPlan[r.plan_id] = r);
-    const plans = PLANS.map(p => ({
+    const plans = LIVE_PLANS.map(p => ({
       id:p.id, name:p.tier, dailyRate:p.rate*100, days:p.days, min:p.min, max:p.max,
       activeCount: parseInt(byPlan[p.id]?.active_count||0),
       capital: parseFloat(byPlan[p.id]?.capital||0),
@@ -1738,7 +2282,29 @@ app.get('/api/admin/plans', adminAuth, async (_,res) => {
 });
 
 // ── Investments (real records from the investments table) ─────────────────
-app.get('/api/admin/investments', adminAuth, async (req,res) => {
+app.get('/api/admin/investments', adminAuth, requirePermission('investments'), async (req,res) => {
+  try {
+    const page = parseInt(req.query.page)||1, limit = Math.min(parseInt(req.query.limit)||20, 100);
+    const status = req.query.status||'';
+    const search = (req.query.search||'').trim();
+    let where = [], params = [];
+    if (status) { params.push(status); where.push(`i.status=$${params.length}`); }
+    if (search) { params.push(`%${search}%`); where.push(`(u.name ILIKE $${params.length} OR u.uid ILIKE $${params.length})`); }
+    const whereSql = where.length ? 'WHERE '+where.join(' AND ') : '';
+    const {rows:countRows} = await db(`SELECT COUNT(*) FROM investments i JOIN users u ON u.id=i.user_id ${whereSql}`, params);
+    const listParams = [...params, limit, (page-1)*limit];
+    const {rows} = await db(
+      `SELECT i.*, u.name, u.uid FROM investments i JOIN users u ON u.id=i.user_id
+       ${whereSql} ORDER BY i.created_at DESC LIMIT $${listParams.length-1} OFFSET $${listParams.length}`, listParams);
+    const [{rows:kpi}] = await Promise.all([
+      db(`SELECT COUNT(*) FILTER (WHERE status='active') active, COALESCE(SUM(amount) FILTER (WHERE status='active'),0) capital,
+                 COALESCE(SUM(earned_so_far),0) roi_paid, COUNT(*) FILTER (WHERE status='completed') completed FROM investments`)
+    ]);
+    res.json({success:true,data:{investments:ccAll(rows), stats:cc(kpi[0]), total:parseInt(countRows[0].count), page, limit}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.get('/api/admin/investments/export', adminAuth, requirePermission('investments'), async (req,res) => {
   try {
     const status = req.query.status||'';
     const search = (req.query.search||'').trim();
@@ -1747,13 +2313,15 @@ app.get('/api/admin/investments', adminAuth, async (req,res) => {
     if (search) { params.push(`%${search}%`); where.push(`(u.name ILIKE $${params.length} OR u.uid ILIKE $${params.length})`); }
     const whereSql = where.length ? 'WHERE '+where.join(' AND ') : '';
     const {rows} = await db(
-      `SELECT i.*, u.name, u.uid FROM investments i JOIN users u ON u.id=i.user_id
-       ${whereSql} ORDER BY i.created_at DESC LIMIT 200`, params);
-    const [{rows:kpi}] = await Promise.all([
-      db(`SELECT COUNT(*) FILTER (WHERE status='active') active, COALESCE(SUM(amount) FILTER (WHERE status='active'),0) capital,
-                 COALESCE(SUM(earned_so_far),0) roi_paid, COUNT(*) FILTER (WHERE status='completed') completed FROM investments`)
+      `SELECT i.created_at, u.name, u.uid, i.plan_name, i.amount, i.daily_income, i.earned_so_far, i.status, i.end_date
+       FROM investments i JOIN users u ON u.id=i.user_id ${whereSql} ORDER BY i.created_at DESC`, params);
+    const csv = toCsv(ccAll(rows), [
+      {key:'createdAt',label:'Started'}, {key:'name',label:'User'}, {key:'uid',label:'UID'},
+      {key:'planName',label:'Plan'}, {key:'amount',label:'Amount'}, {key:'dailyIncome',label:'Daily Income'},
+      {key:'earnedSoFar',label:'Earned So Far'}, {key:'status',label:'Status'}, {key:'endDate',label:'End Date'},
     ]);
-    res.json({success:true,data:{investments:ccAll(rows), stats:cc(kpi[0])}});
+    await logAdmin(req.admin.id, 'Exported investments CSV', {count:rows.length});
+    sendCsv(res, `qavix-investments-${new Date().toISOString().slice(0,10)}.csv`, csv);
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
@@ -1774,14 +2342,14 @@ app.get('/api/admin/referrals/stats', adminAuth, async (_,res) => {
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
-app.get('/api/admin/referrals/levels', adminAuth, async (_,res) => {
+app.get('/api/admin/referrals/levels', adminAuth, requirePermission('referral'), async (_,res) => {
   try {
     const {rows} = await db(
       `SELECT (meta->>'lvl')::int AS level, COUNT(*) referrers, COALESCE(SUM(amount),0) paid
        FROM transactions WHERE type='commission' AND created_at > NOW() - INTERVAL '30 days'
        GROUP BY (meta->>'lvl')::int ORDER BY level`);
     const byLevel = {}; rows.forEach(r=> byLevel[r.level] = r);
-    const levels = Object.entries(COMM).map(([lvl,pct]) => ({
+    const levels = Object.entries(LIVE_COMM).map(([lvl,pct]) => ({
       level: parseInt(lvl), commissionPct: pct,
       referrers: parseInt(byLevel[lvl]?.referrers||0),
       paid30d: parseFloat(byLevel[lvl]?.paid||0),
@@ -1790,7 +2358,7 @@ app.get('/api/admin/referrals/levels', adminAuth, async (_,res) => {
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
-app.get('/api/admin/referrals/earnings', adminAuth, async (req,res) => {
+app.get('/api/admin/referrals/earnings', adminAuth, requirePermission('referral'), async (req,res) => {
   try {
     const {rows} = await db(
       `SELECT t.*, u.name AS referrer_name, u.uid AS referrer_uid FROM transactions t
@@ -1799,17 +2367,826 @@ app.get('/api/admin/referrals/earnings', adminAuth, async (req,res) => {
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
-// ── Admin activity logs ───────────────────────────────────────────────────
-app.get('/api/admin/logs', adminAuth, async (req,res) => {
+// ── Reports (real SQL aggregation, no fabricated numbers) ──────────────────
+const fmtNum = (n) => parseFloat(n||0);
+
+// ── CSV export helper ────────────────────────────────────────────────────
+const toCsv = (rows, columns) => {
+  // columns: [{ key, label }] — key supports dot-path (e.g. 'user.name')
+  const esc = (v) => {
+    if (v===null||v===undefined) return '';
+    const s = String(v);
+    return /[",\n]/.test(s) ? '"' + s.replace(/"/g,'""') + '"' : s;
+  };
+  const get = (obj, path) => path.split('.').reduce((o,k)=> (o==null?o:o[k]), obj);
+  const header = columns.map(c=>esc(c.label)).join(',');
+  const body = rows.map(r => columns.map(c=>esc(get(r,c.key))).join(',')).join('\n');
+  return header + '\n' + body;
+};
+const sendCsv = (res, filename, csv) => {
+  res.setHeader('Content-Type', 'text/csv');
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+  res.send(csv);
+};
+// ── Loss tracking (manual bad-debt entries feed the Loss Report) ───────────
+app.get('/api/admin/loss-entries', adminAuth, requirePermission('reports'), async (req,res) => {
   try {
-    const {rows} = await db(
-      `SELECT al.*, a.name as admin_name, a.email as admin_email FROM admin_logs al
-       LEFT JOIN admins a ON a.id=al.admin_id ORDER BY al.created_at DESC LIMIT 200`);
-    res.json({success:true,data:{logs:ccAll(rows)}});
+    const {rows} = await db(`SELECT l.*, a.name as created_by_name FROM loss_entries l
+      LEFT JOIN admins a ON a.id=l.created_by ORDER BY l.created_at DESC LIMIT 100`);
+    res.json({success:true,data:{entries:ccAll(rows)}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.post('/api/admin/loss-entries', adminAuth, requireRole('Super Admin','Finance'), async (req,res) => {
+  try {
+    const { amount, category, reason } = req.body;
+    if (!amount||!reason) return res.status(400).json({success:false,message:'Amount and reason are required'});
+    const {rows:[l]} = await db(
+      `INSERT INTO loss_entries(amount,category,reason,created_by) VALUES($1,$2,$3,$4) RETURNING *`,
+      [parseFloat(amount), category||'Bad Debt', reason.trim(), req.admin.id]);
+    await logAdmin(req.admin.id, 'Logged a loss/bad-debt entry', {amount, category});
+    res.json({success:true,message:'Loss entry recorded',data:{entry:cc(l)}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.delete('/api/admin/loss-entries/:id', adminAuth, requireRole('Super Admin'), async (req,res) => {
+  try {
+    await db('DELETE FROM loss_entries WHERE id=$1',[req.params.id]);
+    await logAdmin(req.admin.id, 'Deleted a loss entry', {id:req.params.id});
+    res.json({success:true,message:'Loss entry deleted'});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
-// ── 404 & error handler ───────────────────────────────────────────────────
+app.get('/api/admin/reports/:type', adminAuth, requirePermission('reports'), async (req,res) => {
+  try {
+    const type = req.params.type;
+    let result;
+
+    if (type === 'daily' || type === 'weekly' || type === 'monthly') {
+      const cfg = { daily:{unit:'day', count:7}, weekly:{unit:'week', count:8}, monthly:{unit:'month', count:6} }[type];
+      const {rows} = await db(`
+        WITH days AS (
+          SELECT generate_series(date_trunc('${cfg.unit}', NOW()) - INTERVAL '${cfg.count-1} ${cfg.unit}', date_trunc('${cfg.unit}', NOW()), INTERVAL '1 ${cfg.unit}') AS bucket
+        )
+        SELECT to_char(d.bucket, 'YYYY-MM-DD') AS bucket,
+          COALESCE((SELECT SUM(amount) FROM transactions WHERE type='deposit' AND status='approved' AND date_trunc('${cfg.unit}',created_at)=d.bucket),0) AS deposits,
+          COALESCE((SELECT SUM(amount) FROM transactions WHERE type='withdrawal' AND status='paid' AND date_trunc('${cfg.unit}',created_at)=d.bucket),0) AS withdrawals,
+          COALESCE((SELECT COUNT(*) FROM users WHERE date_trunc('${cfg.unit}',created_at)=d.bucket),0) AS new_users
+        FROM days d ORDER BY d.bucket`);
+      const dep = rows.reduce((a,r)=>a+fmtNum(r.deposits),0);
+      const wit = rows.reduce((a,r)=>a+fmtNum(r.withdrawals),0);
+      const newU = rows.reduce((a,r)=>a+parseInt(r.new_users),0);
+      result = {
+        kpis: [
+          {label:`Total Deposits`, value:`$${dep.toLocaleString()}`},
+          {label:`Total Withdrawals`, value:`$${wit.toLocaleString()}`},
+          {label:`Net`, value:`$${(dep-wit).toLocaleString()}`, color: dep-wit>=0?'green':'red'},
+          {label:`New Users`, value:newU},
+        ],
+        columns:['Period','Deposits','Withdrawals','Net','New Users'],
+        rows: rows.map(r=>[r.bucket, `$${fmtNum(r.deposits).toLocaleString()}`, `$${fmtNum(r.withdrawals).toLocaleString()}`, `$${(fmtNum(r.deposits)-fmtNum(r.withdrawals)).toLocaleString()}`, r.new_users]),
+      };
+
+    } else if (type === 'profit' || type === 'loss') {
+      const {rows} = await db(`
+        WITH days AS (SELECT generate_series(CURRENT_DATE - INTERVAL '6 days', CURRENT_DATE, INTERVAL '1 day')::date AS d)
+        SELECT to_char(d.d,'YYYY-MM-DD') AS day,
+          COALESCE((SELECT SUM(amount) FROM transactions WHERE type='deposit' AND status='approved' AND created_at::date=d.d),0) AS revenue,
+          COALESCE((SELECT SUM(amount) FROM transactions WHERE type='commission' AND created_at::date=d.d),0) AS commission_paid,
+          COALESCE((SELECT SUM(amount) FROM transactions WHERE type='deposit' AND status='rejected' AND created_at::date=d.d),0) AS rejected_deposits,
+          COALESCE((SELECT COUNT(*) FROM transactions WHERE type='withdrawal' AND status='rejected' AND created_at::date=d.d),0) AS rejected_withdrawals
+        FROM days d ORDER BY d.d`);
+      if (type === 'profit') {
+        const rev = rows.reduce((a,r)=>a+fmtNum(r.revenue),0);
+        const comm = rows.reduce((a,r)=>a+fmtNum(r.commission_paid),0);
+        result = {
+          kpis: [
+            {label:'Revenue (7d)', value:`$${rev.toLocaleString()}`},
+            {label:'Commission Paid (7d)', value:`$${comm.toLocaleString()}`, color:'red'},
+            {label:'Net Profit (7d)', value:`$${(rev-comm).toLocaleString()}`, color:'green'},
+          ],
+          columns:['Date','Revenue','Commission Paid','Net'],
+          rows: rows.map(r=>[r.day, `$${fmtNum(r.revenue).toLocaleString()}`, `$${fmtNum(r.commission_paid).toLocaleString()}`, `$${(fmtNum(r.revenue)-fmtNum(r.commission_paid)).toLocaleString()}`]),
+        };
+      } else {
+        const rejDep = rows.reduce((a,r)=>a+fmtNum(r.rejected_deposits),0);
+        const rejWit = rows.reduce((a,r)=>a+parseInt(r.rejected_withdrawals),0);
+        const {rows:lossRows} = await db(
+          `SELECT to_char(created_at,'YYYY-MM-DD') AS day, SUM(amount) amt, COUNT(*) cnt FROM loss_entries
+           WHERE created_at > NOW() - INTERVAL '7 days' GROUP BY day ORDER BY day`);
+        const manualLoss = lossRows.reduce((a,r)=>a+fmtNum(r.amt),0);
+        const lossByDay = {}; lossRows.forEach(r=> lossByDay[r.day]=fmtNum(r.amt));
+        result = {
+          kpis: [
+            {label:'Rejected Deposits (7d)', value:`$${rejDep.toLocaleString()}`, color:'red'},
+            {label:'Rejected Withdrawals (7d)', value:rejWit, color:'red'},
+            {label:'Manual Bad Debt Logged (7d)', value:`$${manualLoss.toLocaleString()}`, color:'red'},
+            {label:'Total Recorded Loss (7d)', value:`$${(rejDep+manualLoss).toLocaleString()}`, color:'red'},
+          ],
+          columns:['Date','Rejected Deposit Amount','Rejected Withdrawal Count','Manual Bad Debt'],
+          rows: rows.map(r=>[r.day, `$${fmtNum(r.rejected_deposits).toLocaleString()}`, r.rejected_withdrawals, `$${(lossByDay[r.day]||0).toLocaleString()}`]),
+          note: 'Manual Bad Debt comes from admin-logged loss entries (Reports → Loss → Log Loss Entry). Rejected counts are not the same as confirmed financial loss — they only indicate moderation activity.',
+        };
+      }
+
+    } else if (type === 'investment') {
+      const {rows} = await db(
+        `SELECT plan_id, COUNT(*) FILTER (WHERE status='active') active_count,
+                COALESCE(SUM(amount) FILTER (WHERE status='active'),0) capital,
+                COALESCE(SUM(earned_so_far),0) roi_paid FROM investments GROUP BY plan_id`);
+      const byPlan = {}; rows.forEach(r=> byPlan[r.plan_id]=r);
+      const planRows = LIVE_PLANS.map(p => [p.tier, byPlan[p.id]?.active_count||0, `$${fmtNum(byPlan[p.id]?.capital).toLocaleString()}`, `$${fmtNum(byPlan[p.id]?.roi_paid).toLocaleString()}`]);
+      const totalCapital = rows.reduce((a,r)=>a+fmtNum(r.capital),0);
+      const totalRoi = rows.reduce((a,r)=>a+fmtNum(r.roi_paid),0);
+      result = {
+        kpis: [
+          {label:'Capital Deployed', value:`$${totalCapital.toLocaleString()}`},
+          {label:'ROI Paid (all time)', value:`$${totalRoi.toLocaleString()}`, color:'green'},
+        ],
+        columns:['Plan','Active Count','Capital','ROI Paid'],
+        rows: planRows,
+      };
+
+    } else if (type === 'deposit' || type === 'withdrawal') {
+      const txType = type;
+      const statusFilter = type==='deposit' ? "status='approved'" : "status='paid'";
+      const {rows} = await db(`
+        WITH days AS (SELECT generate_series(CURRENT_DATE - INTERVAL '6 days', CURRENT_DATE, INTERVAL '1 day')::date AS d)
+        SELECT to_char(d.d,'YYYY-MM-DD') AS day,
+          COALESCE((SELECT COUNT(*) FROM transactions WHERE type='${txType}' AND ${statusFilter} AND created_at::date=d.d),0) AS cnt,
+          COALESCE((SELECT SUM(amount) FROM transactions WHERE type='${txType}' AND ${statusFilter} AND created_at::date=d.d),0) AS total,
+          COALESCE((SELECT SUM((meta->>'fee')::numeric) FROM transactions WHERE type='${txType}' AND ${statusFilter} AND created_at::date=d.d),0) AS fees
+        FROM days d ORDER BY d.d`);
+      const totalCount = rows.reduce((a,r)=>a+parseInt(r.cnt),0);
+      const totalAmt = rows.reduce((a,r)=>a+fmtNum(r.total),0);
+      const totalFees = rows.reduce((a,r)=>a+fmtNum(r.fees),0);
+      result = type==='deposit' ? {
+        kpis: [
+          {label:'Total Deposits (7d)', value:totalCount},
+          {label:'Total Volume (7d)', value:`$${totalAmt.toLocaleString()}`},
+          {label:'Avg Deposit Size', value:`$${(totalCount?totalAmt/totalCount:0).toFixed(2)}`},
+        ],
+        columns:['Date','Count','Total Amount'],
+        rows: rows.map(r=>[r.day, r.cnt, `$${fmtNum(r.total).toLocaleString()}`]),
+      } : {
+        kpis: [
+          {label:'Total Withdrawals (7d)', value:totalCount},
+          {label:'Total Paid (7d)', value:`$${totalAmt.toLocaleString()}`},
+          {label:'Fees Collected (7d)', value:`$${totalFees.toLocaleString()}`, color:'green'},
+        ],
+        columns:['Date','Count','Total Amount','Fees Collected'],
+        rows: rows.map(r=>[r.day, r.cnt, `$${fmtNum(r.total).toLocaleString()}`, `$${fmtNum(r.fees).toLocaleString()}`]),
+      };
+
+    } else if (type === 'user') {
+      const {rows} = await db(`
+        WITH days AS (SELECT generate_series(CURRENT_DATE - INTERVAL '6 days', CURRENT_DATE, INTERVAL '1 day')::date AS d)
+        SELECT to_char(d.d,'YYYY-MM-DD') AS day,
+          COALESCE((SELECT COUNT(*) FROM users WHERE created_at::date=d.d),0) AS new_users,
+          COALESCE((SELECT COUNT(*) FROM users WHERE status='banned' AND created_at::date<=d.d),0) AS banned_total
+        FROM days d ORDER BY d.d`);
+      const {rows:totalRows} = await db(`SELECT COUNT(*) total, COUNT(*) FILTER (WHERE status='active') active FROM users`);
+      // Churn definition: account still 'active' status, hasn't logged in for 30+ days,
+      // and has no currently-running investment plan (i.e. genuinely gone quiet, not just between plans).
+      const {rows:churnRows} = await db(`
+        SELECT COUNT(*) c FROM users u
+        WHERE u.status='active' AND u.last_login < NOW() - INTERVAL '30 days'
+        AND NOT EXISTS (SELECT 1 FROM investments i WHERE i.user_id=u.id AND i.status='active')`);
+      const churned = parseInt(churnRows[0].c);
+      const churnRate = totalRows[0].total>0 ? (churned/parseInt(totalRows[0].total)*100).toFixed(1) : '0.0';
+      result = {
+        kpis: [
+          {label:'Total Users', value:parseInt(totalRows[0].total)},
+          {label:'Active Users', value:parseInt(totalRows[0].active)},
+          {label:'New Users (7d)', value: rows.reduce((a,r)=>a+parseInt(r.new_users),0), color:'green'},
+          {label:'Churned Users', value: churned, color:'red'},
+          {label:'Churn Rate', value: `${churnRate}%`, color:'red'},
+        ],
+        columns:['Date','New Users'],
+        rows: rows.map(r=>[r.day, r.new_users]),
+        note: 'Churned = account still active, no login in 30+ days, and no currently running investment plan.',
+      };
+
+    } else if (type === 'referral') {
+      const {rows} = await db(
+        `SELECT (meta->>'lvl')::int AS level, COUNT(*) referrers, COALESCE(SUM(amount),0) paid
+         FROM transactions WHERE type='commission' AND created_at > NOW() - INTERVAL '30 days'
+         GROUP BY (meta->>'lvl')::int ORDER BY level`);
+      const byLevel = {}; rows.forEach(r=> byLevel[r.level]=r);
+      const levelRows = Object.entries(LIVE_COMM).map(([lvl,pct]) => [`L${lvl}`, `${pct}%`, byLevel[lvl]?.referrers||0, `$${fmtNum(byLevel[lvl]?.paid).toLocaleString()}`]);
+      const totalPaid = rows.reduce((a,r)=>a+fmtNum(r.paid),0);
+      // Average network depth: walk the referred_by chain for every user with a referrer.
+      const {rows:depthRows} = await db(`
+        WITH RECURSIVE chain AS (
+          SELECT id, referred_by, 1 AS depth FROM users WHERE referred_by IS NULL
+          UNION ALL
+          SELECT u.id, u.referred_by, c.depth+1 FROM users u JOIN chain c ON u.referred_by = c.id
+        )
+        SELECT COALESCE(AVG(depth),0) avg_depth, COALESCE(MAX(depth),0) max_depth FROM chain WHERE depth > 1`);
+      result = {
+        kpis: [
+          {label:'Commission Paid (30d)', value:`$${totalPaid.toLocaleString()}`, color:'green'},
+          {label:'Avg Network Depth', value: parseFloat(depthRows[0].avg_depth).toFixed(1)},
+          {label:'Deepest Chain', value: depthRows[0].max_depth},
+        ],
+        columns:['Level','Commission %','Referrers (30d)','Paid (30d)'],
+        rows: levelRows,
+      };
+
+    } else {
+      return res.status(404).json({success:false,message:'Unknown report type'});
+    }
+
+    res.json({success:true,data:result});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── Settings (real DB-backed config, drives live business logic) ───────────
+const saveSetting = async (key, value, adminId) => {
+  await db(`INSERT INTO settings(key,value,updated_by) VALUES($1,$2,$3)
+            ON CONFLICT (key) DO UPDATE SET value=$2, updated_at=NOW(), updated_by=$3`, [key, JSON.stringify(value), adminId]);
+};
+
+app.get('/api/admin/settings', adminAuth, requirePermission('settings'), async (_,res) => {
+  res.json({success:true,data:{
+    plans: LIVE_PLANS, commission: LIVE_COMM, payment: LIVE_PAYMENT,
+    referral: LIVE_REFERRAL, maintenance: LIVE_MAINTENANCE, security: LIVE_SECURITY,
+    general: LIVE_GENERAL, branding: LIVE_BRANDING,
+    emailSender: LIVE_EMAIL_SENDER,
+    otp: LIVE_OTP,
+  }});
+});
+
+app.put('/api/admin/settings/plans', adminAuth, requireRole('Super Admin'), async (req,res) => {
+  try {
+    const { planId, rate, days, min, max, status } = req.body;
+    const plan = LIVE_PLANS.find(p=>p.id===planId);
+    if (!plan) return res.status(404).json({success:false,message:'Plan not found'});
+    if (rate!==undefined) plan.rate = parseFloat(rate);
+    if (days!==undefined) plan.days = parseInt(days);
+    if (min!==undefined)  plan.min = parseFloat(min);
+    if (max!==undefined)  plan.max = parseFloat(max);
+    if (status!==undefined) plan.status = status;
+    await saveSetting('plans', LIVE_PLANS, req.admin.id);
+    await logAdmin(req.admin.id, `Updated ${plan.tier} plan settings`, {planId, rate, days, min, max, status});
+    res.json({success:true,message:`${plan.tier} plan updated`,data:{plans:LIVE_PLANS}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.put('/api/admin/settings/referral', adminAuth, requireRole('Super Admin'), async (req,res) => {
+  try {
+    const { enabled, levels } = req.body; // levels: {1:10, 2:5, ...}
+    if (enabled !== undefined) { LIVE_REFERRAL.enabled = !!enabled; await saveSetting('referral', LIVE_REFERRAL, req.admin.id); }
+    if (levels) { LIVE_COMM = {...LIVE_COMM, ...levels}; await saveSetting('commission', LIVE_COMM, req.admin.id); }
+    await logAdmin(req.admin.id, 'Updated referral settings', {enabled, levels});
+    res.json({success:true,message:'Referral settings updated',data:{referral:LIVE_REFERRAL, commission:LIVE_COMM}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.put('/api/admin/settings/payment', adminAuth, requireRole('Super Admin'), async (req,res) => {
+  try {
+    const { depositMin, withdrawalMin, withdrawalMax, withdrawalFeePercent } = req.body;
+    if (depositMin!==undefined) LIVE_PAYMENT.depositMin = parseFloat(depositMin);
+    if (withdrawalMin!==undefined) LIVE_PAYMENT.withdrawalMin = parseFloat(withdrawalMin);
+    if (withdrawalMax!==undefined) LIVE_PAYMENT.withdrawalMax = parseFloat(withdrawalMax);
+    if (withdrawalFeePercent!==undefined) LIVE_PAYMENT.withdrawalFeePercent = parseFloat(withdrawalFeePercent);
+    await saveSetting('payment', LIVE_PAYMENT, req.admin.id);
+    await logAdmin(req.admin.id, 'Updated payment settings', req.body);
+    res.json({success:true,message:'Payment settings updated',data:{payment:LIVE_PAYMENT}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.put('/api/admin/settings/maintenance', adminAuth, requireRole('Super Admin'), async (req,res) => {
+  try {
+    const { enabled, message } = req.body;
+    if (enabled !== undefined) LIVE_MAINTENANCE.enabled = !!enabled;
+    if (message) LIVE_MAINTENANCE.message = message;
+    await saveSetting('maintenance', LIVE_MAINTENANCE, req.admin.id);
+    await logAdmin(req.admin.id, `Maintenance mode ${LIVE_MAINTENANCE.enabled?'enabled':'disabled'}`);
+    res.json({success:true,message:`Maintenance mode is now ${LIVE_MAINTENANCE.enabled?'ON':'OFF'}`,data:{maintenance:LIVE_MAINTENANCE}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── Phase 2.5: General / Branding / SMTP / OTP settings ─────────────────────
+app.put('/api/admin/settings/general', adminAuth, requireRole('Super Admin'), async (req,res) => {
+  try {
+    const { siteName, supportEmail, timezone, language } = req.body;
+    LIVE_GENERAL = { ...LIVE_GENERAL,
+      ...(siteName!==undefined && {siteName}), ...(supportEmail!==undefined && {supportEmail}),
+      ...(timezone!==undefined && {timezone}), ...(language!==undefined && {language}) };
+    await saveSetting('general', LIVE_GENERAL, req.admin.id);
+    await logAdmin(req.admin.id, 'Updated general settings');
+    res.json({success:true,message:'General settings saved',data:{general:LIVE_GENERAL}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.put('/api/admin/settings/branding', adminAuth, requireRole('Super Admin'), async (req,res) => {
+  try {
+    const { logoUrl, primaryColor, theme } = req.body;
+    LIVE_BRANDING = { ...LIVE_BRANDING,
+      ...(logoUrl!==undefined && {logoUrl}), ...(primaryColor!==undefined && {primaryColor}), ...(theme!==undefined && {theme}) };
+    await saveSetting('branding', LIVE_BRANDING, req.admin.id);
+    await logAdmin(req.admin.id, 'Updated branding settings');
+    res.json({success:true,message:'Branding settings saved',data:{branding:LIVE_BRANDING}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.put('/api/admin/settings/email-sender', adminAuth, requireRole('Super Admin'), async (req,res) => {
+  try {
+    const { fromName, fromEmail } = req.body;
+    LIVE_EMAIL_SENDER = { ...LIVE_EMAIL_SENDER,
+      ...(fromName!==undefined && {fromName}), ...(fromEmail!==undefined && {fromEmail}) };
+    await saveSetting('smtp', LIVE_EMAIL_SENDER, req.admin.id);
+    await logAdmin(req.admin.id, 'Updated email sender settings');
+    res.json({success:true,message:'Email sender settings saved — applies to all future emails immediately',data:{emailSender:LIVE_EMAIL_SENDER}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.put('/api/admin/settings/otp', adminAuth, requireRole('Super Admin'), async (req,res) => {
+  try {
+    const { codeLength, loginExpiryMin, withdrawExpiryMin, registerExpiryMin, loginOtpEnabled, withdrawOtpEnabled } = req.body;
+    LIVE_OTP = { ...LIVE_OTP,
+      ...(codeLength!==undefined && {codeLength:Math.min(Math.max(parseInt(codeLength),4),8)}),
+      ...(loginExpiryMin!==undefined && {loginExpiryMin:parseInt(loginExpiryMin)}),
+      ...(withdrawExpiryMin!==undefined && {withdrawExpiryMin:parseInt(withdrawExpiryMin)}),
+      ...(registerExpiryMin!==undefined && {registerExpiryMin:parseInt(registerExpiryMin)}),
+      ...(loginOtpEnabled!==undefined && {loginOtpEnabled:!!loginOtpEnabled}),
+      ...(withdrawOtpEnabled!==undefined && {withdrawOtpEnabled:!!withdrawOtpEnabled}) };
+    await saveSetting('otp', LIVE_OTP, req.admin.id);
+    await logAdmin(req.admin.id, 'Updated OTP settings');
+    res.json({success:true,message:'OTP settings saved — takes effect immediately for new OTP requests',data:{otp:LIVE_OTP}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── API Keys (Settings → API Keys) ───────────────────────────────────────
+app.get('/api/admin/settings/api-keys', adminAuth, requireRole('Super Admin'), async (_,res) => {
+  try {
+    const {rows} = await db(`SELECT id,name,key_prefix,last_used_at,revoked,created_at FROM api_keys ORDER BY created_at DESC`);
+    res.json({success:true,data:{keys:ccAll(rows)}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.post('/api/admin/settings/api-keys', adminAuth, requireRole('Super Admin'), async (req,res) => {
+  try {
+    const { name } = req.body;
+    if (!name) return res.status(400).json({success:false,message:'Key name is required'});
+    const rawKey = 'qvx_' + crypto.randomBytes(24).toString('hex');
+    const prefix = rawKey.slice(0,12);
+    const hash = await bcrypt.hash(rawKey, 8);
+    const {rows:[k]} = await db(
+      `INSERT INTO api_keys(name,key_prefix,key_hash,created_by) VALUES($1,$2,$3,$4) RETURNING id,name,key_prefix,created_at`,
+      [name.trim(), prefix, hash, req.admin.id]);
+    await logAdmin(req.admin.id, 'Generated API key', {name});
+    // The full key is only ever shown this one time — store only the hash from here on.
+    res.json({success:true,message:'API key generated — copy it now, it will not be shown again.',data:{key:cc(k), fullKey:rawKey}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.delete('/api/admin/settings/api-keys/:id', adminAuth, requireRole('Super Admin'), async (req,res) => {
+  try {
+    await db('UPDATE api_keys SET revoked=true WHERE id=$1',[req.params.id]);
+    await logAdmin(req.admin.id, 'Revoked API key', {id:req.params.id});
+    res.json({success:true,message:'API key revoked'});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── Admin activity logs ───────────────────────────────────────────────────
+app.get('/api/admin/logs', adminAuth, requirePermission('logs'), async (req,res) => {
+  try {
+    const isExport = req.query.format === 'csv';
+    const page = parseInt(req.query.page)||1;
+    const limit = isExport ? 10000 : Math.min(parseInt(req.query.limit)||50, 200);
+    const search = (req.query.search||'').trim();
+    const adminId = req.query.adminId||'';
+    let where = [], params = [];
+    if (search) { params.push(`%${search}%`); where.push(`al.action ILIKE $${params.length}`); }
+    if (adminId) { params.push(adminId); where.push(`al.admin_id=$${params.length}`); }
+    const whereSql = where.length ? 'WHERE '+where.join(' AND ') : '';
+    const {rows:countRows} = await db(`SELECT COUNT(*) FROM admin_logs al ${whereSql}`, params);
+    params.push(limit, (page-1)*limit);
+    const {rows} = await db(
+      `SELECT al.*, a.name as admin_name, a.email as admin_email FROM admin_logs al
+       LEFT JOIN admins a ON a.id=al.admin_id ${whereSql} ORDER BY al.created_at DESC LIMIT $${params.length-1} OFFSET $${params.length}`, params);
+    if (isExport) {
+      const csv = toCsv(ccAll(rows), [
+        {key:'adminName',label:'Admin'},{key:'adminEmail',label:'Email'},
+        {key:'action',label:'Action'},{key:'createdAt',label:'Time'},
+      ]);
+      await logAdmin(req.admin.id, 'Exported activity logs CSV', {count:rows.length});
+      return sendCsv(res, `qavix-activity-logs-${new Date().toISOString().slice(0,10)}.csv`, csv);
+    }
+    res.json({success:true,data:{logs:ccAll(rows), total:parseInt(countRows[0].count), page, limit}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── Phase 3: Security — Failed login attempts ─────────────────────────────
+app.get('/api/admin/security/failed-logins', adminAuth, requirePermission('security'), async (req,res) => {
+  try {
+    const {rows} = await db(
+      `SELECT * FROM admin_login_attempts WHERE success=false ORDER BY created_at DESC LIMIT 100`);
+    const {rows:summary} = await db(
+      `SELECT email, COUNT(*) c, MAX(created_at) last FROM admin_login_attempts
+       WHERE success=false AND created_at > NOW() - INTERVAL '24 hours' GROUP BY email ORDER BY c DESC LIMIT 10`);
+    res.json({success:true,data:{attempts:ccAll(rows), topOffenders:ccAll(summary)}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.delete('/api/admin/security/failed-logins', adminAuth, requireRole('Super Admin'), async (req,res) => {
+  try {
+    await db('DELETE FROM admin_login_attempts');
+    await logAdmin(req.admin.id, 'Cleared failed login log');
+    res.json({success:true,message:'Failed login log cleared'});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── Phase 3: Security — IP Whitelist ──────────────────────────────────────
+app.get('/api/admin/security/ip-whitelist', adminAuth, requirePermission('security'), async (req,res) => {
+  try {
+    const {rows} = await db(
+      `SELECT w.*, a.name as added_by_name FROM admin_ip_whitelist w
+       LEFT JOIN admins a ON a.id=w.added_by ORDER BY w.created_at DESC`);
+    res.json({success:true,data:{
+      enabled: LIVE_SECURITY.ipWhitelistEnabled,
+      entries: ccAll(rows),
+      yourIp: getClientIp(req),
+    }});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.post('/api/admin/security/ip-whitelist', adminAuth, requireRole('Super Admin'), async (req,res) => {
+  try {
+    const { ip, label } = req.body;
+    if (!ip) return res.status(400).json({success:false,message:'IP address is required'});
+    const {rows} = await db(
+      `INSERT INTO admin_ip_whitelist(ip_address,label,added_by) VALUES($1,$2,$3)
+       ON CONFLICT (ip_address) DO UPDATE SET label=$2 RETURNING *`, [ip.trim(), label||'', req.admin.id]);
+    await logAdmin(req.admin.id, 'Added IP to whitelist', {ip, label});
+    res.json({success:true,message:'IP added to whitelist',data:{entry:cc(rows[0])}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.delete('/api/admin/security/ip-whitelist/:id', adminAuth, requireRole('Super Admin'), async (req,res) => {
+  try {
+    await db('DELETE FROM admin_ip_whitelist WHERE id=$1',[req.params.id]);
+    await logAdmin(req.admin.id, 'Removed IP from whitelist', {id:req.params.id});
+    res.json({success:true,message:'IP removed from whitelist'});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.put('/api/admin/security/ip-whitelist/toggle', adminAuth, requireRole('Super Admin'), async (req,res) => {
+  try {
+    const { enabled } = req.body;
+    // Safety net: when turning ON, auto-whitelist the requesting Super Admin's
+    // current IP so they can never lock themselves out by mistake.
+    if (enabled) {
+      const myIp = getClientIp(req);
+      await db(
+        `INSERT INTO admin_ip_whitelist(ip_address,label,added_by) VALUES($1,'Auto-added (your IP at enable time)',$2)
+         ON CONFLICT (ip_address) DO NOTHING`, [myIp, req.admin.id]);
+    }
+    LIVE_SECURITY.ipWhitelistEnabled = !!enabled;
+    await saveSetting('security', LIVE_SECURITY, req.admin.id);
+    await logAdmin(req.admin.id, `IP whitelist ${enabled?'enabled':'disabled'}`);
+    res.json({success:true,message:`IP whitelist is now ${enabled?'ON':'OFF'}`,data:{security:LIVE_SECURITY}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── 2FA / Known Devices ─────────────────────────────────────────────────────
+app.put('/api/admin/security/2fa/toggle', adminAuth, requireRole('Super Admin'), async (req,res) => {
+  try {
+    const { enabled } = req.body;
+    LIVE_SECURITY.adminTwoFactorEnabled = !!enabled;
+    await saveSetting('security', LIVE_SECURITY, req.admin.id);
+    await logAdmin(req.admin.id, `Admin 2FA ${enabled?'enabled':'disabled'}`);
+    res.json({success:true,message:`Admin 2FA is now ${enabled?'ON':'OFF'}`,data:{security:LIVE_SECURITY}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.get('/api/admin/security/devices', adminAuth, requirePermission('security'), async (req,res) => {
+  try {
+    const {rows} = await db(
+      `SELECT d.*, u.name as admin_name, u.email as admin_email FROM admin_known_devices d
+       JOIN admins a ON a.id=d.admin_id JOIN users u ON u.id=a.user_id
+       ORDER BY d.last_seen DESC`);
+    res.json({success:true,data:{devices:ccAll(rows)}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.delete('/api/admin/security/devices/:id', adminAuth, requireRole('Super Admin'), async (req,res) => {
+  try {
+    await db('DELETE FROM admin_known_devices WHERE id=$1',[req.params.id]);
+    await logAdmin(req.admin.id, 'Revoked a trusted device', {id:req.params.id});
+    res.json({success:true,message:'Device revoked — that location will need to verify by email OTP again on next login'});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── Phase 4: Support Tickets / Live Chat (admin side) ─────────────────────
+// One conversation per user — real aggregation off the existing support_messages table.
+app.get('/api/admin/support/conversations', adminAuth, requirePermission('support'), async (req,res) => {
+  try {
+    const {rows} = await db(`
+      SELECT u.id as user_id, u.name, u.email, u.uid,
+             lm.message as last_message, lm.created_at as last_time, lm.direction as last_direction,
+             COALESCE(uc.unread,0) as unread
+      FROM (SELECT DISTINCT user_id FROM support_messages) du
+      JOIN users u ON u.id = du.user_id
+      JOIN LATERAL (
+        SELECT message, created_at, direction FROM support_messages
+        WHERE user_id = du.user_id ORDER BY created_at DESC LIMIT 1
+      ) lm ON true
+      LEFT JOIN (
+        SELECT user_id, COUNT(*) as unread FROM support_messages
+        WHERE direction='user' AND read_by_admin=false GROUP BY user_id
+      ) uc ON uc.user_id = du.user_id
+      ORDER BY lm.created_at DESC
+    `);
+    res.json({success:true,data:{conversations:ccAll(rows)}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.get('/api/admin/support/:userId/messages', adminAuth, async (req,res) => {
+  try {
+    const {rows} = await db(
+      `SELECT id,direction,message,created_at FROM support_messages WHERE user_id=$1 ORDER BY created_at ASC LIMIT 300`,
+      [req.params.userId]);
+    await db(`UPDATE support_messages SET read_by_admin=true WHERE user_id=$1 AND direction='user' AND read_by_admin=false`,[req.params.userId]);
+    res.json({success:true,data:{messages:ccAll(rows)}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.post('/api/admin/support/:userId/reply', adminAuth, requirePermission('support'), async (req,res) => {
+  try {
+    const { message } = req.body;
+    if (!message || !message.trim()) return res.status(400).json({success:false,message:'Message required'});
+    const text = message.trim().slice(0, 2000);
+    const {rows:[u]} = await db('SELECT name,uid FROM users WHERE id=$1',[req.params.userId]);
+    if (!u) return res.status(404).json({success:false,message:'User not found'});
+
+    const {rows:[msg]} = await db(
+      `INSERT INTO support_messages(user_id,direction,message,read_by_admin) VALUES($1,'admin',$2,true) RETURNING *`,
+      [req.params.userId, text]);
+
+    // Mirror to Telegram so the admin's mobile thread stays in sync.
+    tgSend(`💬 <b>Replied via Admin Panel</b>\n👤 ${u.name} (${u.uid})\n─────────────────────\n${text}`).catch(()=>{});
+
+    await logAdmin(req.admin.id, `Replied to support chat`, {userId:req.params.userId, userName:u.name});
+    res.json({success:true,message:'Reply sent',data:{message:cc(msg)}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── Phase 5: Announcements (admin CRUD) ────────────────────────────────────
+app.get('/api/admin/announcements', adminAuth, requirePermission('announcements'), async (req,res) => {
+  try {
+    const {rows} = await db(`SELECT a.*, ad.name as created_by_name FROM announcements a
+      LEFT JOIN admins ad ON ad.id=a.created_by ORDER BY a.created_at DESC`);
+    res.json({success:true,data:{announcements:ccAll(rows)}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.post('/api/admin/announcements', adminAuth, requireRole('Super Admin','Moderator'), async (req,res) => {
+  try {
+    const { title, message, type, style, startsAt, endsAt } = req.body;
+    if (!title||!message) return res.status(400).json({success:false,message:'Title and message are required'});
+    const {rows:[a]} = await db(
+      `INSERT INTO announcements(title,message,type,style,starts_at,ends_at,created_by)
+       VALUES($1,$2,$3,$4,COALESCE($5,NOW()),$6,$7) RETURNING *`,
+      [title.trim(), message.trim(), type||'banner', style||'info', startsAt||null, endsAt||null, req.admin.id]);
+    await logAdmin(req.admin.id, 'Created announcement', {title});
+    res.json({success:true,message:'Announcement created',data:{announcement:cc(a)}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.put('/api/admin/announcements/:id', adminAuth, requireRole('Super Admin','Moderator'), async (req,res) => {
+  try {
+    const { title, message, type, style, isActive, startsAt, endsAt } = req.body;
+    const {rows:[a]} = await db(
+      `UPDATE announcements SET
+         title=COALESCE($1,title), message=COALESCE($2,message), type=COALESCE($3,type),
+         style=COALESCE($4,style), is_active=COALESCE($5,is_active),
+         starts_at=COALESCE($6,starts_at), ends_at=$7
+       WHERE id=$8 RETURNING *`,
+      [title, message, type, style, isActive, startsAt, endsAt!==undefined?endsAt:null, req.params.id]);
+    if (!a) return res.status(404).json({success:false,message:'Announcement not found'});
+    await logAdmin(req.admin.id, 'Updated announcement', {id:req.params.id});
+    res.json({success:true,message:'Announcement updated',data:{announcement:cc(a)}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.put('/api/admin/announcements/:id/toggle', adminAuth, requireRole('Super Admin','Moderator'), async (req,res) => {
+  try {
+    const {rows:[a]} = await db(
+      `UPDATE announcements SET is_active = NOT is_active WHERE id=$1 RETURNING *`,[req.params.id]);
+    if (!a) return res.status(404).json({success:false,message:'Announcement not found'});
+    await logAdmin(req.admin.id, `Announcement ${a.is_active?'activated':'deactivated'}`, {id:req.params.id});
+    res.json({success:true,message:`Announcement ${a.is_active?'activated':'deactivated'}`,data:{announcement:cc(a)}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.delete('/api/admin/announcements/:id', adminAuth, requireRole('Super Admin'), async (req,res) => {
+  try {
+    await db('DELETE FROM announcements WHERE id=$1',[req.params.id]);
+    await logAdmin(req.admin.id, 'Deleted announcement', {id:req.params.id});
+    res.json({success:true,message:'Announcement deleted'});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── Phase 6: Content Management (admin CRUD) ───────────────────────────────
+// FAQ
+app.get('/api/admin/content/faq', adminAuth, requirePermission('content'), async (_,res) => {
+  try {
+    const {rows} = await db('SELECT * FROM content_faq ORDER BY sort_order ASC, created_at ASC');
+    res.json({success:true,data:{faqs:ccAll(rows)}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.post('/api/admin/content/faq', adminAuth, requireRole('Super Admin','Moderator'), async (req,res) => {
+  try {
+    const { question, answer, category, sortOrder } = req.body;
+    if (!question||!answer) return res.status(400).json({success:false,message:'Question and answer are required'});
+    const {rows:[f]} = await db(
+      `INSERT INTO content_faq(question,answer,category,sort_order) VALUES($1,$2,$3,$4) RETURNING *`,
+      [question.trim(), answer.trim(), category||'General', sortOrder||0]);
+    await logAdmin(req.admin.id, 'Added FAQ entry', {question});
+    res.json({success:true,message:'FAQ added',data:{faq:cc(f)}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.put('/api/admin/content/faq/:id', adminAuth, requireRole('Super Admin','Moderator'), async (req,res) => {
+  try {
+    const { question, answer, category, sortOrder, isActive } = req.body;
+    const {rows:[f]} = await db(
+      `UPDATE content_faq SET question=COALESCE($1,question), answer=COALESCE($2,answer),
+       category=COALESCE($3,category), sort_order=COALESCE($4,sort_order), is_active=COALESCE($5,is_active)
+       WHERE id=$6 RETURNING *`, [question, answer, category, sortOrder, isActive, req.params.id]);
+    if (!f) return res.status(404).json({success:false,message:'FAQ not found'});
+    await logAdmin(req.admin.id, 'Updated FAQ entry', {id:req.params.id});
+    res.json({success:true,message:'FAQ updated',data:{faq:cc(f)}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.delete('/api/admin/content/faq/:id', adminAuth, requireRole('Super Admin','Moderator'), async (req,res) => {
+  try {
+    await db('DELETE FROM content_faq WHERE id=$1',[req.params.id]);
+    await logAdmin(req.admin.id, 'Deleted FAQ entry', {id:req.params.id});
+    res.json({success:true,message:'FAQ deleted'});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// Banners
+app.get('/api/admin/content/banners', adminAuth, requirePermission('content'), async (_,res) => {
+  try {
+    const {rows} = await db('SELECT * FROM content_banners ORDER BY sort_order ASC, created_at ASC');
+    res.json({success:true,data:{banners:ccAll(rows)}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.post('/api/admin/content/banners', adminAuth, requireRole('Super Admin','Moderator'), async (req,res) => {
+  try {
+    const { title, subtitle, imageUrl, linkUrl, sortOrder } = req.body;
+    if (!title) return res.status(400).json({success:false,message:'Title is required'});
+    const {rows:[b]} = await db(
+      `INSERT INTO content_banners(title,subtitle,image_url,link_url,sort_order) VALUES($1,$2,$3,$4,$5) RETURNING *`,
+      [title.trim(), subtitle||'', imageUrl||'', linkUrl||'', sortOrder||0]);
+    await logAdmin(req.admin.id, 'Added banner', {title});
+    res.json({success:true,message:'Banner added',data:{banner:cc(b)}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.put('/api/admin/content/banners/:id', adminAuth, requireRole('Super Admin','Moderator'), async (req,res) => {
+  try {
+    const { title, subtitle, imageUrl, linkUrl, sortOrder, isActive } = req.body;
+    const {rows:[b]} = await db(
+      `UPDATE content_banners SET title=COALESCE($1,title), subtitle=COALESCE($2,subtitle),
+       image_url=COALESCE($3,image_url), link_url=COALESCE($4,link_url),
+       sort_order=COALESCE($5,sort_order), is_active=COALESCE($6,is_active)
+       WHERE id=$7 RETURNING *`, [title, subtitle, imageUrl, linkUrl, sortOrder, isActive, req.params.id]);
+    if (!b) return res.status(404).json({success:false,message:'Banner not found'});
+    await logAdmin(req.admin.id, 'Updated banner', {id:req.params.id});
+    res.json({success:true,message:'Banner updated',data:{banner:cc(b)}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.delete('/api/admin/content/banners/:id', adminAuth, requireRole('Super Admin','Moderator'), async (req,res) => {
+  try {
+    await db('DELETE FROM content_banners WHERE id=$1',[req.params.id]);
+    await logAdmin(req.admin.id, 'Deleted banner', {id:req.params.id});
+    res.json({success:true,message:'Banner deleted'});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// News
+app.get('/api/admin/content/news', adminAuth, requirePermission('content'), async (_,res) => {
+  try {
+    const {rows} = await db(`SELECT n.*, a.name as created_by_name FROM content_news n
+      LEFT JOIN admins a ON a.id=n.created_by ORDER BY n.created_at DESC`);
+    res.json({success:true,data:{news:ccAll(rows)}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.post('/api/admin/content/news', adminAuth, requireRole('Super Admin','Moderator'), async (req,res) => {
+  try {
+    const { title, excerpt, body, imageUrl, isPublished } = req.body;
+    if (!title||!body) return res.status(400).json({success:false,message:'Title and body are required'});
+    const {rows:[n]} = await db(
+      `INSERT INTO content_news(title,excerpt,body,image_url,is_published,created_by) VALUES($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [title.trim(), excerpt||'', body.trim(), imageUrl||'', isPublished!==false, req.admin.id]);
+    await logAdmin(req.admin.id, 'Created news post', {title});
+    res.json({success:true,message:'News post created',data:{news:cc(n)}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.put('/api/admin/content/news/:id', adminAuth, requireRole('Super Admin','Moderator'), async (req,res) => {
+  try {
+    const { title, excerpt, body, imageUrl, isPublished } = req.body;
+    const {rows:[n]} = await db(
+      `UPDATE content_news SET title=COALESCE($1,title), excerpt=COALESCE($2,excerpt),
+       body=COALESCE($3,body), image_url=COALESCE($4,image_url), is_published=COALESCE($5,is_published)
+       WHERE id=$6 RETURNING *`, [title, excerpt, body, imageUrl, isPublished, req.params.id]);
+    if (!n) return res.status(404).json({success:false,message:'News post not found'});
+    await logAdmin(req.admin.id, 'Updated news post', {id:req.params.id});
+    res.json({success:true,message:'News post updated',data:{news:cc(n)}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.delete('/api/admin/content/news/:id', adminAuth, requireRole('Super Admin','Moderator'), async (req,res) => {
+  try {
+    await db('DELETE FROM content_news WHERE id=$1',[req.params.id]);
+    await logAdmin(req.admin.id, 'Deleted news post', {id:req.params.id});
+    res.json({success:true,message:'News post deleted'});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// Static pages (Terms, Privacy, About, etc.)
+app.get('/api/admin/content/pages', adminAuth, requirePermission('content'), async (_,res) => {
+  try {
+    const {rows} = await db('SELECT * FROM content_pages ORDER BY slug ASC');
+    res.json({success:true,data:{pages:ccAll(rows)}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.put('/api/admin/content/pages/:slug', adminAuth, requireRole('Super Admin','Moderator'), async (req,res) => {
+  try {
+    const { title, body } = req.body;
+    if (!title||!body) return res.status(400).json({success:false,message:'Title and body are required'});
+    const {rows:[p]} = await db(
+      `INSERT INTO content_pages(slug,title,body,updated_by) VALUES($1,$2,$3,$4)
+       ON CONFLICT (slug) DO UPDATE SET title=$2, body=$3, updated_by=$4, updated_at=NOW() RETURNING *`,
+      [req.params.slug, title.trim(), body, req.admin.id]);
+    await logAdmin(req.admin.id, `Updated content page: ${req.params.slug}`);
+    res.json({success:true,message:'Page saved',data:{page:cc(p)}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── Phase 7: Backup ─────────────────────────────────────────────────────────
+// Render's free/standard web service has no persistent disk, so backups are
+// never written to local storage. Instead they're either streamed straight to
+// the admin's browser as a download, or pushed to Telegram (which IS
+// persistent storage) as a document the admin can grab anytime from their phone.
+const generateBackupPayload = async () => {
+  const tables = ['users','investments','transactions','admins','settings',
+    'announcements','content_faq','content_banners','content_news','content_pages',
+    'admin_ip_whitelist'];
+  const data = {};
+  for (const t of tables) {
+    const {rows} = await db(`SELECT * FROM ${t}`);
+    data[t] = rows;
+  }
+  return {
+    generatedAt: new Date().toISOString(),
+    platform: 'QAVIX GLOBAL',
+    tables: Object.keys(data),
+    rowCounts: Object.fromEntries(Object.entries(data).map(([k,v])=>[k,v.length])),
+    data,
+  };
+};
+
+app.get('/api/admin/backup/download', adminAuth, requireRole('Super Admin'), async (req,res) => {
+  try {
+    const backup = await generateBackupPayload();
+    const filename = `qavix-backup-${new Date().toISOString().slice(0,10)}.json`;
+    await logAdmin(req.admin.id, 'Downloaded manual backup', {filename});
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.send(JSON.stringify(backup, null, 2));
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.post('/api/admin/backup/send-telegram', adminAuth, requireRole('Super Admin'), async (req,res) => {
+  try {
+    const backup = await generateBackupPayload();
+    const buffer = Buffer.from(JSON.stringify(backup, null, 2));
+    const filename = `qavix-backup-${new Date().toISOString().slice(0,10)}.json`;
+    const totalRows = Object.values(backup.rowCounts).reduce((s,n)=>s+n,0);
+    const caption = `📦 QAVIX GLOBAL Backup\n${new Date().toLocaleString('en-GB')}\nTables: ${backup.tables.length} · Rows: ${totalRows}\nRequested by: ${req.admin.name}`;
+    const result = await tgSendDocument(buffer, filename, caption);
+    if (!result) return res.status(502).json({success:false,message:'Could not send backup to Telegram. Check bot token/chat ID.'});
+    await logAdmin(req.admin.id, 'Sent backup to Telegram', {filename});
+    res.json({success:true,message:'Backup sent to Telegram successfully',data:{rowCounts:backup.rowCounts}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.get('/api/admin/backup/status', adminAuth, requirePermission('backup'), async (_,res) => {
+  try {
+    const tables = ['users','investments','transactions','admins','settings',
+      'announcements','content_faq','content_banners','content_news','content_pages','admin_ip_whitelist'];
+    const counts = {};
+    for (const t of tables) {
+      const {rows} = await db(`SELECT COUNT(*) c FROM ${t}`);
+      counts[t] = parseInt(rows[0].c);
+    }
+    res.json({success:true,data:{tables,counts,lastAutoBackup:LAST_AUTO_BACKUP}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+
 app.use((_,res)=>res.status(404).json({success:false,message:'Route not found'}));
 app.use((e,req,res,_)=>{console.error(e.message); res.status(500).json({success:false,message:e.message});});
 
@@ -1874,6 +3251,29 @@ initDB().then(async ()=>{
       );
       if (rowCount > 0) console.log(`✅ Marked ${rowCount} expired investments as completed`);
     } catch(e) { console.error('Startup cleanup error:', e.message); }
+
+    // ── One-time backfill: membership_level was never updated on plan purchase
+    // until this fix, so every existing user could be stuck showing "starter"
+    // regardless of what they actually invested in. Recompute it for everyone
+    // from their real investment history (highest tier ever purchased wins).
+    try {
+      const {rowCount:fixedCount} = await pool.query(`
+        UPDATE users u SET membership_level = ranked.plan_id
+        FROM (
+          SELECT DISTINCT ON (user_id) user_id, plan_id
+          FROM investments
+          ORDER BY user_id,
+            CASE plan_id WHEN 'elite' THEN 4 WHEN 'gold' THEN 3 WHEN 'silver' THEN 2 WHEN 'bronze' THEN 1 ELSE 0 END DESC
+        ) ranked
+        WHERE u.id = ranked.user_id
+        AND (
+          u.membership_level IS DISTINCT FROM ranked.plan_id
+          AND CASE ranked.plan_id WHEN 'elite' THEN 4 WHEN 'gold' THEN 3 WHEN 'silver' THEN 2 WHEN 'bronze' THEN 1 ELSE 0 END
+            > CASE u.membership_level WHEN 'elite' THEN 4 WHEN 'gold' THEN 3 WHEN 'silver' THEN 2 WHEN 'bronze' THEN 1 ELSE 0 END
+        )
+      `);
+      if (fixedCount > 0) console.log(`✅ Backfilled membership_level for ${fixedCount} user(s) with stale "starter" tier`);
+    } catch(e) { console.error('Membership level backfill error:', e.message); }
   }
 
   app.listen(PORT,()=>{
@@ -1891,6 +3291,22 @@ initDB().then(async ()=>{
   // First run 10s after startup (catches up if server was down)
   setTimeout(runDailyProfits, 10_000);
   setInterval(runDailyProfits, 24 * 60 * 60 * 1000);
+
+  // Daily automatic backup → sent to admin Telegram (no persistent disk needed on Render)
+  const runDailyBackup = async () => {
+    try {
+      const backup = await generateBackupPayload();
+      const buffer = Buffer.from(JSON.stringify(backup, null, 2));
+      const filename = `qavix-backup-auto-${new Date().toISOString().slice(0,10)}.json`;
+      const totalRows = Object.values(backup.rowCounts).reduce((s,n)=>s+n,0);
+      const caption = `📦 QAVIX GLOBAL — Daily Auto-Backup\n${new Date().toLocaleString('en-GB')}\nTables: ${backup.tables.length} · Rows: ${totalRows}`;
+      const result = await tgSendDocument(buffer, filename, caption);
+      if (result) { LAST_AUTO_BACKUP = new Date().toISOString(); console.log('✅ Daily backup sent to Telegram'); }
+      else console.log('⚠️  Daily backup failed to send to Telegram');
+    } catch(e){ console.error('Daily backup error:', e.message); }
+  };
+  setTimeout(runDailyBackup, 30_000);
+  setInterval(runDailyBackup, 24 * 60 * 60 * 1000);
 });
 
 module.exports = app;
