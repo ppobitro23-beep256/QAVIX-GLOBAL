@@ -2008,7 +2008,7 @@ app.get('/api/admin/users/:id/login-history', adminAuth, requirePermission('user
 app.get('/api/admin/users/:id/devices', adminAuth, requirePermission('users'), async (req,res) => {
   try {
     const {rows} = await db(
-      `SELECT id, device, ip, created_at, updated_at FROM user_sessions WHERE user_id=$1 ORDER BY COALESCE(updated_at,created_at) DESC LIMIT 20`,
+      `SELECT id, device, ip, created_at, last_active FROM user_sessions WHERE user_id=$1 ORDER BY COALESCE(last_active,created_at) DESC LIMIT 20`,
       [req.params.id]);
     res.json({success:true,data:{devices:ccAll(rows)}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
