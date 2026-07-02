@@ -3108,8 +3108,10 @@ app.post('/api/admin/support/:userId/reply', adminAuth, requirePermission('suppo
 // ── Phase 5: Announcements (admin CRUD) ────────────────────────────────────
 app.get('/api/admin/announcements', adminAuth, requirePermission('announcements'), async (req,res) => {
   try {
-    const {rows} = await db(`SELECT a.*, ad.name as created_by_name FROM announcements a
-      LEFT JOIN admins ad ON ad.id=a.created_by ORDER BY a.created_at DESC`);
+    const {rows} = await db(`SELECT a.*, u2.name as created_by_name FROM announcements a
+      LEFT JOIN admins ad ON ad.id=a.created_by
+      LEFT JOIN users u2 ON u2.id=ad.user_id
+      ORDER BY a.created_at DESC`);
     res.json({success:true,data:{announcements:ccAll(rows)}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
