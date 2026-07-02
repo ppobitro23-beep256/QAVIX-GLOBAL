@@ -2482,8 +2482,9 @@ app.get('/api/admin/referrals/earnings', adminAuth, requirePermission('referral'
               ru.name AS referred_name, ru.uid AS referred_uid
        FROM transactions t
        JOIN users u ON u.id=t.user_id
-       LEFT JOIN users ru ON ru.id=(t.meta->>'referredUserId')::uuid
-       WHERE t.type='commission' ORDER BY t.created_at DESC LIMIT 100`);
+       LEFT JOIN users ru ON ru.id=(t.meta->>'from')::uuid
+       WHERE t.type='commission' AND t.meta->>'lvl' IS NOT NULL
+       ORDER BY t.created_at DESC LIMIT 100`);
     res.json({success:true,data:{earnings:ccAll(rows)}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
