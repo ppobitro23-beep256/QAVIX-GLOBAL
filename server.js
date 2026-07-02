@@ -1932,8 +1932,11 @@ app.get('/api/admin/users', adminAuth, requirePermission('users'), async (req,re
     const {rows:countRows} = await db(`SELECT COUNT(*) FROM users ${whereSql}`, params);
     params.push(limit, (page-1)*limit);
     const {rows} = await db(
-      `SELECT id,name,email,uid,balance,total_deposited,total_withdrawn,membership_level,status,created_at
-       FROM users ${whereSql} ORDER BY created_at DESC LIMIT $${params.length-1} OFFSET $${params.length}`, params);
+      `SELECT u.id, u.name, u.email, u.uid, u.balance, u.total_deposited, u.total_withdrawn,
+              u.membership_level, u.status, u.created_at,
+              r.name AS referrer_name, r.uid AS referrer_uid
+       FROM users u LEFT JOIN users r ON r.id=u.referred_by
+       ${whereSql} ORDER BY u.created_at DESC LIMIT $${params.length-1} OFFSET $${params.length}`, params);
     const {rows:statusRows} = await db(`SELECT COUNT(*) total, COUNT(*) FILTER (WHERE status='active') active,
       COUNT(*) FILTER (WHERE status='suspended') suspended, COUNT(*) FILTER (WHERE status='banned') banned FROM users`);
     res.json({success:true,data:{users:ccAll(rows),total:parseInt(countRows[0].count),page,limit,statusCounts:cc(statusRows[0])}});
@@ -2423,31 +2426,50 @@ app.get('/api/admin/investments/export', adminAuth, requirePermission('investmen
 // ── Referral system (real commission data from transactions) ───────────────
 app.get('/api/admin/referrals/stats', adminAuth, async (_,res) => {
   try {
-    const [referrers, paid, top] = await Promise.all([
-      db(`SELECT COUNT(DISTINCT referred_by) c FROM users WHERE referred_by IS NOT NULL`),
-      db(`SELECT COALESCE(SUM(amount),0) total FROM transactions WHERE type='commission' AND created_at > NOW() - INTERVAL '30 days'`),
-      db(`SELECT u.name, u.uid, COALESCE(SUM(t.amount),0) earned FROM transactions t JOIN users u ON u.id=t.user_id
-          WHERE t.type='commission' AND t.created_at > NOW() - INTERVAL '30 days' GROUP BY u.id,u.name,u.uid ORDER BY earned DESC LIMIT 1`)
+    const [refRow, networkRow, paidRow, topRow] = await Promise.all([
+      db(`SELECT COUNT(DISTINCT referred_by) FROM users WHERE referred_by IS NOT NULL`),
+      db(`SELECT COUNT(*) FROM users WHERE referred_by IS NOT NULL`),
+      db(`SELECT COALESCE(SUM(amount),0) paid FROM transactions WHERE type='commission' AND created_at > NOW()-INTERVAL '30 days'`),
+      db(`SELECT u.name, u.uid, SUM(t.amount) amount FROM transactions t JOIN users u ON u.id=t.user_id
+          WHERE t.type='commission' AND t.created_at > NOW()-INTERVAL '30 days'
+          GROUP BY u.id,u.name,u.uid ORDER BY amount DESC LIMIT 1`),
     ]);
     res.json({success:true,data:{
-      totalReferrers: parseInt(referrers.rows[0].c),
-      rewardsPaid30d: parseFloat(paid.rows[0].total),
-      topEarner: top.rows[0] ? {name:top.rows[0].name, uid:top.rows[0].uid, amount:parseFloat(top.rows[0].earned)} : null,
+      totalReferrers: parseInt(refRow.rows[0].count)||0,
+      totalNetwork: parseInt(networkRow.rows[0].count)||0,
+      rewardsPaid30d: parseFloat(paidRow.rows[0].paid)||0,
+      topEarner: topRow.rows[0] ? cc(topRow.rows[0]) : null,
     }});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
 app.get('/api/admin/referrals/levels', adminAuth, requirePermission('referral'), async (_,res) => {
   try {
-    const {rows} = await db(
+    const {rows:paid} = await db(
       `SELECT (meta->>'lvl')::int AS level, COUNT(*) referrers, COALESCE(SUM(amount),0) paid
-       FROM transactions WHERE type='commission' AND created_at > NOW() - INTERVAL '30 days'
+       FROM transactions WHERE type='commission' AND created_at > NOW()-INTERVAL '30 days'
        GROUP BY (meta->>'lvl')::int ORDER BY level`);
-    const byLevel = {}; rows.forEach(r=> byLevel[r.level] = r);
-    const levels = Object.entries(LIVE_COMM).map(([lvl,pct]) => ({
-      level: parseInt(lvl), commissionPct: pct,
-      referrers: parseInt(byLevel[lvl]?.referrers||0),
-      paid30d: parseFloat(byLevel[lvl]?.paid||0),
+    const paidMap = {};
+    paid.forEach(r=>{ paidMap[r.level]={referrers:parseInt(r.referrers),paid:parseFloat(r.paid)}; });
+
+    // Count total members at each level via recursive query
+    const {rows:memberRows} = await db(`
+      WITH RECURSIVE t AS (
+        SELECT id, referred_by, 1 AS lvl FROM users WHERE referred_by IS NOT NULL
+        UNION ALL
+        SELECT u.id, u.referred_by, t.lvl+1 FROM users u JOIN t ON u.referred_by=t.id WHERE t.lvl<10
+      )
+      SELECT lvl, COUNT(*) cnt FROM t GROUP BY lvl ORDER BY lvl
+    `);
+    const memberMap={};
+    memberRows.forEach(r=>{ memberMap[parseInt(r.lvl)]=parseInt(r.cnt); });
+
+    const COMM = LIVE_COMM||{'1':10,'2':5,'3':2,'4':1,'5':1,'6':1,'7':1,'8':1,'9':1,'10':1};
+    const levels = Array.from({length:10},(_,i)=>i+1).map(l=>({
+      level:l, commissionPct:COMM[l]||0,
+      totalMembers:memberMap[l]||0,
+      referrers:paidMap[l]?.referrers||0,
+      paid30d:paidMap[l]?.paid||0,
     }));
     res.json({success:true,data:{levels}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
@@ -2456,11 +2478,66 @@ app.get('/api/admin/referrals/levels', adminAuth, requirePermission('referral'),
 app.get('/api/admin/referrals/earnings', adminAuth, requirePermission('referral'), async (req,res) => {
   try {
     const {rows} = await db(
-      `SELECT t.*, u.name AS referrer_name, u.uid AS referrer_uid FROM transactions t
-       JOIN users u ON u.id=t.user_id WHERE t.type='commission' ORDER BY t.created_at DESC LIMIT 50`);
+      `SELECT t.*, u.name AS referrer_name, u.uid AS referrer_uid,
+              ru.name AS referred_name, ru.uid AS referred_uid
+       FROM transactions t
+       JOIN users u ON u.id=t.user_id
+       LEFT JOIN users ru ON ru.id=(t.meta->>'referredUserId')::uuid
+       WHERE t.type='commission' ORDER BY t.created_at DESC LIMIT 100`);
     res.json({success:true,data:{earnings:ccAll(rows)}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
+
+app.get('/api/admin/referrals/network', adminAuth, requirePermission('referral'), async (req,res) => {
+  try {
+    const q = (req.query.q||'').trim();
+    if(!q) return res.status(400).json({success:false,message:'Query required'});
+    // find user
+    const {rows:found} = await db(
+      `SELECT id,name,email,uid,membership_level,referred_by,status FROM users
+       WHERE name ILIKE $1 OR email ILIKE $1 OR uid ILIKE $1 LIMIT 1`,['%'+q+'%']);
+    if(!found.length) return res.json({success:true,data:{user:null}});
+    const user = cc(found[0]);
+
+    // upline — walk referred_by chain up to 10 hops
+    const upline=[];
+    let curId = found[0].referred_by;
+    for(let i=0;i<10&&curId;i++){
+      const {rows:up} = await db(`SELECT id,name,email,uid,membership_level,referred_by FROM users WHERE id=$1`,[curId]);
+      if(!up.length) break;
+      upline.push(cc(up[0]));
+      curId = up[0].referred_by;
+    }
+
+    // downline — recursive
+    const {rows:downRows} = await db(`
+      WITH RECURSIVE t AS (
+        SELECT id,name,uid,membership_level,1 AS lvl FROM users WHERE referred_by=$1
+        UNION ALL
+        SELECT u.id,u.name,u.uid,u.membership_level,t.lvl+1 FROM users u JOIN t ON u.referred_by=t.id WHERE t.lvl<10
+      ) SELECT * FROM t ORDER BY lvl,name
+    `,[found[0].id]);
+
+    let activeSet=new Set();
+    if(downRows.length){
+      const ids=downRows.map(r=>r.id);
+      const ph=ids.map((_,i)=>`$${i+1}`).join(',');
+      const {rows:ar}=await db(`SELECT DISTINCT user_id FROM investments WHERE status='active' AND user_id IN (${ph})`,ids);
+      ar.forEach(r=>activeSet.add(r.user_id));
+    }
+    const byLvl={};
+    downRows.forEach(r=>{
+      if(!byLvl[r.lvl]) byLvl[r.lvl]=[];
+      byLvl[r.lvl].push({id:r.id,name:r.name,uid:r.uid,level:r.membership_level,status:activeSet.has(r.id)?'active':'inactive'});
+    });
+    const COMM=LIVE_COMM||{'1':10,'2':5,'3':2,'4':1,'5':1,'6':1,'7':1,'8':1,'9':1,'10':1};
+    const downline=Array.from({length:10},(_,i)=>i+1).map(l=>({
+      level:l, commission:COMM[l]||0, count:(byLvl[l]||[]).length, members:byLvl[l]||[]
+    }));
+    res.json({success:true,data:{user,upline,downline}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
 
 // ── Reports (real SQL aggregation, no fabricated numbers) ──────────────────
 const fmtNum = (n) => parseFloat(n||0);
