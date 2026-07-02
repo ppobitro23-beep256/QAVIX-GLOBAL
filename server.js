@@ -236,6 +236,7 @@ const initDB = async () => {
       created_at  TIMESTAMPTZ  DEFAULT NOW()
     );
     CREATE INDEX IF NOT EXISTS idx_ann_active ON announcements(is_active, starts_at, ends_at);
+    ALTER TABLE announcements ADD COLUMN IF NOT EXISTS slide_theme VARCHAR(20) DEFAULT 'gold'; -- 'gold','blue','green','purple','red','indigo' — colour used when shown in the home slider
 
     -- ── Phase 6: Content Management (FAQ / Banners / News / Terms / Privacy) ──
     CREATE TABLE IF NOT EXISTS content_faq (
@@ -776,7 +777,7 @@ app.get('/api/health', (_,res)=>res.json({success:true,status:'healthy',uptime:p
 app.get('/api/announcements/active', async (_,res) => {
   try {
     const {rows} = await db(
-      `SELECT id,title,message,type,style FROM announcements
+      `SELECT id,title,message,type,style,slide_theme FROM announcements
        WHERE is_active=true AND starts_at<=NOW() AND (ends_at IS NULL OR ends_at>NOW())
        ORDER BY created_at DESC`);
     res.json({success:true,data:{announcements:ccAll(rows)}});
@@ -3118,12 +3119,12 @@ app.get('/api/admin/announcements', adminAuth, requirePermission('announcements'
 
 app.post('/api/admin/announcements', adminAuth, requireRole('Super Admin','Moderator'), async (req,res) => {
   try {
-    const { title, message, type, style, startsAt, endsAt } = req.body;
+    const { title, message, type, style, slideTheme, startsAt, endsAt } = req.body;
     if (!title||!message) return res.status(400).json({success:false,message:'Title and message are required'});
     const {rows:[a]} = await db(
-      `INSERT INTO announcements(title,message,type,style,starts_at,ends_at,created_by)
-       VALUES($1,$2,$3,$4,COALESCE($5,NOW()),$6,$7) RETURNING *`,
-      [title.trim(), message.trim(), type||'banner', style||'info', startsAt||null, endsAt||null, req.admin.id]);
+      `INSERT INTO announcements(title,message,type,style,slide_theme,starts_at,ends_at,created_by)
+       VALUES($1,$2,$3,$4,$5,COALESCE($6,NOW()),$7,$8) RETURNING *`,
+      [title.trim(), message.trim(), type||'banner', style||'info', slideTheme||'gold', startsAt||null, endsAt||null, req.admin.id]);
     // Notify every user in-app that a new announcement has gone up
     await db(`INSERT INTO notifications(user_id,type,title,body) SELECT id,'announcement',$1,$2 FROM users`,
       [title.trim(), message.trim()]).catch(()=>{});
@@ -3134,14 +3135,14 @@ app.post('/api/admin/announcements', adminAuth, requireRole('Super Admin','Moder
 
 app.put('/api/admin/announcements/:id', adminAuth, requireRole('Super Admin','Moderator'), async (req,res) => {
   try {
-    const { title, message, type, style, isActive, startsAt, endsAt } = req.body;
+    const { title, message, type, style, slideTheme, isActive, startsAt, endsAt } = req.body;
     const {rows:[a]} = await db(
       `UPDATE announcements SET
          title=COALESCE($1,title), message=COALESCE($2,message), type=COALESCE($3,type),
-         style=COALESCE($4,style), is_active=COALESCE($5,is_active),
-         starts_at=COALESCE($6,starts_at), ends_at=$7
-       WHERE id=$8 RETURNING *`,
-      [title, message, type, style, isActive, startsAt, endsAt!==undefined?endsAt:null, req.params.id]);
+         style=COALESCE($4,style), slide_theme=COALESCE($5,slide_theme), is_active=COALESCE($6,is_active),
+         starts_at=COALESCE($7,starts_at), ends_at=$8
+       WHERE id=$9 RETURNING *`,
+      [title, message, type, style, slideTheme, isActive, startsAt, endsAt!==undefined?endsAt:null, req.params.id]);
     if (!a) return res.status(404).json({success:false,message:'Announcement not found'});
     await logAdmin(req.admin.id, 'Updated announcement', {id:req.params.id});
     res.json({success:true,message:'Announcement updated',data:{announcement:cc(a)}});
@@ -3451,7 +3452,7 @@ initDB().then(async ()=>{
         )
       `);
       if (fixedCount > 0) console.log(`✅ Backfilled membership_level for ${fixedCount} user(s) with stale "starter" tier`);
-    } catch(e) { console.error('Membership level backfill error:', e.message); }
+    } catch(e) { console.error('Membership level backfill error:', e.message); }    
   }
 
   app.listen(PORT,()=>{
