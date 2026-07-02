@@ -3124,6 +3124,9 @@ app.post('/api/admin/announcements', adminAuth, requireRole('Super Admin','Moder
       `INSERT INTO announcements(title,message,type,style,starts_at,ends_at,created_by)
        VALUES($1,$2,$3,$4,COALESCE($5,NOW()),$6,$7) RETURNING *`,
       [title.trim(), message.trim(), type||'banner', style||'info', startsAt||null, endsAt||null, req.admin.id]);
+    // Notify every user in-app that a new announcement has gone up
+    await db(`INSERT INTO notifications(user_id,type,title,body) SELECT id,'announcement',$1,$2 FROM users`,
+      [title.trim(), message.trim()]).catch(()=>{});
     await logAdmin(req.admin.id, 'Created announcement', {title});
     res.json({success:true,message:'Announcement created',data:{announcement:cc(a)}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
