@@ -291,18 +291,6 @@ const initDB = async () => {
       created_at  TIMESTAMPTZ   DEFAULT NOW()
     );
 
-    -- ── API Keys (Settings → API Keys) ───────────────────────────────────
-    CREATE TABLE IF NOT EXISTS api_keys (
-      id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      name        VARCHAR(100) NOT NULL,
-      key_prefix  VARCHAR(12)  NOT NULL,
-      key_hash    TEXT         NOT NULL,
-      created_by  UUID REFERENCES admins(id) ON DELETE SET NULL,
-      last_used_at TIMESTAMPTZ,
-      revoked     BOOLEAN      DEFAULT FALSE,
-      created_at  TIMESTAMPTZ  DEFAULT NOW()
-    );
-
     -- ── Admin 2FA / device verification ──────────────────────────────────
     CREATE TABLE IF NOT EXISTS admin_known_devices (
       id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -649,7 +637,6 @@ const DEFAULT_REFERRAL = { enabled: true };
 const DEFAULT_MAINTENANCE = { enabled: false, message: 'We are performing scheduled maintenance and will be back shortly.' };
 const DEFAULT_SECURITY = { ipWhitelistEnabled: false, adminTwoFactorEnabled: false };
 const DEFAULT_GENERAL = { siteName: 'QAVIX GLOBAL', supportEmail: 'support@qavixglobal.com', timezone: 'UTC', language: 'en' };
-const DEFAULT_BRANDING = { logoUrl: '', primaryColor: '#C9A227', theme: 'light' };
 // Email delivery actually runs on the Brevo HTTP API (see sendEmail) — there is no
 // raw SMTP host/port/user/password in this stack, so this only exposes the two
 // fields that genuinely change Brevo's outgoing emails. The Brevo API key itself
@@ -666,7 +653,6 @@ let LIVE_REFERRAL = {...DEFAULT_REFERRAL};
 let LIVE_MAINTENANCE = {...DEFAULT_MAINTENANCE};
 let LIVE_SECURITY = {...DEFAULT_SECURITY};
 let LIVE_GENERAL = {...DEFAULT_GENERAL};
-let LIVE_BRANDING = {...DEFAULT_BRANDING};
 let LIVE_EMAIL_SENDER = {...DEFAULT_EMAIL_SENDER};
 let LIVE_OTP = {...DEFAULT_OTP};
 
@@ -685,7 +671,6 @@ const loadSettingsCache = async () => {
       if (r.key === 'maintenance') LIVE_MAINTENANCE = {...DEFAULT_MAINTENANCE, ...r.value};
       if (r.key === 'security') LIVE_SECURITY = {...DEFAULT_SECURITY, ...r.value};
       if (r.key === 'general') LIVE_GENERAL = {...DEFAULT_GENERAL, ...r.value};
-      if (r.key === 'branding') LIVE_BRANDING = {...DEFAULT_BRANDING, ...r.value};
       if (r.key === 'smtp') LIVE_EMAIL_SENDER = {...DEFAULT_EMAIL_SENDER, ...r.value};
       if (r.key === 'otp') LIVE_OTP = {...DEFAULT_OTP, ...r.value};
     });
@@ -787,10 +772,6 @@ app.get('/api/announcements/active', async (_,res) => {
 });
 
 // ── Public: Content Management read endpoints (used by index.html) ────────
-// Also expose branding for CSS variable injection on page load
-app.get('/api/content/branding', async (_,res) => {
-  res.json({success:true,data:LIVE_BRANDING});
-});
 
 // ── Public: payment limits & fee (used by index.html withdrawal form) ────
 app.get('/api/content/payment-info', async (_,res) => {
@@ -2797,7 +2778,7 @@ app.get('/api/admin/settings', adminAuth, requirePermission('settings'), async (
   res.json({success:true,data:{
     plans: LIVE_PLANS, commission: LIVE_COMM, payment: LIVE_PAYMENT,
     referral: LIVE_REFERRAL, maintenance: LIVE_MAINTENANCE, security: LIVE_SECURITY,
-    general: LIVE_GENERAL, branding: LIVE_BRANDING,
+    general: LIVE_GENERAL,
     emailSender: LIVE_EMAIL_SENDER,
     otp: LIVE_OTP,
   }});
@@ -2885,7 +2866,7 @@ app.put('/api/admin/settings/maintenance', adminAuth, requireRole('Super Admin')
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
-// ── Phase 2.5: General / Branding / SMTP / OTP settings ─────────────────────
+// ── Phase 2.5: General / SMTP / OTP settings ─────────────────────
 app.put('/api/admin/settings/general', adminAuth, requireRole('Super Admin'), async (req,res) => {
   try {
     const { siteName, supportEmail, timezone, language } = req.body;
@@ -2895,17 +2876,6 @@ app.put('/api/admin/settings/general', adminAuth, requireRole('Super Admin'), as
     await saveSetting('general', LIVE_GENERAL, req.admin.id);
     await logAdmin(req.admin.id, 'Updated general settings');
     res.json({success:true,message:'General settings saved',data:{general:LIVE_GENERAL}});
-  } catch(e){res.status(500).json({success:false,message:e.message});}
-});
-
-app.put('/api/admin/settings/branding', adminAuth, requireRole('Super Admin'), async (req,res) => {
-  try {
-    const { logoUrl, primaryColor, theme } = req.body;
-    LIVE_BRANDING = { ...LIVE_BRANDING,
-      ...(logoUrl!==undefined && {logoUrl}), ...(primaryColor!==undefined && {primaryColor}), ...(theme!==undefined && {theme}) };
-    await saveSetting('branding', LIVE_BRANDING, req.admin.id);
-    await logAdmin(req.admin.id, 'Updated branding settings');
-    res.json({success:true,message:'Branding settings saved',data:{branding:LIVE_BRANDING}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
@@ -2934,63 +2904,6 @@ app.put('/api/admin/settings/otp', adminAuth, requireRole('Super Admin'), async 
     await logAdmin(req.admin.id, 'Updated OTP settings');
     res.json({success:true,message:'OTP settings saved — takes effect immediately for new OTP requests',data:{otp:LIVE_OTP}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
-});
-
-// ── API Keys (Settings → API Keys) ───────────────────────────────────────
-app.get('/api/admin/settings/api-keys', adminAuth, requireRole('Super Admin'), async (_,res) => {
-  try {
-    const {rows} = await db(`SELECT id,name,key_prefix,last_used_at,revoked,created_at FROM api_keys ORDER BY created_at DESC`);
-    res.json({success:true,data:{keys:ccAll(rows)}});
-  } catch(e){res.status(500).json({success:false,message:e.message});}
-});
-
-app.post('/api/admin/settings/api-keys', adminAuth, requireRole('Super Admin'), async (req,res) => {
-  try {
-    const { name } = req.body;
-    if (!name) return res.status(400).json({success:false,message:'Key name is required'});
-    const rawKey = 'qvx_' + crypto.randomBytes(24).toString('hex');
-    const prefix = rawKey.slice(0,12);
-    const hash = await bcrypt.hash(rawKey, 8);
-    const {rows:[k]} = await db(
-      `INSERT INTO api_keys(name,key_prefix,key_hash,created_by) VALUES($1,$2,$3,$4) RETURNING id,name,key_prefix,created_at`,
-      [name.trim(), prefix, hash, req.admin.id]);
-    await logAdmin(req.admin.id, 'Generated API key', {name});
-    // The full key is only ever shown this one time — store only the hash from here on.
-    res.json({success:true,message:'API key generated — copy it now, it will not be shown again.',data:{key:cc(k), fullKey:rawKey}});
-  } catch(e){res.status(500).json({success:false,message:e.message});}
-});
-
-app.delete('/api/admin/settings/api-keys/:id', adminAuth, requireRole('Super Admin'), async (req,res) => {
-  try {
-    await db('UPDATE api_keys SET revoked=true WHERE id=$1',[req.params.id]);
-    await logAdmin(req.admin.id, 'Revoked API key', {id:req.params.id});
-    res.json({success:true,message:'API key revoked'});
-  } catch(e){res.status(500).json({success:false,message:e.message});}
-});
-
-// ── External API key auth ───────────────────────────────────────────────────
-// Generated keys previously had nowhere to actually be checked — this middleware
-// makes them real. Any request under /api/external/* must send a valid,
-// non-revoked key via the X-API-Key header (format: qvx_<random>).
-const apiKeyAuth = async (req,res,next) => {
-  try {
-    const key = req.headers['x-api-key'];
-    if (!key || !key.startsWith('qvx_')) return res.status(401).json({success:false,message:'Missing or invalid X-API-Key header'});
-    const prefix = key.slice(0,12);
-    const {rows} = await db('SELECT * FROM api_keys WHERE key_prefix=$1 AND revoked=false',[prefix]);
-    let matched = null;
-    for (const row of rows) { if (await bcrypt.compare(key, row.key_hash)) { matched = row; break; } }
-    if (!matched) return res.status(401).json({success:false,message:'Invalid or revoked API key'});
-    db('UPDATE api_keys SET last_used_at=NOW() WHERE id=$1',[matched.id]).catch(()=>{});
-    req.apiKeyName = matched.name;
-    next();
-  } catch(e){res.status(500).json({success:false,message:e.message});}
-};
-
-// Example real, read-only endpoint for partners/affiliates holding a generated
-// key — returns the same live plan data used on the platform itself.
-app.get('/api/external/plans', apiKeyAuth, (_,res) => {
-  res.json({success:true,data:{plans:LIVE_PLANS}});
 });
 
 // ── Admin activity logs ───────────────────────────────────────────────────
