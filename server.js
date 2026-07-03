@@ -181,7 +181,7 @@ const initDB = async () => {
     CREATE TABLE IF NOT EXISTS admins (
       id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       user_id      UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE UNIQUE,
-      role         VARCHAR(30)   DEFAULT 'Support',
+      role         VARCHAR(30)   DEFAULT 'Moderator',
       status       VARCHAR(20)   DEFAULT 'pending',
       last_login   TIMESTAMPTZ,
       created_at   TIMESTAMPTZ   DEFAULT NOW()
@@ -573,26 +573,28 @@ const adminAuth = async (req, res, next) => {
     res.status(401).json({success:false,message: e.name==='TokenExpiredError'?'Token expired':'Invalid token'});
   }
 };
-// Restrict to specific roles, e.g. requireRole('Super Admin','Finance')
+// Restrict to specific roles, e.g. requireRole('Super Admin')
+// Owner always bypasses this check — it's the single top-level account and is
+// never subject to role restrictions imposed on anyone else.
 const requireRole = (...roles) => (req, res, next) => {
+  if (req.admin.role === 'Owner') return next();
   if (!roles.includes(req.admin.role)) return res.status(403).json({success:false,message:'Insufficient permissions for this action'});
   next();
 };
 
 // Default permission matrix per role — what each role can do out of the box.
-// Super Admin always gets everything and cannot be restricted.
+// Owner and Super Admin always get everything and cannot be restricted.
 // These are used when an admin has no custom permissions saved yet.
 const DEFAULT_ROLE_PERMISSIONS = {
+  'Owner':       { dashboard:true, users:true, deposits:true, withdrawals:true, plans:true, investments:true, referral:true, reports:true, settings:true, security:true, support:true, announcements:true, content:true, admins:true, logs:true, backup:true },
   'Super Admin': { dashboard:true, users:true, deposits:true, withdrawals:true, plans:true, investments:true, referral:true, reports:true, settings:true, security:true, support:true, announcements:true, content:true, admins:true, logs:true, backup:true },
   'Moderator':   { dashboard:true, users:true, deposits:true, withdrawals:false, plans:false, investments:true, referral:true, reports:true, settings:false, security:false, support:true, announcements:true, content:true, admins:false, logs:false, backup:false },
-  'Finance':     { dashboard:true, users:false, deposits:true, withdrawals:true, plans:true, investments:true, referral:true, reports:true, settings:false, security:false, support:false, announcements:false, content:false, admins:false, logs:true, backup:true },
-  'Support':     { dashboard:true, users:true, deposits:false, withdrawals:false, plans:false, investments:false, referral:false, reports:false, settings:false, security:false, support:true, announcements:false, content:false, admins:false, logs:false, backup:false },
 };
 
 // Check if an admin has permission for a given module key.
-// Super Admin always passes; others check custom permissions, falling back to role defaults.
+// Owner and Super Admin always pass; others check custom permissions, falling back to role defaults.
 const hasPermission = (admin, module) => {
-  if (admin.role === 'Super Admin') return true;
+  if (admin.role === 'Owner' || admin.role === 'Super Admin') return true;
   const perms = admin.permissions && Object.keys(admin.permissions).length > 0
     ? admin.permissions
     : (DEFAULT_ROLE_PERMISSIONS[admin.role] || {});
@@ -2060,7 +2062,7 @@ app.put('/api/admin/users/:id/status', adminAuth, requirePermission('users'), as
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
-app.post('/api/admin/users/:id/balance', adminAuth, requireRole('Super Admin','Finance'), async (req,res) => {
+app.post('/api/admin/users/:id/balance', adminAuth, requireRole('Super Admin'), async (req,res) => {
   try {
     const {type, amount, ledger, reason} = req.body; // type: 'credit' | 'debit'
     const amt = parseFloat(amount);
@@ -2306,6 +2308,7 @@ app.post('/api/admin/admins', adminAuth, requireRole('Super Admin'), async (req,
   try {
     const {email, role} = req.body;
     if (!email) return res.status(400).json({success:false,message:'Email is required'});
+    if (role === 'Owner') return res.status(400).json({success:false,message:'There can only be one Owner account — it cannot be assigned here.'});
     const {rows:[user]} = await db('SELECT id,name,email FROM users WHERE email=$1',[email.toLowerCase()]);
     if (!user) return res.status(400).json({success:false,message:'This email does not have a QAVIX GLOBAL account yet. They must register on the platform first.'});
     const {rows:exists} = await db('SELECT id FROM admins WHERE user_id=$1',[user.id]);
@@ -2313,7 +2316,7 @@ app.post('/api/admin/admins', adminAuth, requireRole('Super Admin'), async (req,
     // New admins start as 'pending' — they cannot use admin access until a Super Admin approves them.
     const {rows} = await db(
       `INSERT INTO admins(user_id,role,status) VALUES($1,$2,'pending') RETURNING id,role,status,created_at`,
-      [user.id, role||'Support']);
+      [user.id, role||'Moderator']);
     await logAdmin(req.admin.id, `Granted admin access to ${user.email} (pending approval)`, {role});
     res.status(201).json({success:true,message:`${user.name} added — pending your approval. They will log in with their existing QAVIX GLOBAL password.`,
       data:{admin:{...cc(rows[0]), name:user.name, email:user.email}}});
@@ -2334,6 +2337,10 @@ app.put('/api/admin/admins/:id/approve', adminAuth, requireRole('Super Admin'), 
 app.put('/api/admin/admins/:id', adminAuth, requireRole('Super Admin'), async (req,res) => {
   try {
     const {role, status} = req.body;
+    if (role === 'Owner') return res.status(400).json({success:false,message:'There can only be one Owner account — it cannot be assigned here.'});
+    const {rows:[target]} = await db('SELECT role FROM admins WHERE id=$1',[req.params.id]);
+    if (!target) return res.status(404).json({success:false,message:'Admin not found'});
+    if (target.role === 'Owner') return res.status(403).json({success:false,message:'The Owner account cannot be modified.'});
     const {rows} = await db(
       `UPDATE admins SET role=COALESCE($1,role), status=COALESCE($2,status) WHERE id=$3
        RETURNING id,user_id,role,status`, [role,status,req.params.id]);
@@ -2347,6 +2354,9 @@ app.put('/api/admin/admins/:id', adminAuth, requireRole('Super Admin'), async (r
 app.delete('/api/admin/admins/:id', adminAuth, requireRole('Super Admin'), async (req,res) => {
   try {
     if (req.params.id === req.admin.id) return res.status(400).json({success:false,message:'You cannot remove your own account'});
+    const {rows:[target]} = await db('SELECT role FROM admins WHERE id=$1',[req.params.id]);
+    if (!target) return res.status(404).json({success:false,message:'Admin not found'});
+    if (target.role === 'Owner') return res.status(403).json({success:false,message:'The Owner account cannot be removed.'});
     const {rows} = await db('DELETE FROM admins WHERE id=$1 RETURNING user_id',[req.params.id]);
     if (!rows[0]) return res.status(404).json({success:false,message:'Admin not found'});
     await logAdmin(req.admin.id, `Removed admin access from user ${rows[0].user_id}`);
@@ -2565,7 +2575,7 @@ app.get('/api/admin/loss-entries', adminAuth, requirePermission('reports'), asyn
     res.json({success:true,data:{entries:ccAll(rows)}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
-app.post('/api/admin/loss-entries', adminAuth, requireRole('Super Admin','Finance'), async (req,res) => {
+app.post('/api/admin/loss-entries', adminAuth, requireRole('Super Admin'), async (req,res) => {
   try {
     const { amount, category, reason } = req.body;
     if (!amount||!reason) return res.status(400).json({success:false,message:'Amount and reason are required'});
@@ -3442,7 +3452,21 @@ initDB().then(async ()=>{
         )
       `);
       if (fixedCount > 0) console.log(`✅ Backfilled membership_level for ${fixedCount} user(s) with stale "starter" tier`);
-    } catch(e) { console.error('Membership level backfill error:', e.message); }    
+    } catch(e) { console.error('Membership level backfill error:', e.message); }
+
+    // ── One-time migration: rafishasan273@gmail.com is the platform owner and
+    // should hold the sole 'Owner' role (above Super Admin, cannot be removed
+    // or modified by anyone through the admin UI). Also guards against ever
+    // ending up with more than one Owner if this runs again.
+    try {
+      const {rowCount:ownerCount} = await pool.query(
+        `UPDATE admins SET role='Owner'
+         WHERE user_id=(SELECT id FROM users WHERE email='rafishasan273@gmail.com') AND role<>'Owner'`);
+      if (ownerCount > 0) console.log('✅ Promoted rafishasan273@gmail.com to Owner');
+      await pool.query(
+        `UPDATE admins SET role='Super Admin'
+         WHERE role='Owner' AND user_id<>(SELECT id FROM users WHERE email='rafishasan273@gmail.com')`);
+    } catch(e) { console.error('Owner migration error:', e.message); }
   }
 
   app.listen(PORT,()=>{
