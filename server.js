@@ -362,18 +362,20 @@ const notif  = (uid,type,title,body='') =>
 // ── Brevo HTTP API Email Service ─────────────────────────────────────────
 // NOTE: Render free plan blocks outbound SMTP — HTTP API only
 const sendEmail = async (toEmail, toName, subject, htmlBody) => {
+  const body = {
+    sender     : { name: LIVE_EMAIL_SENDER.fromName || 'QAVIX GLOBAL', email: LIVE_EMAIL_SENDER.fromEmail || process.env.BREVO_SENDER_EMAIL },
+    to         : [{ email: toEmail, name: toName || toEmail }],
+    subject    : subject,
+    htmlContent: htmlBody,
+  };
+  if (LIVE_GENERAL.supportEmail) body.replyTo = { email: LIVE_GENERAL.supportEmail };
   const response = await fetch('https://api.brevo.com/v3/smtp/email', {
     method  : 'POST',
     headers : {
       'Content-Type' : 'application/json',
       'api-key'      : process.env.BREVO_API_KEY,
     },
-    body: JSON.stringify({
-      sender     : { name: LIVE_EMAIL_SENDER.fromName || 'QAVIX GLOBAL', email: LIVE_EMAIL_SENDER.fromEmail || process.env.BREVO_SENDER_EMAIL },
-      to         : [{ email: toEmail, name: toName || toEmail }],
-      subject    : subject,
-      htmlContent: htmlBody,
-    }),
+    body: JSON.stringify(body),
   });
   if (!response.ok) {
     const errText = await response.text();
@@ -797,6 +799,16 @@ app.get('/api/content/payment-info', async (_,res) => {
     withdrawalMin: LIVE_PAYMENT.withdrawalMin,
     withdrawalMax: LIVE_PAYMENT.withdrawalMax,
     withdrawalFeePercent: LIVE_PAYMENT.withdrawalFeePercent,
+  }});
+});
+
+// Only siteName and supportEmail are exposed here — timezone/language are stored
+// for future use but nothing in the app consumes them yet (no i18n or per-region
+// date conversion exists), so they're intentionally left out of this public payload.
+app.get('/api/content/general-info', async (_,res) => {
+  res.json({success:true,data:{
+    siteName: LIVE_GENERAL.siteName,
+    supportEmail: LIVE_GENERAL.supportEmail,
   }});
 });
 
@@ -2954,6 +2966,31 @@ app.delete('/api/admin/settings/api-keys/:id', adminAuth, requireRole('Super Adm
     await logAdmin(req.admin.id, 'Revoked API key', {id:req.params.id});
     res.json({success:true,message:'API key revoked'});
   } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── External API key auth ───────────────────────────────────────────────────
+// Generated keys previously had nowhere to actually be checked — this middleware
+// makes them real. Any request under /api/external/* must send a valid,
+// non-revoked key via the X-API-Key header (format: qvx_<random>).
+const apiKeyAuth = async (req,res,next) => {
+  try {
+    const key = req.headers['x-api-key'];
+    if (!key || !key.startsWith('qvx_')) return res.status(401).json({success:false,message:'Missing or invalid X-API-Key header'});
+    const prefix = key.slice(0,12);
+    const {rows} = await db('SELECT * FROM api_keys WHERE key_prefix=$1 AND revoked=false',[prefix]);
+    let matched = null;
+    for (const row of rows) { if (await bcrypt.compare(key, row.key_hash)) { matched = row; break; } }
+    if (!matched) return res.status(401).json({success:false,message:'Invalid or revoked API key'});
+    db('UPDATE api_keys SET last_used_at=NOW() WHERE id=$1',[matched.id]).catch(()=>{});
+    req.apiKeyName = matched.name;
+    next();
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+};
+
+// Example real, read-only endpoint for partners/affiliates holding a generated
+// key — returns the same live plan data used on the platform itself.
+app.get('/api/external/plans', apiKeyAuth, (_,res) => {
+  res.json({success:true,data:{plans:LIVE_PLANS}});
 });
 
 // ── Admin activity logs ───────────────────────────────────────────────────
