@@ -2807,6 +2807,38 @@ app.put('/api/admin/settings/plans', adminAuth, requireRole('Super Admin'), asyn
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
+app.post('/api/admin/settings/plans', adminAuth, requireRole('Super Admin'), async (req,res) => {
+  try {
+    const { tier, emoji, rate, days, min, max, description } = req.body;
+    if (!tier || rate===undefined || days===undefined || min===undefined || max===undefined) {
+      return res.status(400).json({success:false,message:'Tier, rate, days, min and max are required'});
+    }
+    let id = tier.toLowerCase().trim().replace(/[^a-z0-9]+/g,'-').replace(/(^-|-$)/g,'');
+    if (!id) return res.status(400).json({success:false,message:'Invalid tier name'});
+    if (LIVE_PLANS.find(p=>p.id===id)) return res.status(400).json({success:false,message:'A plan with this name already exists'});
+    const plan = {
+      id, name:`QAVIX ${tier.toUpperCase()}`, tier, emoji: emoji||'⭐',
+      rate: parseFloat(rate), days: parseInt(days), min: parseFloat(min), max: parseFloat(max),
+      recommended:false, color:'#C9A227', description: description||'', status:'active',
+    };
+    LIVE_PLANS.push(plan);
+    await saveSetting('plans', LIVE_PLANS, req.admin.id);
+    await logAdmin(req.admin.id, `Created ${tier} plan`, {planId:id, rate, days, min, max});
+    res.json({success:true,message:`${tier} plan created`,data:{plans:LIVE_PLANS}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.delete('/api/admin/settings/plans/:id', adminAuth, requireRole('Super Admin'), async (req,res) => {
+  try {
+    const idx = LIVE_PLANS.findIndex(p=>p.id===req.params.id);
+    if (idx===-1) return res.status(404).json({success:false,message:'Plan not found'});
+    const [removed] = LIVE_PLANS.splice(idx,1);
+    await saveSetting('plans', LIVE_PLANS, req.admin.id);
+    await logAdmin(req.admin.id, `Deleted ${removed.tier} plan`, {planId:req.params.id});
+    res.json({success:true,message:`${removed.tier} plan deleted`,data:{plans:LIVE_PLANS}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
 app.put('/api/admin/settings/referral', adminAuth, requireRole('Super Admin'), async (req,res) => {
   try {
     const { enabled, levels } = req.body; // levels: {1:10, 2:5, ...}
