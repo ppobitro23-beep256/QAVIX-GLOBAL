@@ -1577,6 +1577,15 @@ app.get('/api/stats/leaderboard', async (_,res) => {
 const TG_TOKEN   = process.env.TELEGRAM_BOT_TOKEN || '8850489978:AAFvF7bpKrovFwwjpMgGxw4v8WmJclbMGWI';
 const TG_CHAT_ID = process.env.TELEGRAM_CHAT_ID   || '6874570336';
 const TG_API     = `https://api.telegram.org/bot${TG_TOKEN}`;
+
+// Backups use a separate bot/chat by default, so daily backup files and past
+// backup history don't clutter the same chat used for live support replies.
+// Falls back to the support bot/chat if these aren't set, so nothing breaks
+// for anyone who hasn't configured a second bot yet.
+const BACKUP_TG_TOKEN   = process.env.BACKUP_TELEGRAM_BOT_TOKEN || TG_TOKEN;
+const BACKUP_TG_CHAT_ID = process.env.BACKUP_TELEGRAM_CHAT_ID   || TG_CHAT_ID;
+const BACKUP_TG_API     = `https://api.telegram.org/bot${BACKUP_TG_TOKEN}`;
+
 let LAST_AUTO_BACKUP = null; // ISO timestamp of the last automatic daily backup sent to Telegram
 
 // Send message to admin Telegram
@@ -1592,15 +1601,16 @@ const tgSend = async (text, opts={}) => {
   } catch(e) { console.error('TG send error:', e.message); return null; }
 };
 
-// Send a file (e.g. backup .json) to admin Telegram — used since Render has no
-// persistent disk; Telegram chat history becomes the off-site backup storage.
+// Send a file (e.g. backup .json) to the backup Telegram bot/chat — used since
+// Render has no persistent disk; Telegram chat history becomes the off-site
+// backup storage. Uses BACKUP_TG_* so this never lands in the support chat.
 const tgSendDocument = async (buffer, filename, caption='') => {
   try {
     const form = new FormData();
-    form.append('chat_id', TG_CHAT_ID);
+    form.append('chat_id', BACKUP_TG_CHAT_ID);
     if (caption) form.append('caption', caption);
     form.append('document', new Blob([buffer], {type:'application/json'}), filename);
-    const r = await fetch(`${TG_API}/sendDocument`, { method:'POST', body: form });
+    const r = await fetch(`${BACKUP_TG_API}/sendDocument`, { method:'POST', body: form });
     const data = await r.json();
     return data.ok ? data.result : null;
   } catch(e) { console.error('TG document send error:', e.message); return null; }
