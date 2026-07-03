@@ -2565,8 +2565,10 @@ const sendCsv = (res, filename, csv) => {
 // ── Loss tracking (manual bad-debt entries feed the Loss Report) ───────────
 app.get('/api/admin/loss-entries', adminAuth, requirePermission('reports'), async (req,res) => {
   try {
-    const {rows} = await db(`SELECT l.*, a.name as created_by_name FROM loss_entries l
-      LEFT JOIN admins a ON a.id=l.created_by ORDER BY l.created_at DESC LIMIT 100`);
+    const {rows} = await db(`SELECT l.*, u.name as created_by_name FROM loss_entries l
+      LEFT JOIN admins a ON a.id=l.created_by
+      LEFT JOIN users u ON u.id=a.user_id
+      ORDER BY l.created_at DESC LIMIT 100`);
     res.json({success:true,data:{entries:ccAll(rows)}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
@@ -2937,8 +2939,10 @@ app.get('/api/admin/logs', adminAuth, requirePermission('logs'), async (req,res)
     const {rows:countRows} = await db(`SELECT COUNT(*) FROM admin_logs al ${whereSql}`, params);
     params.push(limit, (page-1)*limit);
     const {rows} = await db(
-      `SELECT al.*, a.name as admin_name, a.email as admin_email FROM admin_logs al
-       LEFT JOIN admins a ON a.id=al.admin_id ${whereSql} ORDER BY al.created_at DESC LIMIT $${params.length-1} OFFSET $${params.length}`, params);
+      `SELECT al.*, u.name as admin_name, u.email as admin_email FROM admin_logs al
+       LEFT JOIN admins a ON a.id=al.admin_id
+       LEFT JOIN users u ON u.id=a.user_id
+       ${whereSql} ORDER BY al.created_at DESC LIMIT $${params.length-1} OFFSET $${params.length}`, params);
     if (isExport) {
       const csv = toCsv(ccAll(rows), [
         {key:'adminName',label:'Admin'},{key:'adminEmail',label:'Email'},
@@ -2975,8 +2979,10 @@ app.delete('/api/admin/security/failed-logins', adminAuth, requireRole('Super Ad
 app.get('/api/admin/security/ip-whitelist', adminAuth, requirePermission('security'), async (req,res) => {
   try {
     const {rows} = await db(
-      `SELECT w.*, a.name as added_by_name FROM admin_ip_whitelist w
-       LEFT JOIN admins a ON a.id=w.added_by ORDER BY w.created_at DESC`);
+      `SELECT w.*, u.name as added_by_name FROM admin_ip_whitelist w
+       LEFT JOIN admins a ON a.id=w.added_by
+       LEFT JOIN users u ON u.id=a.user_id
+       ORDER BY w.created_at DESC`);
     res.json({success:true,data:{
       enabled: LIVE_SECURITY.ipWhitelistEnabled,
       entries: ccAll(rows),
@@ -3248,8 +3254,10 @@ app.delete('/api/admin/content/banners/:id', adminAuth, requireRole('Super Admin
 // News
 app.get('/api/admin/content/news', adminAuth, requirePermission('content'), async (_,res) => {
   try {
-    const {rows} = await db(`SELECT n.*, a.name as created_by_name FROM content_news n
-      LEFT JOIN admins a ON a.id=n.created_by ORDER BY n.created_at DESC`);
+    const {rows} = await db(`SELECT n.*, u.name as created_by_name FROM content_news n
+      LEFT JOIN admins a ON a.id=n.created_by
+      LEFT JOIN users u ON u.id=a.user_id
+      ORDER BY n.created_at DESC`);
     res.json({success:true,data:{news:ccAll(rows)}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
