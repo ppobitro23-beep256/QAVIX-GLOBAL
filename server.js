@@ -161,10 +161,8 @@ const initDB = async () => {
       claimed_at              TIMESTAMPTZ,
       created_at              TIMESTAMPTZ DEFAULT NOW()
     );
-    CREATE INDEX IF NOT EXISTS idx_lh_user ON lottery_history(user_id);
-    CREATE INDEX IF NOT EXISTS idx_lh_time ON lottery_history(created_at);
-    CREATE INDEX IF NOT EXISTS idx_lh_status ON lottery_history(user_id,status);
-    -- Safe migrations in case these tables already exist from an earlier deploy
+    -- Safe migrations in case these tables already exist from an earlier deploy —
+    -- must run BEFORE any CREATE INDEX that references these columns.
     ALTER TABLE lottery_prizes ADD COLUMN IF NOT EXISTS task_title VARCHAR(150);
     ALTER TABLE lottery_prizes ADD COLUMN IF NOT EXISTS task_description TEXT DEFAULT '';
     ALTER TABLE lottery_prizes ADD COLUMN IF NOT EXISTS task_requirement_type VARCHAR(30);
@@ -177,6 +175,9 @@ const initDB = async () => {
     ALTER TABLE lottery_history ADD COLUMN IF NOT EXISTS task_requirement_meta VARCHAR(30);
     ALTER TABLE lottery_history ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'no_task';
     ALTER TABLE lottery_history ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ;
+    CREATE INDEX IF NOT EXISTS idx_lothist_user ON lottery_history(user_id);
+    CREATE INDEX IF NOT EXISTS idx_lothist_time ON lottery_history(created_at);
+    CREATE INDEX IF NOT EXISTS idx_lothist_status ON lottery_history(user_id,status);
     -- Old bonus-spin task system — retired in favor of per-prize claim-tasks above.
     DROP TABLE IF EXISTS lottery_task_claims;
     DROP TABLE IF EXISTS lottery_tasks;
