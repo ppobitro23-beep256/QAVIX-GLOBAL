@@ -120,6 +120,56 @@ const initDB = async () => {
       UNIQUE(user_id, task_id)
     );
 
+    -- ── Lottery System (daily free spin + task-earned bonus spins) ───────
+    CREATE TABLE IF NOT EXISTS lottery_prizes (
+      id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      label        VARCHAR(60) NOT NULL,
+      amount       NUMERIC(10,2) NOT NULL DEFAULT 0,  -- USDT credited if won (0 = "Try Again")
+      probability  NUMERIC(6,2) NOT NULL DEFAULT 0,   -- admin-set weight; normalized across active prizes at draw time
+      color        VARCHAR(20) DEFAULT '#C9A227',     -- wheel segment color
+      icon         VARCHAR(10) DEFAULT '🎁',
+      is_active    BOOLEAN DEFAULT TRUE,
+      sort_order   INT DEFAULT 0,
+      created_at   TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS lottery_spin_state (
+      user_id          UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      free_spins       INT NOT NULL DEFAULT 0,   -- bonus spins earned via lottery tasks, stack & don't expire
+      last_free_claim  DATE,                      -- date the daily free spin was last used
+      updated_at       TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS lottery_history (
+      id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      prize_id    UUID REFERENCES lottery_prizes(id) ON DELETE SET NULL,
+      prize_label VARCHAR(60),
+      amount      NUMERIC(10,2) NOT NULL DEFAULT 0,
+      spin_type   VARCHAR(20) DEFAULT 'free', -- free | bonus
+      created_at  TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_lh_user ON lottery_history(user_id);
+    CREATE INDEX IF NOT EXISTS idx_lh_time ON lottery_history(created_at);
+    CREATE TABLE IF NOT EXISTS lottery_tasks (
+      id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      title              VARCHAR(150) NOT NULL,
+      description        TEXT DEFAULT '',
+      requirement_type   VARCHAR(30) NOT NULL, -- deposit_amount | team_deposit_amount | invite_count | active_members
+      requirement_value  NUMERIC(10,2) NOT NULL,
+      spins_reward       INT NOT NULL DEFAULT 1,
+      is_active          BOOLEAN DEFAULT TRUE,
+      sort_order         INT DEFAULT 0,
+      created_by         UUID REFERENCES admins(id) ON DELETE SET NULL,
+      created_at         TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS lottery_task_claims (
+      id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id          UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      lottery_task_id  UUID NOT NULL REFERENCES lottery_tasks(id) ON DELETE CASCADE,
+      spins_granted    INT NOT NULL,
+      created_at       TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(user_id, lottery_task_id)
+    );
+
     CREATE TABLE IF NOT EXISTS refresh_tokens (
       id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       token TEXT NOT NULL UNIQUE,
@@ -356,6 +406,36 @@ const initDB = async () => {
   } else {
     console.log(`⚠️  No QAVIX GLOBAL account found for ${seedEmail} yet — register that email on the platform first, then restart the server to link Super Admin access.`);
   }
+
+  // Seed a default set of lottery prizes on first run so the wheel isn't empty.
+  const { rows: prizeCount } = await pool.query('SELECT COUNT(*)::int AS c FROM lottery_prizes');
+  if (prizeCount[0].c === 0) {
+    const defaultPrizes = [
+      { label:'Try Again',   amount:0,    probability:35, color:'#3A342A', icon:'🔁' },
+      { label:'$0.10',       amount:0.10, probability:25, color:'#9B7A10', icon:'🪙' },
+      { label:'$0.25',       amount:0.25, probability:18, color:'#C9A227', icon:'💰' },
+      { label:'$0.50',       amount:0.50, probability:12, color:'#E8C84A', icon:'💵' },
+      { label:'$1.00',       amount:1.00, probability:7,  color:'#FFD66E', icon:'🎁' },
+      { label:'$5.00 JACKPOT', amount:5.00, probability:3, color:'#F5E6A8', icon:'👑' },
+    ];
+    for (let i=0;i<defaultPrizes.length;i++) {
+      const p = defaultPrizes[i];
+      await pool.query(
+        `INSERT INTO lottery_prizes(label,amount,probability,color,icon,sort_order) VALUES($1,$2,$3,$4,$5,$6)`,
+        [p.label,p.amount,p.probability,p.color,p.icon,i]);
+    }
+    console.log('✅ Seeded default lottery prizes');
+  }
+  // Seed a couple of default lottery tasks on first run.
+  const { rows: ltaskCount } = await pool.query('SELECT COUNT(*)::int AS c FROM lottery_tasks');
+  if (ltaskCount[0].c === 0) {
+    await pool.query(
+      `INSERT INTO lottery_tasks(title,description,requirement_type,requirement_value,spins_reward,sort_order) VALUES
+       ('Deposit $5','Deposit at least $5 USDT to unlock a bonus spin','deposit_amount',5,1,0),
+       ('Team Deposit $2000','Get your team to deposit a combined $2000 USDT','team_deposit_amount',2000,3,1)`);
+    console.log('✅ Seeded default lottery tasks');
+  }
+
   console.log('✅ Neon DB tables ready');
   await loadSettingsCache();
 };
@@ -614,9 +694,9 @@ const requireRole = (...roles) => (req, res, next) => {
 // Owner and Super Admin always get everything and cannot be restricted.
 // These are used when an admin has no custom permissions saved yet.
 const DEFAULT_ROLE_PERMISSIONS = {
-  'Owner':       { dashboard:true, users:true, deposits:true, withdrawals:true, plans:true, investments:true, referral:true, reports:true, settings:true, security:true, support:true, announcements:true, content:true, admins:true, logs:true, backup:true, tasks:true },
-  'Super Admin': { dashboard:true, users:true, deposits:true, withdrawals:true, plans:true, investments:true, referral:true, reports:true, settings:true, security:true, support:true, announcements:true, content:true, admins:true, logs:true, backup:true, tasks:true },
-  'Moderator':   { dashboard:true, users:true, deposits:true, withdrawals:false, plans:false, investments:true, referral:true, reports:true, settings:false, security:false, support:true, announcements:true, content:true, admins:false, logs:false, backup:false, tasks:true },
+  'Owner':       { dashboard:true, users:true, deposits:true, withdrawals:true, plans:true, investments:true, referral:true, reports:true, settings:true, security:true, support:true, announcements:true, content:true, admins:true, logs:true, backup:true, tasks:true, lottery:true },
+  'Super Admin': { dashboard:true, users:true, deposits:true, withdrawals:true, plans:true, investments:true, referral:true, reports:true, settings:true, security:true, support:true, announcements:true, content:true, admins:true, logs:true, backup:true, tasks:true, lottery:true },
+  'Moderator':   { dashboard:true, users:true, deposits:true, withdrawals:false, plans:false, investments:true, referral:true, reports:true, settings:false, security:false, support:true, announcements:true, content:true, admins:false, logs:false, backup:false, tasks:true, lottery:false },
 };
 
 // Check if an admin has permission for a given module key.
@@ -1649,6 +1729,160 @@ app.post('/api/tasks/:id/claim', auth, async (req,res) => {
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
+// ── Lottery: helpers ─────────────────────────────────────────────────────
+const LOTTERY_TASK_TYPES = ['deposit_amount','team_deposit_amount','invite_count','active_members'];
+
+// Live progress for a lottery task's requirement, for a given user.
+async function lotteryTaskProgress(userId, reqType) {
+  if (reqType === 'deposit_amount') {
+    const {rows:[r]} = await db(
+      `SELECT COALESCE(SUM(amount),0)::float AS v FROM transactions WHERE user_id=$1 AND type='deposit'`,[userId]);
+    return r.v;
+  }
+  if (reqType === 'team_deposit_amount') {
+    const {rows:team} = await db(
+      `WITH RECURSIVE t AS (
+        SELECT id FROM users WHERE referred_by=$1
+        UNION ALL
+        SELECT u.id FROM users u INNER JOIN t ON u.referred_by=t.id
+      ) SELECT id FROM t LIMIT 500`,[userId]);
+    if (!team.length) return 0;
+    const {rows:[r]} = await db(
+      `SELECT COALESCE(SUM(amount),0)::float AS v FROM transactions WHERE user_id=ANY($1::uuid[]) AND type='deposit'`,
+      [team.map(t=>t.id)]);
+    return r.v;
+  }
+  if (reqType === 'invite_count') {
+    const {rows:[r]} = await db(`SELECT COUNT(*)::int AS c FROM users WHERE referred_by=$1`,[userId]);
+    return r.c;
+  }
+  if (reqType === 'active_members') {
+    const {rows:[r]} = await db(
+      `SELECT COUNT(DISTINCT u.id)::int AS c FROM users u
+       JOIN investments i ON i.user_id=u.id AND i.status='active'
+       WHERE u.referred_by=$1`,[userId]);
+    return r.c;
+  }
+  return 0;
+}
+
+// Weighted-random prize draw. Normalizes probabilities across active prizes
+// so admin-entered weights don't need to sum to exactly 100.
+function drawLotteryPrize(prizes) {
+  const totalWeight = prizes.reduce((s,p)=>s+parseFloat(p.probability||0),0);
+  if (totalWeight <= 0) return prizes[Math.floor(Math.random()*prizes.length)];
+  let r = Math.random() * totalWeight;
+  for (const p of prizes) {
+    r -= parseFloat(p.probability||0);
+    if (r <= 0) return p;
+  }
+  return prizes[prizes.length-1];
+}
+
+// ── Lottery: user status (spins available + wheel prizes for rendering) ──
+app.get('/api/lottery/status', auth, async (req,res) => {
+  try {
+    const today = new Date().toISOString().slice(0,10);
+    let {rows:[state]} = await db('SELECT * FROM lottery_spin_state WHERE user_id=$1',[req.user.id]);
+    if (!state) {
+      const ins = await db('INSERT INTO lottery_spin_state(user_id) VALUES($1) RETURNING *',[req.user.id]);
+      state = ins.rows[0];
+    }
+    const freeSpinAvailable = String(state.last_free_claim||'') !== today;
+    const {rows:prizes} = await db(
+      `SELECT id,label,amount,color,icon FROM lottery_prizes WHERE is_active=true ORDER BY sort_order ASC`);
+    res.json({success:true,data:{
+      freeSpinAvailable,
+      bonusSpins: state.free_spins,
+      totalSpins: (freeSpinAvailable?1:0) + state.free_spins,
+      prizes: ccAll(prizes),
+    }});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── Lottery: spin the wheel ───────────────────────────────────────────────
+app.post('/api/lottery/spin', auth, async (req,res) => {
+  try {
+    const today = new Date().toISOString().slice(0,10);
+    let {rows:[state]} = await db('SELECT * FROM lottery_spin_state WHERE user_id=$1',[req.user.id]);
+    if (!state) {
+      const ins = await db('INSERT INTO lottery_spin_state(user_id) VALUES($1) RETURNING *',[req.user.id]);
+      state = ins.rows[0];
+    }
+    const freeSpinAvailable = String(state.last_free_claim||'') !== today;
+    if (!freeSpinAvailable && state.free_spins <= 0) {
+      return res.status(400).json({success:false,message:'No spins left. Come back tomorrow for your free spin, or complete a lottery task for more!'});
+    }
+
+    const {rows:prizes} = await db(`SELECT * FROM lottery_prizes WHERE is_active=true`);
+    if (!prizes.length) return res.status(400).json({success:false,message:'The lottery is temporarily unavailable — no prizes configured.'});
+    const won = drawLotteryPrize(prizes);
+    const amount = parseFloat(won.amount)||0;
+    const spinType = freeSpinAvailable ? 'free' : 'bonus';
+
+    if (freeSpinAvailable) {
+      await db('UPDATE lottery_spin_state SET last_free_claim=$1, updated_at=NOW() WHERE user_id=$2',[today,req.user.id]);
+    } else {
+      await db('UPDATE lottery_spin_state SET free_spins=free_spins-1, updated_at=NOW() WHERE user_id=$1',[req.user.id]);
+    }
+    await db(`INSERT INTO lottery_history(user_id,prize_id,prize_label,amount,spin_type) VALUES($1,$2,$3,$4,$5)`,
+      [req.user.id, won.id, won.label, amount, spinType]);
+
+    if (amount > 0) {
+      await db('UPDATE users SET balance=balance+$1 WHERE id=$2',[amount,req.user.id]);
+      await db(`INSERT INTO transactions(user_id,type,amount,description) VALUES($1,'bonus',$2,$3)`,
+        [req.user.id, amount, `Lottery win: ${won.label}`]);
+      await notif(req.user.id,'bonus','🎉 Lottery Win!',`You won ${won.label} — +$${amount.toFixed(2)} credited to your balance`);
+    }
+
+    const {rows:[freshState]} = await db('SELECT * FROM lottery_spin_state WHERE user_id=$1',[req.user.id]);
+    const stillFree = String(freshState.last_free_claim||'') !== today;
+    res.json({success:true,message: amount>0 ? `🎉 You won ${won.label}!` : `${won.label} — better luck next spin!`,
+      data:{
+        prize: {id:won.id, label:won.label, amount, color:won.color, icon:won.icon},
+        spinsRemaining: (stillFree?1:0) + freshState.free_spins,
+      }});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── Lottery: tasks list (with live progress) ──────────────────────────────
+app.get('/api/lottery/tasks', auth, async (req,res) => {
+  try {
+    const {rows:tasks} = await db(`SELECT * FROM lottery_tasks WHERE is_active=true ORDER BY sort_order ASC, created_at ASC`);
+    const {rows:claims} = await db(`SELECT lottery_task_id FROM lottery_task_claims WHERE user_id=$1`,[req.user.id]);
+    const claimedSet = new Set(claims.map(c=>c.lottery_task_id));
+    const data = await Promise.all(tasks.map(async t=>{
+      const progress = await lotteryTaskProgress(req.user.id, t.requirement_type);
+      return { ...cc(t), claimed: claimedSet.has(t.id), progress, target: parseFloat(t.requirement_value) };
+    }));
+    res.json({success:true,data:{tasks:data}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── Lottery: claim a task's bonus spins ────────────────────────────────────
+app.post('/api/lottery/tasks/:id/claim', auth, async (req,res) => {
+  try {
+    const {rows:[task]} = await db('SELECT * FROM lottery_tasks WHERE id=$1 AND is_active=true',[req.params.id]);
+    if (!task) return res.status(404).json({success:false,message:'Lottery task not found or no longer available'});
+    const {rows:[existing]} = await db('SELECT id FROM lottery_task_claims WHERE user_id=$1 AND lottery_task_id=$2',[req.user.id,task.id]);
+    if (existing) return res.status(400).json({success:false,message:'You already claimed this lottery task'});
+
+    const progress = await lotteryTaskProgress(req.user.id, task.requirement_type);
+    if (progress < parseFloat(task.requirement_value)) {
+      return res.status(400).json({success:false,message:`Not yet — you're at ${progress} / ${task.requirement_value}`});
+    }
+
+    await db(`INSERT INTO lottery_task_claims(user_id,lottery_task_id,spins_granted) VALUES($1,$2,$3)`,
+      [req.user.id, task.id, task.spins_reward]);
+    await db(`INSERT INTO lottery_spin_state(user_id,free_spins) VALUES($1,$2)
+              ON CONFLICT (user_id) DO UPDATE SET free_spins=lottery_spin_state.free_spins+$2, updated_at=NOW()`,
+      [req.user.id, task.spins_reward]);
+    await notif(req.user.id,'bonus','🎰 Bonus Spins Earned!',`+${task.spins_reward} lottery spin(s) from "${task.title}"`);
+
+    res.json({success:true,message:`+${task.spins_reward} spin(s) added to your lottery!`,data:{spinsGranted:task.spins_reward}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
 // ── Admin: Task management ──────────────────────────────────────────────────
 app.get('/api/admin/tasks', adminAuth, requirePermission('tasks'), async (_,res) => {
   try {
@@ -1736,6 +1970,132 @@ app.post('/api/admin/task-claims/:id/reject', adminAuth, requireRole('Owner','Su
     await notif(claim.user_id,'task',`Task not approved: ${task?.title||'Task'}`,`We couldn't verify this — you can try again or contact support.`);
     await logAdmin(req.admin.id, `Rejected task claim for "${task?.title}"`, {claimId:claim.id});
     res.json({success:true,message:'Claim rejected'});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── Admin: Lottery — Prizes (wheel segments + odds) ─────────────────────────
+app.get('/api/admin/lottery/prizes', adminAuth, requirePermission('lottery'), async (_,res) => {
+  try {
+    const {rows} = await db(`SELECT * FROM lottery_prizes ORDER BY sort_order ASC, created_at ASC`);
+    const totalWeight = rows.filter(r=>r.is_active).reduce((s,r)=>s+parseFloat(r.probability||0),0);
+    res.json({success:true,data:{prizes:ccAll(rows), totalActiveWeight: +totalWeight.toFixed(2)}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.post('/api/admin/lottery/prizes', adminAuth, requireRole('Owner','Super Admin'), async (req,res) => {
+  try {
+    const {label, amount, probability, color, icon, sortOrder} = req.body;
+    if (!label || amount===undefined || probability===undefined) return res.status(400).json({success:false,message:'Label, amount and probability are required'});
+    const {rows} = await db(
+      `INSERT INTO lottery_prizes(label,amount,probability,color,icon,sort_order) VALUES($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [label, amount, probability, color||'#C9A227', icon||'🎁', sortOrder||0]);
+    await logAdmin(req.admin.id, `Created lottery prize "${label}"`, {amount,probability});
+    res.status(201).json({success:true,message:'Prize added to the wheel',data:{prize:cc(rows[0])}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.put('/api/admin/lottery/prizes/:id', adminAuth, requireRole('Owner','Super Admin'), async (req,res) => {
+  try {
+    const {label, amount, probability, color, icon, isActive, sortOrder} = req.body;
+    const {rows} = await db(
+      `UPDATE lottery_prizes SET
+        label=COALESCE($1,label), amount=COALESCE($2,amount), probability=COALESCE($3,probability),
+        color=COALESCE($4,color), icon=COALESCE($5,icon), is_active=COALESCE($6,is_active), sort_order=COALESCE($7,sort_order)
+       WHERE id=$8 RETURNING *`,
+      [label,amount,probability,color,icon,isActive,sortOrder,req.params.id]);
+    if (!rows[0]) return res.status(404).json({success:false,message:'Prize not found'});
+    await logAdmin(req.admin.id, `Updated lottery prize "${rows[0].label}"`);
+    res.json({success:true,message:'Prize updated',data:{prize:cc(rows[0])}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.delete('/api/admin/lottery/prizes/:id', adminAuth, requireRole('Owner','Super Admin'), async (req,res) => {
+  try {
+    const {rows} = await db('DELETE FROM lottery_prizes WHERE id=$1 RETURNING label',[req.params.id]);
+    if (!rows[0]) return res.status(404).json({success:false,message:'Prize not found'});
+    await logAdmin(req.admin.id, `Deleted lottery prize "${rows[0].label}"`);
+    res.json({success:true,message:'Prize removed from the wheel'});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── Admin: Lottery — Tasks (spin-granting tasks) ─────────────────────────────
+app.get('/api/admin/lottery/tasks', adminAuth, requirePermission('lottery'), async (_,res) => {
+  try {
+    const {rows} = await db(`SELECT * FROM lottery_tasks ORDER BY sort_order ASC, created_at DESC`);
+    res.json({success:true,data:{tasks:ccAll(rows)}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.post('/api/admin/lottery/tasks', adminAuth, requireRole('Owner','Super Admin'), async (req,res) => {
+  try {
+    const {title, description, requirementType, requirementValue, spinsReward, sortOrder} = req.body;
+    if (!title || !requirementType || requirementValue===undefined || !spinsReward)
+      return res.status(400).json({success:false,message:'Title, requirement type/value and spins reward are required'});
+    if (!LOTTERY_TASK_TYPES.includes(requirementType)) return res.status(400).json({success:false,message:'Invalid requirement type'});
+    const {rows} = await db(
+      `INSERT INTO lottery_tasks(title,description,requirement_type,requirement_value,spins_reward,sort_order,created_by)
+       VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+      [title, description||'', requirementType, requirementValue, spinsReward, sortOrder||0, req.admin.id]);
+    await logAdmin(req.admin.id, `Created lottery task "${title}"`, {requirementType,requirementValue,spinsReward});
+    res.status(201).json({success:true,message:'Lottery task created — live immediately',data:{task:cc(rows[0])}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.put('/api/admin/lottery/tasks/:id', adminAuth, requireRole('Owner','Super Admin'), async (req,res) => {
+  try {
+    const {title, description, requirementValue, spinsReward, isActive, sortOrder} = req.body;
+    const {rows} = await db(
+      `UPDATE lottery_tasks SET
+        title=COALESCE($1,title), description=COALESCE($2,description),
+        requirement_value=COALESCE($3,requirement_value), spins_reward=COALESCE($4,spins_reward),
+        is_active=COALESCE($5,is_active), sort_order=COALESCE($6,sort_order)
+       WHERE id=$7 RETURNING *`,
+      [title,description,requirementValue,spinsReward,isActive,sortOrder,req.params.id]);
+    if (!rows[0]) return res.status(404).json({success:false,message:'Lottery task not found'});
+    await logAdmin(req.admin.id, `Updated lottery task "${rows[0].title}"`);
+    res.json({success:true,message:'Lottery task updated',data:{task:cc(rows[0])}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.delete('/api/admin/lottery/tasks/:id', adminAuth, requireRole('Owner','Super Admin'), async (req,res) => {
+  try {
+    const {rows} = await db('DELETE FROM lottery_tasks WHERE id=$1 RETURNING title',[req.params.id]);
+    if (!rows[0]) return res.status(404).json({success:false,message:'Lottery task not found'});
+    await logAdmin(req.admin.id, `Deleted lottery task "${rows[0].title}"`);
+    res.json({success:true,message:'Lottery task deleted'});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── Admin: Lottery — History & stats ─────────────────────────────────────────
+app.get('/api/admin/lottery/history', adminAuth, requirePermission('lottery'), async (req,res) => {
+  try {
+    const page  = Math.max(1, parseInt(req.query.page)||1);
+    const limit = 20;
+    const {rows} = await db(
+      `SELECT lh.*, u.name AS user_name, u.email AS user_email
+       FROM lottery_history lh JOIN users u ON u.id=lh.user_id
+       ORDER BY lh.created_at DESC LIMIT $1 OFFSET $2`,
+      [limit, (page-1)*limit]);
+    const {rows:[countRow]} = await db('SELECT COUNT(*)::int AS c FROM lottery_history');
+    res.json({success:true,data:{history:ccAll(rows), total:countRow.c, page, pages:Math.ceil(countRow.c/limit)}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.get('/api/admin/lottery/stats', adminAuth, requirePermission('lottery'), async (_,res) => {
+  try {
+    const [totalR, todayR, payoutR, topR] = await Promise.all([
+      db(`SELECT COUNT(*)::int AS c FROM lottery_history`),
+      db(`SELECT COUNT(*)::int AS c FROM lottery_history WHERE created_at::date = CURRENT_DATE`),
+      db(`SELECT COALESCE(SUM(amount),0)::float AS t FROM lottery_history`),
+      db(`SELECT u.name, SUM(lh.amount)::float AS won FROM lottery_history lh JOIN users u ON u.id=lh.user_id
+          GROUP BY u.id,u.name ORDER BY won DESC LIMIT 5`),
+    ]);
+    res.json({success:true,data:{
+      totalSpins: totalR.rows[0].c,
+      spinsToday: todayR.rows[0].c,
+      totalPaidOut: +payoutR.rows[0].t.toFixed(2),
+      topWinners: topR.rows,
+    }});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
