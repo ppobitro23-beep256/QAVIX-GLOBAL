@@ -92,6 +92,34 @@ const initDB = async () => {
       claimed_at TIMESTAMPTZ DEFAULT NOW(),
       UNIQUE(user_id, reward_id)
     );
+
+    -- ── Tasks (earn-by-completing-actions system) ─────────────────────────
+    CREATE TABLE IF NOT EXISTS tasks (
+      id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      title           VARCHAR(150) NOT NULL,
+      description     TEXT DEFAULT '',
+      type            VARCHAR(30) NOT NULL, -- telegram_channel | telegram_group | whatsapp_group | invite_count | active_members
+      reward_amount   NUMERIC(10,2) NOT NULL,
+      target_url      TEXT DEFAULT '',
+      required_count  INT,
+      requires_review BOOLEAN DEFAULT FALSE,
+      is_active       BOOLEAN DEFAULT TRUE,
+      sort_order      INT DEFAULT 0,
+      created_by      UUID REFERENCES admins(id) ON DELETE SET NULL,
+      created_at      TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS task_claims (
+      id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id       UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      task_id       UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+      status        VARCHAR(20) DEFAULT 'pending', -- pending | approved | rejected
+      reward_amount NUMERIC(10,2),
+      reviewed_by   UUID REFERENCES admins(id) ON DELETE SET NULL,
+      created_at    TIMESTAMPTZ DEFAULT NOW(),
+      reviewed_at   TIMESTAMPTZ,
+      UNIQUE(user_id, task_id)
+    );
+
     CREATE TABLE IF NOT EXISTS refresh_tokens (
       id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       token TEXT NOT NULL UNIQUE,
@@ -586,9 +614,9 @@ const requireRole = (...roles) => (req, res, next) => {
 // Owner and Super Admin always get everything and cannot be restricted.
 // These are used when an admin has no custom permissions saved yet.
 const DEFAULT_ROLE_PERMISSIONS = {
-  'Owner':       { dashboard:true, users:true, deposits:true, withdrawals:true, plans:true, investments:true, referral:true, reports:true, settings:true, security:true, support:true, announcements:true, content:true, admins:true, logs:true, backup:true },
-  'Super Admin': { dashboard:true, users:true, deposits:true, withdrawals:true, plans:true, investments:true, referral:true, reports:true, settings:true, security:true, support:true, announcements:true, content:true, admins:true, logs:true, backup:true },
-  'Moderator':   { dashboard:true, users:true, deposits:true, withdrawals:false, plans:false, investments:true, referral:true, reports:true, settings:false, security:false, support:true, announcements:true, content:true, admins:false, logs:false, backup:false },
+  'Owner':       { dashboard:true, users:true, deposits:true, withdrawals:true, plans:true, investments:true, referral:true, reports:true, settings:true, security:true, support:true, announcements:true, content:true, admins:true, logs:true, backup:true, tasks:true },
+  'Super Admin': { dashboard:true, users:true, deposits:true, withdrawals:true, plans:true, investments:true, referral:true, reports:true, settings:true, security:true, support:true, announcements:true, content:true, admins:true, logs:true, backup:true, tasks:true },
+  'Moderator':   { dashboard:true, users:true, deposits:true, withdrawals:false, plans:false, investments:true, referral:true, reports:true, settings:false, security:false, support:true, announcements:true, content:true, admins:false, logs:false, backup:false, tasks:true },
 };
 
 // Check if an admin has permission for a given module key.
@@ -1538,6 +1566,176 @@ app.post('/api/rewards/lucky', auth, async (req,res) => {
       await db(`INSERT INTO transactions(user_id,type,amount,description) VALUES($1,'bonus',$2,$3)`,[req.user.id,p.a,p.l]);
     }
     res.json({success:true,message:p.l,data:{prize:p}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── Tasks (earn-by-completing-actions) ──────────────────────────────────────
+// Two families of task, verified very differently:
+//  - 'invite_count' / 'active_members': fully automatic — checked live against
+//    this platform's own referral data, credited instantly, no review needed.
+//  - 'telegram_channel' / 'telegram_group' / 'whatsapp_group': there is no way
+//    to verify a specific user actually joined an external channel/group from
+//    here (that would require them linking a Telegram account and the bot
+//    checking membership, which doesn't exist in this app). These are
+//    self-reported by the user and go into a review queue for an admin to
+//    manually approve or reject before anything is credited.
+const AUTO_TASK_TYPES   = ['invite_count','active_members'];
+const REVIEW_TASK_TYPES = ['telegram_channel','telegram_group','whatsapp_group'];
+
+app.get('/api/tasks', auth, async (req,res) => {
+  try {
+    const {rows:tasks} = await db(`SELECT * FROM tasks WHERE is_active=true ORDER BY sort_order ASC, created_at ASC`);
+    const {rows:claims} = await db(`SELECT task_id,status FROM task_claims WHERE user_id=$1`,[req.user.id]);
+    const claimMap = {}; claims.forEach(c=>{claimMap[c.task_id]=c.status;});
+
+    // For auto-verifiable tasks, also compute live progress so the UI can show
+    // e.g. "6 / 10 invited" even before the user has claimed it.
+    const {rows:[inviteRow]} = await db(`SELECT COUNT(*)::int AS c FROM users WHERE referred_by=$1`,[req.user.id]);
+    const {rows:[activeRow]} = await db(
+      `SELECT COUNT(DISTINCT u.id)::int AS c FROM users u
+       JOIN investments i ON i.user_id=u.id AND i.status='active'
+       WHERE u.referred_by=$1`,[req.user.id]);
+    const progress = { invite_count: inviteRow.c, active_members: activeRow.c };
+
+    res.json({success:true,data:{tasks: tasks.map(t=>{
+      const tc = cc(t);
+      return { ...tc,
+        status: claimMap[t.id] || 'available',
+        currentCount: AUTO_TASK_TYPES.includes(t.type) ? progress[t.type] : null,
+      };
+    })}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.post('/api/tasks/:id/claim', auth, async (req,res) => {
+  try {
+    const {rows:[task]} = await db('SELECT * FROM tasks WHERE id=$1 AND is_active=true',[req.params.id]);
+    if (!task) return res.status(404).json({success:false,message:'Task not found or no longer available'});
+    const {rows:[existing]} = await db('SELECT status FROM task_claims WHERE user_id=$1 AND task_id=$2',[req.user.id,task.id]);
+    if (existing) {
+      const msg = existing.status==='pending' ? 'This task is already awaiting review' :
+                  existing.status==='approved' ? 'You already completed this task' :
+                  'This task claim was rejected — contact support if you think that\'s wrong';
+      return res.status(400).json({success:false,message:msg});
+    }
+
+    if (AUTO_TASK_TYPES.includes(task.type)) {
+      let count = 0;
+      if (task.type === 'invite_count') {
+        const {rows:[r]} = await db(`SELECT COUNT(*)::int AS c FROM users WHERE referred_by=$1`,[req.user.id]);
+        count = r.c;
+      } else if (task.type === 'active_members') {
+        const {rows:[r]} = await db(
+          `SELECT COUNT(DISTINCT u.id)::int AS c FROM users u
+           JOIN investments i ON i.user_id=u.id AND i.status='active'
+           WHERE u.referred_by=$1`,[req.user.id]);
+        count = r.c;
+      }
+      if (count < task.required_count) {
+        return res.status(400).json({success:false,message:`Not yet — you're at ${count} / ${task.required_count}`});
+      }
+      await db(`INSERT INTO task_claims(user_id,task_id,status,reward_amount,reviewed_at) VALUES($1,$2,'approved',$3,NOW())`,
+        [req.user.id, task.id, task.reward_amount]);
+      await db('UPDATE users SET balance=balance+$1 WHERE id=$2',[task.reward_amount,req.user.id]);
+      await db(`INSERT INTO transactions(user_id,type,amount,description) VALUES($1,'bonus',$2,$3)`,
+        [req.user.id, task.reward_amount, `Task reward: ${task.title}`]);
+      return res.json({success:true,message:`Task complete! +$${task.reward_amount}`,data:{status:'approved',amount:task.reward_amount}});
+    }
+
+    // Review-required task: self-reported, admin approves before anything is credited.
+    await db(`INSERT INTO task_claims(user_id,task_id,status,reward_amount) VALUES($1,$2,'pending',$3)`,
+      [req.user.id, task.id, task.reward_amount]);
+    res.json({success:true,message:'Submitted — an admin will review and credit your reward shortly.',data:{status:'pending'}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── Admin: Task management ──────────────────────────────────────────────────
+app.get('/api/admin/tasks', adminAuth, requirePermission('tasks'), async (_,res) => {
+  try {
+    const {rows} = await db(`SELECT * FROM tasks ORDER BY sort_order ASC, created_at DESC`);
+    res.json({success:true,data:{tasks:ccAll(rows)}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.post('/api/admin/tasks', adminAuth, requireRole('Owner','Super Admin'), async (req,res) => {
+  try {
+    const {title, description, type, rewardAmount, targetUrl, requiredCount, sortOrder} = req.body;
+    if (!title || !type || rewardAmount===undefined) return res.status(400).json({success:false,message:'Title, type and reward amount are required'});
+    if (![...AUTO_TASK_TYPES,...REVIEW_TASK_TYPES].includes(type)) return res.status(400).json({success:false,message:'Invalid task type'});
+    if (AUTO_TASK_TYPES.includes(type) && !requiredCount) return res.status(400).json({success:false,message:'This task type needs a required count (e.g. invite 10 members)'});
+    const {rows} = await db(
+      `INSERT INTO tasks(title,description,type,reward_amount,target_url,required_count,requires_review,created_by)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+      [title, description||'', type, rewardAmount, targetUrl||'', requiredCount||null, REVIEW_TASK_TYPES.includes(type), req.admin.id]);
+    await logAdmin(req.admin.id, `Created task "${title}"`, {type, rewardAmount});
+    res.status(201).json({success:true,message:'Task created — live immediately, no redeploy needed.',data:{task:cc(rows[0])}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.put('/api/admin/tasks/:id', adminAuth, requireRole('Owner','Super Admin'), async (req,res) => {
+  try {
+    const {title, description, rewardAmount, targetUrl, requiredCount, isActive, sortOrder} = req.body;
+    const {rows} = await db(
+      `UPDATE tasks SET
+        title=COALESCE($1,title), description=COALESCE($2,description),
+        reward_amount=COALESCE($3,reward_amount), target_url=COALESCE($4,target_url),
+        required_count=COALESCE($5,required_count), is_active=COALESCE($6,is_active),
+        sort_order=COALESCE($7,sort_order)
+       WHERE id=$8 RETURNING *`,
+      [title,description,rewardAmount,targetUrl,requiredCount,isActive,sortOrder,req.params.id]);
+    if (!rows[0]) return res.status(404).json({success:false,message:'Task not found'});
+    await logAdmin(req.admin.id, `Updated task "${rows[0].title}"`);
+    res.json({success:true,message:'Task updated',data:{task:cc(rows[0])}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.delete('/api/admin/tasks/:id', adminAuth, requireRole('Owner','Super Admin'), async (req,res) => {
+  try {
+    const {rows} = await db('DELETE FROM tasks WHERE id=$1 RETURNING title',[req.params.id]);
+    if (!rows[0]) return res.status(404).json({success:false,message:'Task not found'});
+    await logAdmin(req.admin.id, `Deleted task "${rows[0].title}"`);
+    res.json({success:true,message:'Task deleted'});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── Admin: Task claim review queue (for self-reported join tasks) ──────────
+app.get('/api/admin/task-claims', adminAuth, requirePermission('tasks'), async (req,res) => {
+  try {
+    const status = req.query.status || 'pending';
+    const {rows} = await db(
+      `SELECT tc.*, t.title AS task_title, t.type AS task_type, u.name AS user_name, u.email AS user_email
+       FROM task_claims tc
+       JOIN tasks t ON t.id=tc.task_id
+       JOIN users u ON u.id=tc.user_id
+       WHERE tc.status=$1 ORDER BY tc.created_at ASC`, [status]);
+    res.json({success:true,data:{claims:ccAll(rows)}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.post('/api/admin/task-claims/:id/approve', adminAuth, requireRole('Owner','Super Admin'), async (req,res) => {
+  try {
+    const {rows:[claim]} = await db(`SELECT * FROM task_claims WHERE id=$1 AND status='pending'`,[req.params.id]);
+    if (!claim) return res.status(404).json({success:false,message:'Pending claim not found'});
+    await db(`UPDATE task_claims SET status='approved', reviewed_by=$1, reviewed_at=NOW() WHERE id=$2`,[req.admin.id, claim.id]);
+    await db('UPDATE users SET balance=balance+$1 WHERE id=$2',[claim.reward_amount, claim.user_id]);
+    const {rows:[task]} = await db('SELECT title FROM tasks WHERE id=$1',[claim.task_id]);
+    await db(`INSERT INTO transactions(user_id,type,amount,description) VALUES($1,'bonus',$2,$3)`,
+      [claim.user_id, claim.reward_amount, `Task reward: ${task?.title||'Task'}`]);
+    await notif(claim.user_id,'task',`Task approved: ${task?.title||'Task'}`,`+$${claim.reward_amount} credited to your balance`);
+    await logAdmin(req.admin.id, `Approved task claim for "${task?.title}"`, {claimId:claim.id});
+    res.json({success:true,message:`Approved — $${claim.reward_amount} credited to the user.`});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.post('/api/admin/task-claims/:id/reject', adminAuth, requireRole('Owner','Super Admin'), async (req,res) => {
+  try {
+    const {rows:[claim]} = await db(`SELECT * FROM task_claims WHERE id=$1 AND status='pending'`,[req.params.id]);
+    if (!claim) return res.status(404).json({success:false,message:'Pending claim not found'});
+    await db(`UPDATE task_claims SET status='rejected', reviewed_by=$1, reviewed_at=NOW() WHERE id=$2`,[req.admin.id, claim.id]);
+    const {rows:[task]} = await db('SELECT title FROM tasks WHERE id=$1',[claim.task_id]);
+    await notif(claim.user_id,'task',`Task not approved: ${task?.title||'Task'}`,`We couldn't verify this — you can try again or contact support.`);
+    await logAdmin(req.admin.id, `Rejected task claim for "${task?.title}"`, {claimId:claim.id});
+    res.json({success:true,message:'Claim rejected'});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
