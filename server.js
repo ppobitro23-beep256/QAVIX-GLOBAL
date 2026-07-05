@@ -411,12 +411,12 @@ const initDB = async () => {
   const { rows: prizeCount } = await pool.query('SELECT COUNT(*)::int AS c FROM lottery_prizes');
   if (prizeCount[0].c === 0) {
     const defaultPrizes = [
-      { label:'Try Again',   amount:0,    probability:35, color:'#3A342A', icon:'🔁' },
-      { label:'$0.10',       amount:0.10, probability:25, color:'#9B7A10', icon:'🪙' },
-      { label:'$0.25',       amount:0.25, probability:18, color:'#C9A227', icon:'💰' },
-      { label:'$0.50',       amount:0.50, probability:12, color:'#E8C84A', icon:'💵' },
-      { label:'$1.00',       amount:1.00, probability:7,  color:'#FFD66E', icon:'🎁' },
-      { label:'$5.00 JACKPOT', amount:5.00, probability:3, color:'#F5E6A8', icon:'👑' },
+      { label:'Try Again',   amount:0,    probability:35, color:'#1A1712', icon:'🔁' },
+      { label:'$0.10',       amount:0.10, probability:25, color:'#C9A227', icon:'🪙' },
+      { label:'$0.25',       amount:0.25, probability:18, color:'#1A1712', icon:'💰' },
+      { label:'$0.50',       amount:0.50, probability:12, color:'#C9A227', icon:'💵' },
+      { label:'$1.00',       amount:1.00, probability:7,  color:'#1A1712', icon:'🎁' },
+      { label:'$5.00 JACKPOT', amount:5.00, probability:3, color:'#FFD66E', icon:'👑' },
     ];
     for (let i=0;i<defaultPrizes.length;i++) {
       const p = defaultPrizes[i];
