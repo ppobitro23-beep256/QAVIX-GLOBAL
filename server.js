@@ -1580,7 +1580,7 @@ app.post('/api/rewards/lucky', auth, async (req,res) => {
 //    self-reported by the user and go into a review queue for an admin to
 //    manually approve or reject before anything is credited.
 const AUTO_TASK_TYPES   = ['invite_count','active_members'];
-const REVIEW_TASK_TYPES = ['telegram_channel','telegram_group','whatsapp_group'];
+const REVIEW_TASK_TYPES = ['telegram_channel','telegram_group','whatsapp_group','external_link'];
 
 app.get('/api/tasks', auth, async (req,res) => {
   try {
