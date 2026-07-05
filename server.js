@@ -130,8 +130,9 @@ const initDB = async () => {
       icon                    VARCHAR(10) DEFAULT '🎁',
       task_title              VARCHAR(150),                       -- the task the user must complete to claim this prize (null/empty for amount=0 tiers)
       task_description        TEXT DEFAULT '',
-      task_requirement_type   VARCHAR(30),  -- deposit_amount | team_deposit_amount | invite_count | active_members
+      task_requirement_type   VARCHAR(30),  -- deposit_amount | team_deposit_amount | invite_count | active_members | invite_tier_count
       task_requirement_value  NUMERIC(10,2),
+      task_requirement_meta   VARCHAR(30),  -- e.g. plan tier id ('bronze'|'silver'|'gold'|'elite') when type=invite_tier_count
       is_active               BOOLEAN DEFAULT TRUE,
       sort_order              INT DEFAULT 0,
       created_at              TIMESTAMPTZ DEFAULT NOW()
@@ -155,6 +156,7 @@ const initDB = async () => {
       task_description        TEXT DEFAULT '',
       task_requirement_type   VARCHAR(30),
       task_requirement_value  NUMERIC(10,2),
+      task_requirement_meta   VARCHAR(30),
       status                  VARCHAR(20) DEFAULT 'no_task', -- no_task (amount=0 spins) | pending | claimed | forfeited
       claimed_at              TIMESTAMPTZ,
       created_at              TIMESTAMPTZ DEFAULT NOW()
@@ -167,10 +169,12 @@ const initDB = async () => {
     ALTER TABLE lottery_prizes ADD COLUMN IF NOT EXISTS task_description TEXT DEFAULT '';
     ALTER TABLE lottery_prizes ADD COLUMN IF NOT EXISTS task_requirement_type VARCHAR(30);
     ALTER TABLE lottery_prizes ADD COLUMN IF NOT EXISTS task_requirement_value NUMERIC(10,2);
+    ALTER TABLE lottery_prizes ADD COLUMN IF NOT EXISTS task_requirement_meta VARCHAR(30);
     ALTER TABLE lottery_history ADD COLUMN IF NOT EXISTS task_title VARCHAR(150);
     ALTER TABLE lottery_history ADD COLUMN IF NOT EXISTS task_description TEXT DEFAULT '';
     ALTER TABLE lottery_history ADD COLUMN IF NOT EXISTS task_requirement_type VARCHAR(30);
     ALTER TABLE lottery_history ADD COLUMN IF NOT EXISTS task_requirement_value NUMERIC(10,2);
+    ALTER TABLE lottery_history ADD COLUMN IF NOT EXISTS task_requirement_meta VARCHAR(30);
     ALTER TABLE lottery_history ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'no_task';
     ALTER TABLE lottery_history ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ;
     -- Old bonus-spin task system — retired in favor of per-prize claim-tasks above.
@@ -418,29 +422,35 @@ const initDB = async () => {
   const { rows: prizeCount } = await pool.query('SELECT COUNT(*)::int AS c FROM lottery_prizes');
   if (prizeCount[0].c === 0) {
     const defaultPrizes = [
-      { label:'Try Again', amount:0,    probability:30, color:'#1A1712', icon:'🔁' },
-      { label:'$0.10', amount:0.10, probability:25, color:'#C9A227', icon:'🪙',
+      { label:'Try Again', amount:0,    probability:25, color:'#1A1712', icon:'🔁' },
+      { label:'$0.10', amount:0.10, probability:22, color:'#C9A227', icon:'🪙',
         taskTitle:'Deposit $5', taskDescription:'Deposit at least $5 USDT to claim this prize',
         taskType:'deposit_amount', taskValue:5 },
-      { label:'$0.20', amount:0.20, probability:20, color:'#1A1712', icon:'💰',
-        taskTitle:'Invite 1 Friend', taskDescription:'Refer at least 1 new member to claim this prize',
-        taskType:'invite_count', taskValue:1 },
+      { label:'$0.20', amount:0.20, probability:17, color:'#1A1712', icon:'💰',
+        taskTitle:'Invite 1 Silver User', taskDescription:'Refer 1 member who reaches the Silver plan to claim this prize',
+        taskType:'invite_tier_count', taskValue:1, taskMeta:'silver' },
       { label:'$0.30', amount:0.30, probability:12, color:'#C9A227', icon:'💵',
         taskTitle:'Deposit $20', taskDescription:'Deposit at least $20 USDT to claim this prize',
         taskType:'deposit_amount', taskValue:20 },
       { label:'$0.40', amount:0.40, probability:8,  color:'#1A1712', icon:'🎁',
         taskTitle:'3 Active Team Members', taskDescription:'Have at least 3 team members with an active plan',
         taskType:'active_members', taskValue:3 },
-      { label:'$0.50 JACKPOT', amount:0.50, probability:5, color:'#FFD66E', icon:'👑',
+      { label:'$0.50', amount:0.50, probability:6, color:'#C9A227', icon:'⭐',
         taskTitle:'Team Deposit $2000', taskDescription:'Get your team to deposit a combined $2000 USDT to claim this prize',
         taskType:'team_deposit_amount', taskValue:2000 },
+      { label:'$0.75', amount:0.75, probability:6, color:'#1A1712', icon:'🏆',
+        taskTitle:'Invite 1 Gold User', taskDescription:'Refer 1 member who reaches the Gold plan to claim this prize',
+        taskType:'invite_tier_count', taskValue:1, taskMeta:'gold' },
+      { label:'$1.00 JACKPOT', amount:1.00, probability:4, color:'#FFD66E', icon:'👑',
+        taskTitle:'Invite 1 Elite User', taskDescription:'Refer 1 member who reaches the Elite plan to claim this prize',
+        taskType:'invite_tier_count', taskValue:1, taskMeta:'elite' },
     ];
     for (let i=0;i<defaultPrizes.length;i++) {
       const p = defaultPrizes[i];
       await pool.query(
-        `INSERT INTO lottery_prizes(label,amount,probability,color,icon,task_title,task_description,task_requirement_type,task_requirement_value,sort_order)
-         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-        [p.label,p.amount,p.probability,p.color,p.icon,p.taskTitle||null,p.taskDescription||'',p.taskType||null,p.taskValue||null,i]);
+        `INSERT INTO lottery_prizes(label,amount,probability,color,icon,task_title,task_description,task_requirement_type,task_requirement_value,task_requirement_meta,sort_order)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+        [p.label,p.amount,p.probability,p.color,p.icon,p.taskTitle||null,p.taskDescription||'',p.taskType||null,p.taskValue||null,p.taskMeta||null,i]);
     }
     console.log('✅ Seeded default lottery prizes');
   }
@@ -1739,11 +1749,12 @@ app.post('/api/tasks/:id/claim', auth, async (req,res) => {
 });
 
 // ── Lottery: helpers ─────────────────────────────────────────────────────
-const LOTTERY_TASK_TYPES = ['deposit_amount','team_deposit_amount','invite_count','active_members'];
+const LOTTERY_TASK_TYPES = ['deposit_amount','team_deposit_amount','invite_count','active_members','invite_tier_count'];
 const LOTTERY_MAX_PENDING = 3;
 
 // Live progress for a lottery claim-task's requirement, for a given user.
-async function lotteryTaskProgress(userId, reqType) {
+// `meta` is used by invite_tier_count to specify which plan tier to count (bronze|silver|gold|elite).
+async function lotteryTaskProgress(userId, reqType, meta) {
   if (reqType === 'deposit_amount') {
     const {rows:[r]} = await db(
       `SELECT COALESCE(SUM(amount),0)::float AS v FROM transactions WHERE user_id=$1 AND type='deposit'`,[userId]);
@@ -1771,6 +1782,11 @@ async function lotteryTaskProgress(userId, reqType) {
       `SELECT COUNT(DISTINCT u.id)::int AS c FROM users u
        JOIN investments i ON i.user_id=u.id AND i.status='active'
        WHERE u.referred_by=$1`,[userId]);
+    return r.c;
+  }
+  if (reqType === 'invite_tier_count') {
+    const {rows:[r]} = await db(
+      `SELECT COUNT(*)::int AS c FROM users WHERE referred_by=$1 AND membership_level=$2`,[userId, meta||'silver']);
     return r.c;
   }
   return 0;
@@ -1816,7 +1832,7 @@ app.get('/api/lottery/status', auth, async (req,res) => {
     const freeSpinAvailable = String(state.last_free_claim||'') !== today;
     const pending = await cleanupAndGetPendingClaims(req.user.id);
     const pendingWithProgress = await Promise.all(pending.map(async c=>{
-      const progress = await lotteryTaskProgress(req.user.id, c.task_requirement_type);
+      const progress = await lotteryTaskProgress(req.user.id, c.task_requirement_type, c.task_requirement_meta);
       return { ...cc(c), progress, target: parseFloat(c.task_requirement_value) };
     }));
     const {rows:prizes} = await db(
@@ -1859,10 +1875,10 @@ app.post('/api/lottery/spin', auth, async (req,res) => {
     await db('UPDATE lottery_spin_state SET last_free_claim=$1, updated_at=NOW() WHERE user_id=$2',[today,req.user.id]);
 
     const {rows:[histRow]} = await db(
-      `INSERT INTO lottery_history(user_id,prize_id,prize_label,amount,task_title,task_description,task_requirement_type,task_requirement_value,status)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+      `INSERT INTO lottery_history(user_id,prize_id,prize_label,amount,task_title,task_description,task_requirement_type,task_requirement_value,task_requirement_meta,status)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
       [req.user.id, won.id, won.label, amount,
-       hasTask?won.task_title:null, hasTask?won.task_description:'', hasTask?won.task_requirement_type:null, hasTask?won.task_requirement_value:null,
+       hasTask?won.task_title:null, hasTask?won.task_description:'', hasTask?won.task_requirement_type:null, hasTask?won.task_requirement_value:null, hasTask?won.task_requirement_meta:null,
        hasTask ? 'pending' : 'no_task']);
 
     if (hasTask) {
@@ -1893,7 +1909,7 @@ app.post('/api/lottery/claims/:id/claim', auth, async (req,res) => {
       return res.status(400).json({success:false,message:'This claim expired at the weekly reset — spin again for a new chance!'});
     }
 
-    const progress = await lotteryTaskProgress(req.user.id, claim.task_requirement_type);
+    const progress = await lotteryTaskProgress(req.user.id, claim.task_requirement_type, claim.task_requirement_meta);
     if (progress < parseFloat(claim.task_requirement_value)) {
       return res.status(400).json({success:false,message:`Not yet — you're at ${progress} / ${claim.task_requirement_value}`});
     }
@@ -2011,19 +2027,21 @@ app.get('/api/admin/lottery/prizes', adminAuth, requirePermission('lottery'), as
 app.post('/api/admin/lottery/prizes', adminAuth, requireRole('Owner','Super Admin'), async (req,res) => {
   try {
     const {label, amount, probability, color, icon, sortOrder,
-           taskTitle, taskDescription, taskRequirementType, taskRequirementValue} = req.body;
+           taskTitle, taskDescription, taskRequirementType, taskRequirementValue, taskRequirementMeta} = req.body;
     if (!label || amount===undefined || probability===undefined) return res.status(400).json({success:false,message:'Label, amount and probability are required'});
     if (parseFloat(amount) > 0) {
       if (!taskTitle || !taskRequirementType || taskRequirementValue===undefined)
         return res.status(400).json({success:false,message:'Prizes with an amount > 0 need a claim-task: title, requirement type and value'});
       if (!LOTTERY_TASK_TYPES.includes(taskRequirementType)) return res.status(400).json({success:false,message:'Invalid task requirement type'});
+      if (taskRequirementType==='invite_tier_count' && !taskRequirementMeta) return res.status(400).json({success:false,message:'Pick which plan tier the invited user must reach'});
     }
     const {rows} = await db(
-      `INSERT INTO lottery_prizes(label,amount,probability,color,icon,sort_order,task_title,task_description,task_requirement_type,task_requirement_value)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+      `INSERT INTO lottery_prizes(label,amount,probability,color,icon,sort_order,task_title,task_description,task_requirement_type,task_requirement_value,task_requirement_meta)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
       [label, amount, probability, color||'#C9A227', icon||'🎁', sortOrder||0,
        parseFloat(amount)>0?taskTitle:null, parseFloat(amount)>0?(taskDescription||''):'',
-       parseFloat(amount)>0?taskRequirementType:null, parseFloat(amount)>0?taskRequirementValue:null]);
+       parseFloat(amount)>0?taskRequirementType:null, parseFloat(amount)>0?taskRequirementValue:null,
+       parseFloat(amount)>0?(taskRequirementMeta||null):null]);
     await logAdmin(req.admin.id, `Created lottery prize "${label}"`, {amount,probability,taskRequirementType});
     res.status(201).json({success:true,message:'Prize added to the wheel',data:{prize:cc(rows[0])}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
@@ -2032,7 +2050,7 @@ app.post('/api/admin/lottery/prizes', adminAuth, requireRole('Owner','Super Admi
 app.put('/api/admin/lottery/prizes/:id', adminAuth, requireRole('Owner','Super Admin'), async (req,res) => {
   try {
     const {label, amount, probability, color, icon, isActive, sortOrder,
-           taskTitle, taskDescription, taskRequirementType, taskRequirementValue} = req.body;
+           taskTitle, taskDescription, taskRequirementType, taskRequirementValue, taskRequirementMeta} = req.body;
     if (taskRequirementType!==undefined && taskRequirementType!==null && !LOTTERY_TASK_TYPES.includes(taskRequirementType))
       return res.status(400).json({success:false,message:'Invalid task requirement type'});
     const {rows} = await db(
@@ -2040,9 +2058,10 @@ app.put('/api/admin/lottery/prizes/:id', adminAuth, requireRole('Owner','Super A
         label=COALESCE($1,label), amount=COALESCE($2,amount), probability=COALESCE($3,probability),
         color=COALESCE($4,color), icon=COALESCE($5,icon), is_active=COALESCE($6,is_active), sort_order=COALESCE($7,sort_order),
         task_title=COALESCE($8,task_title), task_description=COALESCE($9,task_description),
-        task_requirement_type=COALESCE($10,task_requirement_type), task_requirement_value=COALESCE($11,task_requirement_value)
-       WHERE id=$12 RETURNING *`,
-      [label,amount,probability,color,icon,isActive,sortOrder,taskTitle,taskDescription,taskRequirementType,taskRequirementValue,req.params.id]);
+        task_requirement_type=COALESCE($10,task_requirement_type), task_requirement_value=COALESCE($11,task_requirement_value),
+        task_requirement_meta=COALESCE($12,task_requirement_meta)
+       WHERE id=$13 RETURNING *`,
+      [label,amount,probability,color,icon,isActive,sortOrder,taskTitle,taskDescription,taskRequirementType,taskRequirementValue,taskRequirementMeta,req.params.id]);
     if (!rows[0]) return res.status(404).json({success:false,message:'Prize not found'});
     await logAdmin(req.admin.id, `Updated lottery prize "${rows[0].label}"`);
     res.json({success:true,message:'Prize updated',data:{prize:cc(rows[0])}});
