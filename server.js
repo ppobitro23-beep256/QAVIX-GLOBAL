@@ -157,6 +157,7 @@ const initDB = async () => {
       task_requirement_type   VARCHAR(30),
       task_requirement_value  NUMERIC(10,2),
       task_requirement_meta   VARCHAR(30),
+      baseline_progress       NUMERIC(10,2) DEFAULT 0, -- metric value snapshot at win time; only growth past this counts toward this claim
       status                  VARCHAR(20) DEFAULT 'no_task', -- no_task (amount=0 spins) | pending | claimed | forfeited
       claimed_at              TIMESTAMPTZ,
       created_at              TIMESTAMPTZ DEFAULT NOW()
@@ -173,6 +174,7 @@ const initDB = async () => {
     ALTER TABLE lottery_history ADD COLUMN IF NOT EXISTS task_requirement_type VARCHAR(30);
     ALTER TABLE lottery_history ADD COLUMN IF NOT EXISTS task_requirement_value NUMERIC(10,2);
     ALTER TABLE lottery_history ADD COLUMN IF NOT EXISTS task_requirement_meta VARCHAR(30);
+    ALTER TABLE lottery_history ADD COLUMN IF NOT EXISTS baseline_progress NUMERIC(10,2) DEFAULT 0;
     ALTER TABLE lottery_history ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'no_task';
     ALTER TABLE lottery_history ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ;
     CREATE INDEX IF NOT EXISTS idx_lothist_user ON lottery_history(user_id);
@@ -1793,6 +1795,29 @@ async function lotteryTaskProgress(userId, reqType, meta) {
   return 0;
 }
 
+// Computes the "starting point" a new claim's progress should count from, so that:
+// (1) a freshly-won claim never gets satisfied by activity that already existed
+//     before the win (only new growth counts), and
+// (2) if the user already holds other pending/claimed claims of the same
+//     requirement type, this new claim starts counting only AFTER those claims'
+//     targets are fully used up — no sharing/double-counting the same progress
+//     across multiple claims of the same type.
+async function computeLotteryClaimBaseline(userId, reqType, reqMeta) {
+  const currentMetric = await lotteryTaskProgress(userId, reqType, reqMeta);
+  const {rows} = await db(
+    `SELECT baseline_progress, task_requirement_value FROM lottery_history
+     WHERE user_id=$1 AND task_requirement_type=$2
+       AND (($3::text IS NULL AND task_requirement_meta IS NULL) OR task_requirement_meta=$3)
+       AND status IN ('pending','claimed')`,
+    [userId, reqType, reqMeta||null]);
+  let ceiling = 0;
+  for (const r of rows) {
+    const consumedUpTo = parseFloat(r.baseline_progress||0) + parseFloat(r.task_requirement_value||0);
+    if (consumedUpTo > ceiling) ceiling = consumedUpTo;
+  }
+  return Math.max(currentMetric, ceiling);
+}
+
 // Weighted-random prize draw. Normalizes probabilities across active prizes
 // so admin-entered weights don't need to sum to exactly 100.
 function drawLotteryPrize(prizes) {
@@ -1833,7 +1858,8 @@ app.get('/api/lottery/status', auth, async (req,res) => {
     const freeSpinAvailable = String(state.last_free_claim||'') !== today;
     const pending = await cleanupAndGetPendingClaims(req.user.id);
     const pendingWithProgress = await Promise.all(pending.map(async c=>{
-      const progress = await lotteryTaskProgress(req.user.id, c.task_requirement_type, c.task_requirement_meta);
+      const rawMetric = await lotteryTaskProgress(req.user.id, c.task_requirement_type, c.task_requirement_meta);
+      const progress = Math.max(0, rawMetric - parseFloat(c.baseline_progress||0));
       return { ...cc(c), progress, target: parseFloat(c.task_requirement_value) };
     }));
     const {rows:prizes} = await db(
@@ -1872,14 +1898,15 @@ app.post('/api/lottery/spin', auth, async (req,res) => {
     const won = drawLotteryPrize(prizes);
     const amount = parseFloat(won.amount)||0;
     const hasTask = amount > 0 && won.task_requirement_type;
+    const baseline = hasTask ? await computeLotteryClaimBaseline(req.user.id, won.task_requirement_type, won.task_requirement_meta) : 0;
 
     await db('UPDATE lottery_spin_state SET last_free_claim=$1, updated_at=NOW() WHERE user_id=$2',[today,req.user.id]);
 
     const {rows:[histRow]} = await db(
-      `INSERT INTO lottery_history(user_id,prize_id,prize_label,amount,task_title,task_description,task_requirement_type,task_requirement_value,task_requirement_meta,status)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+      `INSERT INTO lottery_history(user_id,prize_id,prize_label,amount,task_title,task_description,task_requirement_type,task_requirement_value,task_requirement_meta,baseline_progress,status)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
       [req.user.id, won.id, won.label, amount,
-       hasTask?won.task_title:null, hasTask?won.task_description:'', hasTask?won.task_requirement_type:null, hasTask?won.task_requirement_value:null, hasTask?won.task_requirement_meta:null,
+       hasTask?won.task_title:null, hasTask?won.task_description:'', hasTask?won.task_requirement_type:null, hasTask?won.task_requirement_value:null, hasTask?won.task_requirement_meta:null, baseline,
        hasTask ? 'pending' : 'no_task']);
 
     if (hasTask) {
@@ -1910,7 +1937,8 @@ app.post('/api/lottery/claims/:id/claim', auth, async (req,res) => {
       return res.status(400).json({success:false,message:'This claim expired at the weekly reset — spin again for a new chance!'});
     }
 
-    const progress = await lotteryTaskProgress(req.user.id, claim.task_requirement_type, claim.task_requirement_meta);
+    const rawMetric = await lotteryTaskProgress(req.user.id, claim.task_requirement_type, claim.task_requirement_meta);
+    const progress = Math.max(0, rawMetric - parseFloat(claim.baseline_progress||0));
     if (progress < parseFloat(claim.task_requirement_value)) {
       return res.status(400).json({success:false,message:`Not yet — you're at ${progress} / ${claim.task_requirement_value}`});
     }
