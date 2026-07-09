@@ -757,7 +757,15 @@ const DEFAULT_PLANS = [
 ];
 const DEFAULT_COMM = {1:10, 2:5, 3:2, 4:1, 5:1, 6:1, 7:1, 8:1, 9:1, 10:1};
 // Rank used to decide whether a new plan purchase upgrades a user's displayed membership level.
-const TIER_RANK = { starter:0, bronze:1, silver:2, gold:3, elite:4 };
+const TIER_RANK = { starter:0, bronze:1, silver:2, gold:3, elite:4 }; // fallback only; getTierRank() below is authoritative
+// Derives tier rank dynamically from LIVE_PLANS (sorted by min investment), so
+// any plan admin adds later is correctly ranked without needing a code change.
+function getTierRank(planId){
+  if (!planId || planId === 'starter') return 0;
+  const sorted = [...LIVE_PLANS].sort((a,b)=>a.min-b.min);
+  const idx = sorted.findIndex(p=>p.id===planId);
+  return idx === -1 ? (TIER_RANK[planId] ?? 0) : idx + 1;
+}
 const DEFAULT_PAYMENT = {
   depositMin: parseFloat(process.env.DEPOSIT_MIN)||10,
   withdrawalMin: parseFloat(process.env.WITHDRAWAL_MIN)||2,
@@ -1334,7 +1342,7 @@ app.post('/api/plans/purchase', auth, async (req,res) => {
     await db('UPDATE users SET balance=balance-$1,total_deposited=total_deposited+$1 WHERE id=$2',[amt,req.user.id]);
     // Reflect the highest plan tier ever reached as the user's membership level
     // (e.g. team tree badges, admin Users list "Plan" column, leaderboards).
-    if (TIER_RANK[planId] > (TIER_RANK[u.membership_level] ?? 0)) {
+    if (getTierRank(planId) > getTierRank(u.membership_level)) {
       await db('UPDATE users SET membership_level=$1 WHERE id=$2',[planId, req.user.id]);
     }
     await payComm(req.user.id, amt);
@@ -3407,7 +3415,7 @@ app.get('/api/admin/settings', adminAuth, requirePermission('settings'), async (
 
 app.put('/api/admin/settings/plans', adminAuth, requireRole('Super Admin'), async (req,res) => {
   try {
-    const { planId, rate, days, min, max, status } = req.body;
+    const { planId, rate, days, min, max, status, color, emoji, description } = req.body;
     const plan = LIVE_PLANS.find(p=>p.id===planId);
     if (!plan) return res.status(404).json({success:false,message:'Plan not found'});
     if (rate!==undefined) plan.rate = parseFloat(rate);
@@ -3415,15 +3423,18 @@ app.put('/api/admin/settings/plans', adminAuth, requireRole('Super Admin'), asyn
     if (min!==undefined)  plan.min = parseFloat(min);
     if (max!==undefined)  plan.max = parseFloat(max);
     if (status!==undefined) plan.status = status;
+    if (color!==undefined) plan.color = color;
+    if (emoji!==undefined) plan.emoji = emoji;
+    if (description!==undefined) plan.description = description;
     await saveSetting('plans', LIVE_PLANS, req.admin.id);
-    await logAdmin(req.admin.id, `Updated ${plan.tier} plan settings`, {planId, rate, days, min, max, status});
+    await logAdmin(req.admin.id, `Updated ${plan.tier} plan settings`, {planId, rate, days, min, max, status, color});
     res.json({success:true,message:`${plan.tier} plan updated`,data:{plans:LIVE_PLANS}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
 app.post('/api/admin/settings/plans', adminAuth, requireRole('Super Admin'), async (req,res) => {
   try {
-    const { tier, emoji, rate, days, min, max, description } = req.body;
+    const { tier, emoji, rate, days, min, max, description, color } = req.body;
     if (!tier || rate===undefined || days===undefined || min===undefined || max===undefined) {
       return res.status(400).json({success:false,message:'Tier, rate, days, min and max are required'});
     }
@@ -3433,11 +3444,11 @@ app.post('/api/admin/settings/plans', adminAuth, requireRole('Super Admin'), asy
     const plan = {
       id, name:`QAVIX ${tier.toUpperCase()}`, tier, emoji: emoji||'⭐',
       rate: parseFloat(rate), days: parseInt(days), min: parseFloat(min), max: parseFloat(max),
-      recommended:false, color:'#C9A227', description: description||'', status:'active',
+      recommended:false, color: color||'#C9A227', description: description||'', status:'active',
     };
     LIVE_PLANS.push(plan);
     await saveSetting('plans', LIVE_PLANS, req.admin.id);
-    await logAdmin(req.admin.id, `Created ${tier} plan`, {planId:id, rate, days, min, max});
+    await logAdmin(req.admin.id, `Created ${tier} plan`, {planId:id, rate, days, min, max, color});
     res.json({success:true,message:`${tier} plan created`,data:{plans:LIVE_PLANS}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
