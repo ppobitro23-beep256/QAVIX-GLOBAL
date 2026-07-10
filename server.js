@@ -62,7 +62,11 @@ if (HD_MNEMONIC) {
     // 'm' explicitly here gives the actual root, from which arbitrary child
     // indexes can be derived correctly.
     hdMaster = ethers.HDNodeWallet.fromPhrase(HD_MNEMONIC.trim(), undefined, 'm');
-    bscProvider = new ethers.JsonRpcProvider(BSC_RPC_URL);
+    // batchMaxCount:1 disables request batching — Binance's free public RPC
+    // specifically rate-limits BATCHED eth_getLogs calls ("method eth_getLogs
+    // in batch triggered rate limit"), so sending requests one at a time
+    // avoids that entirely.
+    bscProvider = new ethers.JsonRpcProvider(BSC_RPC_URL, undefined, { batchMaxCount: 1 });
     console.log('✅ HD wallet master loaded — auto-deposit scanning available');
   } catch (e) {
     console.error('❌ HD_MASTER_MNEMONIC is invalid — auto-deposit disabled:', e.message);
