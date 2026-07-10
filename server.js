@@ -174,15 +174,39 @@ async function attemptSweep(depositId, index, childAddress) {
 
     const gasReserve  = deriveDepositWallet(GAS_RESERVE_INDEX).connect(bscProvider);
     const childWallet = deriveDepositWallet(index).connect(bscProvider);
-    const topupAmount = ethers.parseEther(GAS_TOPUP_BNB);
+    const usdt = new ethers.Contract(USDT_BEP20_CONTRACT, ['function transfer(address,uint256) returns (bool)'], childWallet);
 
+    // Estimate the ACTUAL gas needed right now (current gas price × real gas
+    // limit for this exact transfer) instead of sending a fixed guessed
+    // amount — this is what keeps top-ups close to the real cost (a few
+    // cents) rather than overpaying, while still reliably covering it.
+    let requiredWei;
+    try {
+      const feeData = await bscProvider.getFeeData();
+      const gasPrice = feeData.gasPrice || ethers.parseUnits('3', 'gwei');
+      let gasLimit;
+      try {
+        gasLimit = await usdt.transfer.estimateGas(MAIN_COLLECTION_WALLET, amountWei);
+      } catch(e) {
+        gasLimit = 65000n; // fallback if estimation itself fails (e.g. zero balance right now) — typical BEP20 transfer cost
+      }
+      requiredWei = (gasPrice * gasLimit * 130n) / 100n; // +30% safety margin for gas price fluctuation
+    } catch(e) {
+      requiredWei = ethers.parseEther(GAS_TOPUP_BNB); // total estimation failure — fall back to the configured fixed amount
+    }
+    const floorWei = ethers.parseEther(GAS_TOPUP_BNB);
+    if (requiredWei < floorWei) requiredWei = floorWei; // GAS_TOPUP_BNB now acts as a minimum floor, not the amount actually sent
+
+    // Top up only the shortfall (plus a small buffer), not a flat resend —
+    // and the check is against the REAL requirement, so an under-configured
+    // GAS_TOPUP_BNB can no longer get "stuck" thinking it already has enough.
     const childBnbBalance = await bscProvider.getBalance(childAddress);
-    if (childBnbBalance < topupAmount / 2n) {
-      const topupTx = await gasReserve.sendTransaction({ to: childAddress, value: topupAmount });
+    if (childBnbBalance < requiredWei) {
+      const shortfall = requiredWei - childBnbBalance;
+      const topupTx = await gasReserve.sendTransaction({ to: childAddress, value: shortfall + (shortfall / 10n) });
       await topupTx.wait(1);
     }
 
-    const usdt = new ethers.Contract(USDT_BEP20_CONTRACT, ['function transfer(address,uint256) returns (bool)'], childWallet);
     const sweepTx = await usdt.transfer(MAIN_COLLECTION_WALLET, amountWei);
     await sweepTx.wait(1);
     await db(`UPDATE onchain_deposits SET swept=TRUE, sweep_tx_hash=$1, sweep_error=NULL WHERE id=$2`, [sweepTx.hash, depositId]);
