@@ -184,6 +184,38 @@ const initDB = async () => {
     DROP TABLE IF EXISTS lottery_task_claims;
     DROP TABLE IF EXISTS lottery_tasks;
 
+    -- ── Salary / Ambassador Rank System ────────────────────────────────────
+    -- Rank definitions themselves live in settings (key 'salary_ranks'), same
+    -- pattern as plans/commission — fully admin-editable, no redeploy needed.
+    -- Each APPROVED claim permanently "spends" the specific L1 downline members
+    -- counted toward it (member_ids_used): those member ids can never be
+    -- recounted toward a future claim for this user, so climbing again next
+    -- month always requires fresh growth, never the same team re-counted.
+    -- A row starts 'pending' when the user applies themselves; an admin then
+    -- approves (credits balance) or rejects (row is deleted, freeing the period
+    -- up for a fresh application). Admins can also approve directly with no
+    -- prior application — that path inserts straight into 'approved'.
+    CREATE TABLE IF NOT EXISTS salary_claims (
+      id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id          UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      rank_key         VARCHAR(40) NOT NULL,
+      rank_name        VARCHAR(100) NOT NULL,
+      rank_order       INT NOT NULL,
+      amount           NUMERIC(10,2) NOT NULL,
+      period           VARCHAR(7) NOT NULL, -- 'YYYY-MM' — one application/claim per user per calendar month
+      member_ids_used  JSONB NOT NULL DEFAULT '[]',
+      status           VARCHAR(20) NOT NULL DEFAULT 'approved', -- pending | approved
+      approved_by      UUID REFERENCES admins(id) ON DELETE SET NULL,
+      approved_at      TIMESTAMPTZ,
+      created_at       TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(user_id, period)
+    );
+    ALTER TABLE salary_claims ADD COLUMN IF NOT EXISTS status VARCHAR(20) NOT NULL DEFAULT 'approved';
+    ALTER TABLE salary_claims ADD COLUMN IF NOT EXISTS approved_at TIMESTAMPTZ;
+    CREATE INDEX IF NOT EXISTS idx_salary_claims_user ON salary_claims(user_id);
+    CREATE INDEX IF NOT EXISTS idx_salary_claims_status ON salary_claims(status);
+
+
     CREATE TABLE IF NOT EXISTS refresh_tokens (
       id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       token TEXT NOT NULL UNIQUE,
@@ -716,9 +748,9 @@ const requireRole = (...roles) => (req, res, next) => {
 // Owner and Super Admin always get everything and cannot be restricted.
 // These are used when an admin has no custom permissions saved yet.
 const DEFAULT_ROLE_PERMISSIONS = {
-  'Owner':       { dashboard:true, users:true, deposits:true, withdrawals:true, plans:true, investments:true, referral:true, reports:true, settings:true, security:true, support:true, announcements:true, content:true, admins:true, logs:true, backup:true, tasks:true, lottery:true },
-  'Super Admin': { dashboard:true, users:true, deposits:true, withdrawals:true, plans:true, investments:true, referral:true, reports:true, settings:true, security:true, support:true, announcements:true, content:true, admins:true, logs:true, backup:true, tasks:true, lottery:true },
-  'Moderator':   { dashboard:true, users:true, deposits:true, withdrawals:false, plans:false, investments:true, referral:true, reports:true, settings:false, security:false, support:true, announcements:true, content:true, admins:false, logs:false, backup:false, tasks:true, lottery:false },
+  'Owner':       { dashboard:true, users:true, deposits:true, withdrawals:true, plans:true, investments:true, referral:true, reports:true, settings:true, security:true, support:true, announcements:true, content:true, admins:true, logs:true, backup:true, tasks:true, lottery:true, salary:true },
+  'Super Admin': { dashboard:true, users:true, deposits:true, withdrawals:true, plans:true, investments:true, referral:true, reports:true, settings:true, security:true, support:true, announcements:true, content:true, admins:true, logs:true, backup:true, tasks:true, lottery:true, salary:true },
+  'Moderator':   { dashboard:true, users:true, deposits:true, withdrawals:false, plans:false, investments:true, referral:true, reports:true, settings:false, security:false, support:true, announcements:true, content:true, admins:false, logs:false, backup:false, tasks:true, lottery:false, salary:false },
 };
 
 // Check if an admin has permission for a given module key.
@@ -766,6 +798,118 @@ function getTierRank(planId){
   const idx = sorted.findIndex(p=>p.id===planId);
   return idx === -1 ? (TIER_RANK[planId] ?? 0) : idx + 1;
 }
+
+// ── Salary / Ambassador Rank engine ─────────────────────────────────────
+// Sorted, active-only rank ladder.
+const getSalaryRanks = () => [...LIVE_SALARY_RANKS].filter(r => r.active !== false).sort((a,b) => a.order - b.order);
+
+// Counts a list of {membership_level} rows by tier.
+function tierBreakdown(rows){
+  const b = {};
+  rows.forEach(r => { b[r.membership_level] = (b[r.membership_level]||0) + 1; });
+  return b;
+}
+
+// Computes one user's full salary standing: their last APPROVED rank, which
+// rank they must be evaluated against this calendar month, their currently
+// unused/available active L1 members, whether they personally hold the
+// required plan tier, and whether they meet the team requirement right now.
+//
+// Progression rule: the first-ever approved claim may target the highest rank
+// the user already fully qualifies for. Every claim after that must target
+// exactly the next rank up (never a repeat, never a skip) — and only members
+// not already "spent" on a prior APPROVED claim count toward it, so growth
+// must keep compounding. A 'pending' application (submitted by the user,
+// awaiting admin review) does not yet spend members or advance the rank —
+// only an 'approved' row does that.
+async function computeSalaryProgress(userId){
+  const ranks = getSalaryRanks();
+  if (!ranks.length) return null;
+
+  const [{ rows: pastClaims }, { rows: selfRows }] = await Promise.all([
+    db(`SELECT rank_order, period, member_ids_used, status FROM salary_claims WHERE user_id=$1`, [userId]),
+    db(`SELECT membership_level FROM users WHERE id=$1`, [userId]),
+  ]);
+  const self = selfRows[0] || {};
+  const approvedClaims = pastClaims.filter(c => c.status === 'approved');
+  const usedIds = new Set();
+  approvedClaims.forEach(c => (c.member_ids_used||[]).forEach(id => usedIds.add(id)));
+  const lastOrder = approvedClaims.length ? Math.max(...approvedClaims.map(c=>c.rank_order)) : 0;
+  const currentPeriod = new Date().toISOString().slice(0,7); // 'YYYY-MM'
+  const alreadyClaimedThisPeriod = approvedClaims.some(c => c.period === currentPeriod);
+  const alreadyAppliedThisPeriod = pastClaims.some(c => c.status === 'pending' && c.period === currentPeriod);
+
+  const personalPlanMin = LIVE_SALARY_SETTINGS.personalPlanMin;
+  // Fail-safe: if the configured plan was deleted/renamed since, getTierRank()
+  // would fall back to 0 and the gate would silently pass for everyone
+  // (including 'starter'). Require the plan to actually still exist instead.
+  const personalPlanExists = LIVE_PLANS.some(p => p.id === personalPlanMin);
+  const personalPlanOk = personalPlanExists && getTierRank(self.membership_level) >= getTierRank(personalPlanMin);
+
+  const { rows: l1 } = await db(
+    `SELECT id, name, uid, membership_level, created_at FROM users WHERE referred_by=$1 ORDER BY created_at ASC`,
+    [userId]);
+  let activeSet = new Set();
+  if (l1.length){
+    const ids = l1.map(r=>r.id);
+    const ph = ids.map((_,i)=>`$${i+1}`).join(',');
+    const { rows: ar } = await db(`SELECT DISTINCT user_id FROM investments WHERE status='active' AND user_id IN (${ph})`, ids);
+    ar.forEach(r=>activeSet.add(r.user_id));
+  }
+  const activeMembers = l1.filter(m => activeSet.has(m.id) && m.membership_level && m.membership_level !== 'starter');
+  const availableMembers = activeMembers.filter(m => !usedIds.has(m.id));
+
+  const maxOrder = ranks[ranks.length-1].order;
+  const targetOrder = lastOrder === 0 ? null : Math.min(lastOrder + 1, maxOrder);
+
+  const evaluate = (rank) => {
+    const avail = tierBreakdown(availableMembers);
+    const tierMins = rank.tierMins || {};
+    const tierProgress = Object.keys(tierMins).map(t => ({
+      tier: t, required: tierMins[t], have: avail[t]||0, met: (avail[t]||0) >= tierMins[t]
+    }));
+    const l1Met = availableMembers.length >= rank.l1Min;
+    return { rank, l1Have: availableMembers.length, l1Min: rank.l1Min, l1Met, tierProgress, met: l1Met && tierProgress.every(t=>t.met) };
+  };
+
+  let evaluation;
+  if (targetOrder === null){
+    const evals = ranks.map(evaluate);
+    evaluation = [...evals].reverse().find(e=>e.met) || evals[0];
+  } else {
+    // ranks is sorted ascending, so this finds the smallest order at or above
+    // targetOrder — an exact match normally, or the next available rank if the
+    // targeted order was deactivated/deleted since (a gap), so evaluation is
+    // never left null as long as at least one active rank exists.
+    const rank = ranks.find(r=>r.order>=targetOrder);
+    evaluation = rank ? evaluate(rank) : null;
+  }
+
+  const canApply = !!(evaluation && evaluation.met && personalPlanOk && !alreadyClaimedThisPeriod && !alreadyAppliedThisPeriod);
+
+  return {
+    userId, lastOrder, currentPeriod, alreadyClaimedThisPeriod, alreadyAppliedThisPeriod,
+    personalPlanOk, personalPlanMin, availableMembers, activeMembers, evaluation, canApply
+  };
+}
+
+// Deterministically picks which available members get "spent" on a claim:
+// fills each tier bucket (earliest-joined first) up to its minimum, then tops
+// up with any remaining earliest members until l1Min total is reached.
+function selectMembersForClaim(availableMembers, rank){
+  const tierMins = rank.tierMins || {};
+  const picked = new Set();
+  const byTier = {};
+  availableMembers.forEach(m => { (byTier[m.membership_level] ||= []).push(m); });
+  Object.keys(tierMins).forEach(t => {
+    (byTier[t]||[]).slice(0, tierMins[t]).forEach(m => picked.add(m.id));
+  });
+  for (const m of availableMembers){
+    if (picked.size >= rank.l1Min) break;
+    if (!picked.has(m.id)) picked.add(m.id);
+  }
+  return [...picked];
+}
 const DEFAULT_PAYMENT = {
   depositMin: parseFloat(process.env.DEPOSIT_MIN)||10,
   withdrawalMin: parseFloat(process.env.WITHDRAWAL_MIN)||2,
@@ -784,6 +928,22 @@ const DEFAULT_GENERAL = { siteName: 'QAVIX GLOBAL', supportEmail: 'support@qavix
 const DEFAULT_EMAIL_SENDER = { fromName: 'QAVIX GLOBAL', fromEmail: '' };
 const DEFAULT_OTP = { codeLength: 6, loginExpiryMin: 5, withdrawExpiryMin: 3, registerExpiryMin: 5, loginOtpEnabled: true, withdrawOtpEnabled: true };
 
+// Ambassador salary ranks. tierMins keys are plan ids (from LIVE_PLANS) — e.g. an
+// 'ultra' key works fine as data even before an 'ultra' plan exists; that rank simply
+// stays unreachable until the plan is created, which is exactly the intended gate.
+// order defines the required climb sequence (see computeSalaryProgress / getSalaryRanks).
+const DEFAULT_SALARY_RANKS = [
+  { key:'associate_ambassador', name:'Associate Ambassador', order:1, l1Min:5,   tierMins:{ silver:5 },                              amount:20,  active:true },
+  { key:'senior_ambassador',    name:'Senior Ambassador',    order:2, l1Min:10,  tierMins:{ silver:7, gold:3 },                       amount:40,  active:true },
+  { key:'elite_ambassador',     name:'Elite Ambassador',     order:3, l1Min:25,  tierMins:{ silver:15, gold:7, elite:3 },             amount:100, active:true },
+  { key:'regional_ambassador',  name:'Regional Ambassador',  order:4, l1Min:50,  tierMins:{ silver:30, gold:10, elite:10 },           amount:200, active:true },
+  { key:'global_ambassador',    name:'Global Ambassador',    order:5, l1Min:100, tierMins:{ silver:50, gold:25, elite:20, ultra:5 },  amount:500, active:true },
+];
+// Personal gate: a user must personally hold at least this plan tier (by rank,
+// via getTierRank — so Elite also satisfies a Gold requirement) before they can
+// apply for ANY salary rank, regardless of how strong their team is. Admin-editable.
+const DEFAULT_SALARY_SETTINGS = { personalPlanMin: 'gold' };
+
 // Live, DB-backed config — admins can edit these via /api/admin/settings/*.
 // Falls back to the DEFAULT_* values above until the settings table has rows.
 let LIVE_PLANS = DEFAULT_PLANS.map(p=>({...p}));
@@ -795,6 +955,8 @@ let LIVE_SECURITY = {...DEFAULT_SECURITY};
 let LIVE_GENERAL = {...DEFAULT_GENERAL};
 let LIVE_EMAIL_SENDER = {...DEFAULT_EMAIL_SENDER};
 let LIVE_OTP = {...DEFAULT_OTP};
+let LIVE_SALARY_RANKS = DEFAULT_SALARY_RANKS.map(r=>({...r, tierMins:{...r.tierMins}}));
+let LIVE_SALARY_SETTINGS = {...DEFAULT_SALARY_SETTINGS};
 
 // Extract the real client IP, accounting for Render's reverse proxy.
 const getClientIp = (req) =>
@@ -813,6 +975,8 @@ const loadSettingsCache = async () => {
       if (r.key === 'general') LIVE_GENERAL = {...DEFAULT_GENERAL, ...r.value};
       if (r.key === 'smtp') LIVE_EMAIL_SENDER = {...DEFAULT_EMAIL_SENDER, ...r.value};
       if (r.key === 'otp') LIVE_OTP = {...DEFAULT_OTP, ...r.value};
+      if (r.key === 'salary_ranks') LIVE_SALARY_RANKS = r.value;
+      if (r.key === 'salary_settings') LIVE_SALARY_SETTINGS = {...DEFAULT_SALARY_SETTINGS, ...r.value};
     });
     console.log('✅ Settings cache loaded from DB');
   } catch(e){ console.log('⚠️  Could not load settings cache, using defaults:', e.message); }
@@ -1546,6 +1710,55 @@ app.post('/api/referral/collect', auth, async (req,res) => {
     res.json({success:true,message:`$${amount.toFixed(2)} collected!`,data:{collected:amount,newBalance:parseFloat(u.balance)+amount}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
+
+// ── Salary / Ambassador Rank (user-facing: check own progress, apply) ──────
+app.get('/api/salary/progress', auth, async (req,res) => {
+  try {
+    const progress = await computeSalaryProgress(req.user.id);
+    if (!progress || !progress.evaluation) return res.json({success:true,data:{noRanksConfigured:true}});
+    const { rows: history } = await db(
+      `SELECT rank_name, period, amount, created_at FROM salary_claims WHERE user_id=$1 AND status='approved' ORDER BY created_at DESC`,
+      [req.user.id]);
+    const personalPlan = LIVE_PLANS.find(p=>p.id===progress.personalPlanMin);
+    res.json({success:true,data:{
+      evaluation: progress.evaluation,
+      personalPlanOk: progress.personalPlanOk,
+      personalPlanMin: progress.personalPlanMin,
+      personalPlanMinName: personalPlan ? personalPlan.name : progress.personalPlanMin,
+      alreadyClaimedThisPeriod: progress.alreadyClaimedThisPeriod,
+      alreadyAppliedThisPeriod: progress.alreadyAppliedThisPeriod,
+      canApply: progress.canApply,
+      currentRankOrder: progress.lastOrder,
+      history: ccAll(history),
+    }});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.post('/api/salary/apply', auth, async (req,res) => {
+  try {
+    const progress = await computeSalaryProgress(req.user.id);
+    if (!progress || !progress.evaluation) return res.status(400).json({success:false,message:'Salary system is not configured yet'});
+    if (!progress.personalPlanOk) {
+      const p = LIVE_PLANS.find(pl=>pl.id===progress.personalPlanMin);
+      return res.status(400).json({success:false,message:`You need to be on the ${p?p.name:progress.personalPlanMin} plan or higher yourself to apply for salary`});
+    }
+    if (progress.alreadyClaimedThisPeriod) return res.status(400).json({success:false,message:'You already received a salary payout this month'});
+    if (progress.alreadyAppliedThisPeriod) return res.status(400).json({success:false,message:'You already applied this month — please wait for admin review'});
+    if (!progress.evaluation.met) return res.status(400).json({success:false,message:'You do not currently meet the requirements for this rank yet'});
+    const rank = progress.evaluation.rank;
+    const memberIds = selectMembersForClaim(progress.availableMembers, rank);
+    const { rows:[claim] } = await db(
+      `INSERT INTO salary_claims(user_id, rank_key, rank_name, rank_order, amount, period, member_ids_used, status)
+       VALUES($1,$2,$3,$4,$5,$6,$7,'pending') RETURNING *`,
+      [req.user.id, rank.key, rank.name, rank.order, rank.amount, progress.currentPeriod, JSON.stringify(memberIds)]);
+    await notif(req.user.id, 'system', 'Salary application submitted', `Your ${rank.name} salary application ($${rank.amount}) is pending admin review.`);
+    res.json({success:true,message:`Application submitted for ${rank.name}. Awaiting admin approval.`,data:{claim:cc(claim)}});
+  } catch(e){
+    if (e.code === '23505') return res.status(400).json({success:false,message:'You already have a salary application for this month'});
+    res.status(500).json({success:false,message:e.message});
+  }
+});
+
 
 // ── Notifications ─────────────────────────────────────────────────────────
 app.get('/api/notifications', auth, async (req,res) => {
@@ -3410,6 +3623,8 @@ app.get('/api/admin/settings', adminAuth, requirePermission('settings'), async (
     general: LIVE_GENERAL,
     emailSender: LIVE_EMAIL_SENDER,
     otp: LIVE_OTP,
+    salaryRanks: LIVE_SALARY_RANKS,
+    salarySettings: LIVE_SALARY_SETTINGS,
   }});
 });
 
@@ -3461,6 +3676,213 @@ app.delete('/api/admin/settings/plans/:id', adminAuth, requireRole('Super Admin'
     await saveSetting('plans', LIVE_PLANS, req.admin.id);
     await logAdmin(req.admin.id, `Deleted ${removed.tier} plan`, {planId:req.params.id});
     res.json({success:true,message:`${removed.tier} plan deleted`,data:{plans:LIVE_PLANS}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.post('/api/admin/settings/salary-ranks', adminAuth, requireRole('Super Admin'), async (req,res) => {
+  try {
+    const { name, order, l1Min, tierMins, amount } = req.body;
+    if (!name || order===undefined || l1Min===undefined || amount===undefined) {
+      return res.status(400).json({success:false,message:'Name, order, L1 minimum and amount are required'});
+    }
+    const orderNum = parseInt(order), l1MinNum = parseInt(l1Min), amountNum = parseFloat(amount);
+    if (Number.isNaN(orderNum) || Number.isNaN(l1MinNum) || Number.isNaN(amountNum)) {
+      return res.status(400).json({success:false,message:'Order, L1 minimum and amount must be valid numbers'});
+    }
+    let key = name.toLowerCase().trim().replace(/[^a-z0-9]+/g,'_').replace(/(^_|_$)/g,'');
+    if (!key) return res.status(400).json({success:false,message:'Invalid rank name'});
+    if (LIVE_SALARY_RANKS.find(r=>r.key===key)) return res.status(400).json({success:false,message:'A rank with this name already exists'});
+    const rank = { key, name, order:orderNum, l1Min:l1MinNum, tierMins: tierMins||{}, amount:amountNum, active:true };
+    LIVE_SALARY_RANKS.push(rank);
+    await saveSetting('salary_ranks', LIVE_SALARY_RANKS, req.admin.id);
+    await logAdmin(req.admin.id, `Created salary rank ${name}`, {key, order, l1Min, tierMins, amount});
+    res.json({success:true,message:`${name} rank created`,data:{salaryRanks:LIVE_SALARY_RANKS}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.put('/api/admin/settings/salary-ranks/:key', adminAuth, requireRole('Super Admin'), async (req,res) => {
+  try {
+    const rank = LIVE_SALARY_RANKS.find(r=>r.key===req.params.key);
+    if (!rank) return res.status(404).json({success:false,message:'Rank not found'});
+    const { name, order, l1Min, tierMins, amount, active } = req.body;
+    if (order!==undefined && Number.isNaN(parseInt(order))) return res.status(400).json({success:false,message:'Order must be a valid number'});
+    if (l1Min!==undefined && Number.isNaN(parseInt(l1Min))) return res.status(400).json({success:false,message:'L1 minimum must be a valid number'});
+    if (amount!==undefined && Number.isNaN(parseFloat(amount))) return res.status(400).json({success:false,message:'Amount must be a valid number'});
+    if (name!==undefined) rank.name = name;
+    if (order!==undefined) rank.order = parseInt(order);
+    if (l1Min!==undefined) rank.l1Min = parseInt(l1Min);
+    if (tierMins!==undefined) rank.tierMins = tierMins;
+    if (amount!==undefined) rank.amount = parseFloat(amount);
+    if (active!==undefined) rank.active = !!active;
+    await saveSetting('salary_ranks', LIVE_SALARY_RANKS, req.admin.id);
+    await logAdmin(req.admin.id, `Updated salary rank ${rank.name}`, {key:rank.key, name, order, l1Min, tierMins, amount, active});
+    res.json({success:true,message:`${rank.name} updated`,data:{salaryRanks:LIVE_SALARY_RANKS}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.delete('/api/admin/settings/salary-ranks/:key', adminAuth, requireRole('Super Admin'), async (req,res) => {
+  try {
+    const idx = LIVE_SALARY_RANKS.findIndex(r=>r.key===req.params.key);
+    if (idx===-1) return res.status(404).json({success:false,message:'Rank not found'});
+    const [removed] = LIVE_SALARY_RANKS.splice(idx,1);
+    await saveSetting('salary_ranks', LIVE_SALARY_RANKS, req.admin.id);
+    await logAdmin(req.admin.id, `Deleted salary rank ${removed.name}`, {key:removed.key});
+    res.json({success:true,message:`${removed.name} deleted`,data:{salaryRanks:LIVE_SALARY_RANKS}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.put('/api/admin/settings/salary', adminAuth, requireRole('Super Admin'), async (req,res) => {
+  try {
+    const { personalPlanMin } = req.body;
+    if (personalPlanMin !== undefined) {
+      if (!LIVE_PLANS.some(p => p.id === personalPlanMin)) {
+        return res.status(400).json({success:false,message:'That plan ID does not exist — pick one of the current plans'});
+      }
+      LIVE_SALARY_SETTINGS.personalPlanMin = personalPlanMin;
+      await saveSetting('salary_settings', LIVE_SALARY_SETTINGS, req.admin.id);
+    }
+    await logAdmin(req.admin.id, 'Updated salary settings', {personalPlanMin});
+    res.json({success:true,message:'Salary settings updated',data:{salarySettings:LIVE_SALARY_SETTINGS}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── Salary Operations (candidate list, applications, breakdown, approve/reject, history) ─
+app.get('/api/admin/salary/candidates', adminAuth, requirePermission('salary'), async (req,res) => {
+  try {
+    const { rows: referrers } = await db(`SELECT DISTINCT referred_by AS id FROM users WHERE referred_by IS NOT NULL`);
+    const results = [];
+    for (const r of referrers) {
+      const progress = await computeSalaryProgress(r.id);
+      // Anyone who already got paid or already has a pending application this
+      // month belongs in the Applications tab / is done for the month, not here.
+      if (!progress || !progress.evaluation || progress.alreadyClaimedThisPeriod || progress.alreadyAppliedThisPeriod) continue;
+      const { evaluation } = progress;
+      const pct = evaluation.l1Min ? Math.round((Math.min(evaluation.l1Have, evaluation.l1Min) / evaluation.l1Min) * 100) : 0;
+      results.push({ userId:r.id, evaluation, eligible:progress.canApply, personalPlanOk:progress.personalPlanOk, completionPct:pct, lastOrder:progress.lastOrder });
+    }
+    const ids = results.map(r=>r.userId);
+    let userMap = {};
+    if (ids.length){
+      const ph = ids.map((_,i)=>`$${i+1}`).join(',');
+      const { rows:us } = await db(`SELECT id,name,uid,email FROM users WHERE id IN (${ph})`, ids);
+      us.forEach(u=>userMap[u.id]=u);
+    }
+    const data = results
+      .sort((a,b) => (b.eligible - a.eligible) || (b.completionPct - a.completionPct))
+      .map(r => ({
+        user: userMap[r.userId] ? cc(userMap[r.userId]) : null,
+        targetRank: { key:r.evaluation.rank.key, name:r.evaluation.rank.name, order:r.evaluation.rank.order, amount:r.evaluation.rank.amount },
+        l1Have: r.evaluation.l1Have, l1Min: r.evaluation.l1Min,
+        tierProgress: r.evaluation.tierProgress,
+        personalPlanOk: r.personalPlanOk,
+        eligible: r.eligible, completionPct: r.completionPct, currentRankOrder: r.lastOrder,
+      }));
+    res.json({success:true,data:{candidates:data, personalPlanMin:LIVE_SALARY_SETTINGS.personalPlanMin}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.get('/api/admin/salary/applications', adminAuth, requirePermission('salary'), async (req,res) => {
+  try {
+    const { rows } = await db(
+      `SELECT sc.*, u.name AS user_name, u.uid AS user_uid FROM salary_claims sc
+       JOIN users u ON u.id = sc.user_id WHERE sc.status='pending' ORDER BY sc.created_at ASC`);
+    res.json({success:true,data:{applications:ccAll(rows)}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.get('/api/admin/salary/candidates/:userId', adminAuth, requirePermission('salary'), async (req,res) => {
+  try {
+    const progress = await computeSalaryProgress(req.params.userId);
+    if (!progress || !progress.evaluation) return res.status(404).json({success:false,message:'No salary ranks configured'});
+    const [{ rows: pastClaims }, { rows: pendingRows }] = await Promise.all([
+      db(`SELECT rank_name, period, amount, member_ids_used, created_at FROM salary_claims WHERE user_id=$1 AND status='approved' ORDER BY created_at DESC`, [req.params.userId]),
+      db(`SELECT id, rank_name, amount, created_at FROM salary_claims WHERE user_id=$1 AND period=$2 AND status='pending'`, [req.params.userId, progress.currentPeriod]),
+    ]);
+    const usedIds = new Set();
+    pastClaims.forEach(c => (c.member_ids_used||[]).forEach(id=>usedIds.add(id)));
+    const members = progress.activeMembers.map(m => ({
+      id:m.id, name:m.name, uid:m.uid, tier:m.membership_level, joinDate:m.created_at, usedInPastClaim: usedIds.has(m.id)
+    }));
+    res.json({success:true,data:{
+      evaluation: progress.evaluation, currentRankOrder: progress.lastOrder,
+      alreadyClaimedThisPeriod: progress.alreadyClaimedThisPeriod,
+      alreadyAppliedThisPeriod: progress.alreadyAppliedThisPeriod,
+      personalPlanOk: progress.personalPlanOk, personalPlanMin: progress.personalPlanMin,
+      pendingApplication: pendingRows[0] ? cc(pendingRows[0]) : null,
+      members, claimHistory: ccAll(pastClaims)
+    }});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.post('/api/admin/salary/claim/:userId', adminAuth, requirePermission('salary'), async (req,res) => {
+  try {
+    const progress = await computeSalaryProgress(req.params.userId);
+    if (!progress || !progress.evaluation) return res.status(400).json({success:false,message:'No salary rank configured for this user'});
+    if (progress.alreadyClaimedThisPeriod) return res.status(400).json({success:false,message:'This user has already received a salary payout this month'});
+    if (!progress.personalPlanOk) return res.status(400).json({success:false,message:'User does not personally hold the required plan tier for salary eligibility'});
+    if (!progress.evaluation.met) return res.status(400).json({success:false,message:'User does not currently meet the requirements for this rank'});
+    const rank = progress.evaluation.rank;
+    const memberIds = selectMembersForClaim(progress.availableMembers, rank);
+
+    // Approve the user's own pending application if one exists for this month;
+    // otherwise this is an admin-initiated approval with no prior application.
+    const { rows: pending } = await db(
+      `SELECT id FROM salary_claims WHERE user_id=$1 AND period=$2 AND status='pending'`,
+      [req.params.userId, progress.currentPeriod]);
+
+    let claim;
+    if (pending.length){
+      // Guarding with AND status='pending' + checking rowCount closes a real race:
+      // without it, two concurrent approve clicks (or two admins) could both pass
+      // the checks above, both update the same row, and both credit the balance —
+      // a double payout. If someone else already processed it, rowCount is 0 and
+      // we stop here before touching the user's balance.
+      const { rows, rowCount } = await db(
+        `UPDATE salary_claims SET status='approved', rank_key=$1, rank_name=$2, rank_order=$3, amount=$4,
+           member_ids_used=$5, approved_by=$6, approved_at=NOW() WHERE id=$7 AND status='pending' RETURNING *`,
+        [rank.key, rank.name, rank.order, rank.amount, JSON.stringify(memberIds), req.admin.id, pending[0].id]);
+      if (rowCount === 0) return res.status(400).json({success:false,message:'This application was already processed (approved or rejected) by someone else'});
+      claim = rows[0];
+    } else {
+      const { rows:[c] } = await db(
+        `INSERT INTO salary_claims(user_id, rank_key, rank_name, rank_order, amount, period, member_ids_used, status, approved_by, approved_at)
+         VALUES($1,$2,$3,$4,$5,$6,$7,'approved',$8,NOW()) RETURNING *`,
+        [req.params.userId, rank.key, rank.name, rank.order, rank.amount, progress.currentPeriod, JSON.stringify(memberIds), req.admin.id]);
+      claim = c;
+    }
+    await db('UPDATE users SET balance=balance+$1 WHERE id=$2', [rank.amount, req.params.userId]);
+    await db(`INSERT INTO transactions(user_id,type,amount,status,description,meta) VALUES($1,'salary',$2,'completed',$3,$4)`,
+      [req.params.userId, rank.amount, `${rank.name} salary — ${progress.currentPeriod}`, JSON.stringify({rankKey:rank.key, period:progress.currentPeriod})]);
+    await notif(req.params.userId, 'bonus', `${rank.name} salary approved`, `Your $${rank.amount} ${rank.name} salary for ${progress.currentPeriod} has been credited to your balance.`);
+    await logAdmin(req.admin.id, `Approved ${rank.name} salary for user ${req.params.userId}`, {amount:rank.amount, period:progress.currentPeriod, memberCount:memberIds.length});
+    res.json({success:true,message:`${rank.name} salary of $${rank.amount} approved`,data:{claim:cc(claim)}});
+  } catch(e){
+    if (e.code === '23505') return res.status(400).json({success:false,message:'This user has already received a salary payout this month'});
+    res.status(500).json({success:false,message:e.message});
+  }
+});
+
+app.post('/api/admin/salary/reject/:userId', adminAuth, requirePermission('salary'), async (req,res) => {
+  try {
+    const currentPeriod = new Date().toISOString().slice(0,7);
+    const { rows } = await db(
+      `DELETE FROM salary_claims WHERE user_id=$1 AND period=$2 AND status='pending' RETURNING rank_name, amount`,
+      [req.params.userId, currentPeriod]);
+    if (!rows.length) return res.status(404).json({success:false,message:'No pending application found for this user this month'});
+    await notif(req.params.userId, 'system', 'Salary application declined', `Your ${rows[0].rank_name} salary application for this month was not approved. You may re-apply once you meet the requirements.`);
+    await logAdmin(req.admin.id, `Rejected salary application for user ${req.params.userId}`, {period:currentPeriod, rankName:rows[0].rank_name});
+    res.json({success:true,message:'Application rejected — the user may re-apply this month'});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.get('/api/admin/salary/history', adminAuth, requirePermission('salary'), async (req,res) => {
+  try {
+    const page = parseInt(req.query.page)||1, limit=20, offset=(page-1)*limit;
+    const { rows } = await db(
+      `SELECT sc.*, u.name AS user_name, u.uid AS user_uid FROM salary_claims sc
+       JOIN users u ON u.id = sc.user_id WHERE sc.status='approved' ORDER BY sc.created_at DESC LIMIT $1 OFFSET $2`, [limit, offset]);
+    const { rows:[{count}] } = await db(`SELECT COUNT(*)::int AS count FROM salary_claims WHERE status='approved'`);
+    res.json({success:true,data:{history:ccAll(rows), total:count, page, pages:Math.ceil(count/limit)}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
