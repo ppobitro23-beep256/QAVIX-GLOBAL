@@ -859,6 +859,11 @@ async function computeSalaryProgress(userId){
   const activeMembers = l1.filter(m => activeSet.has(m.id) && m.membership_level && m.membership_level !== 'starter');
   const availableMembers = activeMembers.filter(m => !usedIds.has(m.id));
 
+  // Looked up from the full (not just active) rank list, so a rank a user
+  // already legitimately earned still shows its real name even if an admin
+  // later deactivates it — a display concern only, doesn't affect eligibility.
+  const currentRankName = lastOrder > 0 ? (LIVE_SALARY_RANKS.find(r=>r.order===lastOrder)?.name || null) : null;
+
   const maxOrder = ranks[ranks.length-1].order;
   const targetOrder = lastOrder === 0 ? null : Math.min(lastOrder + 1, maxOrder);
 
@@ -888,7 +893,7 @@ async function computeSalaryProgress(userId){
   const canApply = !!(evaluation && evaluation.met && personalPlanOk && !alreadyClaimedThisPeriod && !alreadyAppliedThisPeriod);
 
   return {
-    userId, lastOrder, currentPeriod, alreadyClaimedThisPeriod, alreadyAppliedThisPeriod,
+    userId, lastOrder, currentRankName, currentPeriod, alreadyClaimedThisPeriod, alreadyAppliedThisPeriod,
     personalPlanOk, personalPlanMin, availableMembers, activeMembers, evaluation, canApply
   };
 }
@@ -1729,6 +1734,7 @@ app.get('/api/salary/progress', auth, async (req,res) => {
       alreadyAppliedThisPeriod: progress.alreadyAppliedThisPeriod,
       canApply: progress.canApply,
       currentRankOrder: progress.lastOrder,
+      currentRankName: progress.currentRankName,
       history: ccAll(history),
     }});
   } catch(e){res.status(500).json({success:false,message:e.message});}
@@ -3804,7 +3810,7 @@ app.get('/api/admin/salary/candidates/:userId', adminAuth, requirePermission('sa
       id:m.id, name:m.name, uid:m.uid, tier:m.membership_level, joinDate:m.created_at, usedInPastClaim: usedIds.has(m.id)
     }));
     res.json({success:true,data:{
-      evaluation: progress.evaluation, currentRankOrder: progress.lastOrder,
+      evaluation: progress.evaluation, currentRankOrder: progress.lastOrder, currentRankName: progress.currentRankName,
       alreadyClaimedThisPeriod: progress.alreadyClaimedThisPeriod,
       alreadyAppliedThisPeriod: progress.alreadyAppliedThisPeriod,
       personalPlanOk: progress.personalPlanOk, personalPlanMin: progress.personalPlanMin,
