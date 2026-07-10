@@ -54,7 +54,14 @@ let hdMaster = null;     // ethers.HDNodeWallet — used only to derive addresse
 let bscProvider = null;  // ethers.JsonRpcProvider — used only by the background scanner
 if (HD_MNEMONIC) {
   try {
-    hdMaster = ethers.HDNodeWallet.fromPhrase(HD_MNEMONIC.trim());
+    // IMPORTANT: fromPhrase()'s 3rd argument is the derivation path, and if
+    // omitted it defaults to "m/44'/60'/0'/0/0" (ethers' defaultPath) — NOT the
+    // root. That silently made hdMaster a depth-5 child instead of the true
+    // root, so every later hdMaster.derivePath("m/...") call (an absolute path)
+    // threw "cannot derive root path for a node at non-zero depth". Passing
+    // 'm' explicitly here gives the actual root, from which arbitrary child
+    // indexes can be derived correctly.
+    hdMaster = ethers.HDNodeWallet.fromPhrase(HD_MNEMONIC.trim(), undefined, 'm');
     bscProvider = new ethers.JsonRpcProvider(BSC_RPC_URL);
     console.log('✅ HD wallet master loaded — auto-deposit scanning available');
   } catch (e) {
