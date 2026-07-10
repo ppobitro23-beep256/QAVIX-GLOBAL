@@ -210,9 +210,60 @@ async function attemptSweep(depositId, index, childAddress) {
     const sweepTx = await usdt.transfer(MAIN_COLLECTION_WALLET, amountWei);
     await sweepTx.wait(1);
     await db(`UPDATE onchain_deposits SET swept=TRUE, sweep_tx_hash=$1, sweep_error=NULL WHERE id=$2`, [sweepTx.hash, depositId]);
+
+    // Reclaim any unspent gas left in the child address back to the Gas
+    // Reserve — a plain BNB transfer only costs ~21000 gas (much less than
+    // the ERC20 transfer just done), so it's cheap to return the leftover
+    // instead of letting small amounts of BNB sit scattered everywhere.
+    try {
+      const leftover = await bscProvider.getBalance(childAddress);
+      const feeData2 = await bscProvider.getFeeData();
+      const nativeGasPrice = feeData2.gasPrice || ethers.parseUnits('3', 'gwei');
+      const reclaimTxCost = nativeGasPrice * 21000n;
+      if (leftover > reclaimTxCost * 2n) { // only worth reclaiming if it's clearly more than the cost of reclaiming it
+        const gasReserveAddress = deriveDepositAddress(GAS_RESERVE_INDEX);
+        const reclaimTx = await childWallet.sendTransaction({
+          to: gasReserveAddress, value: leftover - reclaimTxCost, gasLimit: 21000n, gasPrice: nativeGasPrice
+        });
+        await reclaimTx.wait(1);
+      }
+    } catch(e) {
+      console.error(`Gas reclaim failed for deposit ${depositId} (non-fatal):`, e.message);
+    }
   } catch (e) {
     console.error(`Sweep failed for deposit ${depositId}:`, e.message);
     await db(`UPDATE onchain_deposits SET sweep_error=$1 WHERE id=$2`, [String(e.message||'').slice(0,500), depositId]).catch(()=>{});
+  }
+}
+
+// Sweeping already returns unused gas right after each transfer (see above),
+// but this catches any older/leftover BNB sitting in addresses from before
+// that existed (e.g. the $0.45 top-up sent under the old fixed-amount logic)
+// — runs periodically and reclaims anything above a worthwhile threshold.
+async function reclaimStrayGas() {
+  if (!hdMaster || !bscProvider) return;
+  try {
+    const { rows } = await db(`SELECT id, deposit_address, deposit_address_index FROM users WHERE deposit_address IS NOT NULL AND deposit_address_index IS NOT NULL AND deposit_address_index != $1`, [GAS_RESERVE_INDEX]);
+    if (!rows.length) return;
+    const feeData = await bscProvider.getFeeData();
+    const nativeGasPrice = feeData.gasPrice || ethers.parseUnits('3', 'gwei');
+    const reclaimTxCost = nativeGasPrice * 21000n;
+    const gasReserveAddress = deriveDepositAddress(GAS_RESERVE_INDEX);
+    for (const r of rows) {
+      try {
+        const bal = await bscProvider.getBalance(r.deposit_address);
+        if (bal <= reclaimTxCost * 2n) continue; // not worth it
+        const wallet = deriveDepositWallet(r.deposit_address_index).connect(bscProvider);
+        const tx = await wallet.sendTransaction({ to: gasReserveAddress, value: bal - reclaimTxCost, gasLimit: 21000n, gasPrice: nativeGasPrice });
+        await tx.wait(1);
+        console.log(`Reclaimed stray gas from ${r.deposit_address}: ${ethers.formatEther(bal - reclaimTxCost)} BNB`);
+      } catch(e) {
+        // one address failing shouldn't stop the rest from being checked
+        console.error(`Stray gas reclaim failed for ${r.deposit_address}:`, e.message);
+      }
+    }
+  } catch(e) {
+    console.error('reclaimStrayGas error:', e.message);
   }
 }
 
@@ -4944,6 +4995,11 @@ initDB().then(async ()=>{
     // Gas reserve balance check — independent, lighter-weight, every 10 min.
     setTimeout(checkGasReserveAlert, 25_000);
     setInterval(checkGasReserveAlert, 10 * 60 * 1000);
+    // Reclaims stray/leftover BNB from user deposit addresses back to the
+    // Gas Reserve — catches both future overshoot and old leftovers from
+    // before this logic existed. Every 15 min.
+    setTimeout(reclaimStrayGas, 40_000);
+    setInterval(reclaimStrayGas, 15 * 60 * 1000);
   }
 });
 
