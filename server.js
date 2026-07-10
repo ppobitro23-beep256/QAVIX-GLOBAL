@@ -11,6 +11,7 @@ const jwt          = require('jsonwebtoken');
 const cors         = require('cors');
 const helmet       = require('helmet');
 const rateLimit    = require('express-rate-limit');
+const { ethers }   = require('ethers'); // HD wallet address derivation + on-chain deposit scanning
 
 const app  = express();
 const PORT = process.env.PORT || 5000;
@@ -24,6 +25,215 @@ const pool = process.env.DATABASE_URL
   : null;
 
 const db = (text, params) => pool.query(text, params);
+
+// ═══════════════════════════════════════════════════════════════════════
+//  HD WALLET — one master seed → a unique, permanent BEP20 deposit address
+//  per user (BIP-44, same derivation as Ethereum since BSC is EVM-compatible).
+//  The mnemonic lives ONLY in an environment variable — never in the database,
+//  never in a response, never logged. Only this process derives addresses/keys.
+// ═══════════════════════════════════════════════════════════════════════
+const HD_MNEMONIC         = process.env.HD_MASTER_MNEMONIC || null; // set in Render env vars ONLY — never commit this
+const BSC_RPC_URL         = process.env.BSC_RPC_URL || 'https://bsc-dataseed.binance.org';
+const USDT_BEP20_CONTRACT = process.env.USDT_BEP20_CONTRACT || '0x55d398326f99059fF775485246999027B3197955';
+const USDT_DECIMALS       = 18; // Binance-Peg BSC-USD (BEP20) uses 18 decimals — NOT 6 like TRC20/ERC20 USDT
+const DEPOSIT_CONFIRMATIONS = parseInt(process.env.DEPOSIT_CONFIRMATIONS) || 15; // ~45s on BSC — protects against reorgs
+const HD_DERIVATION_BASE  = "m/44'/60'/0'/0/"; // Ethereum coin-type path — valid for any EVM chain, including BSC
+
+// ── Auto-sweep — moves each user's deposited USDT out of their own child
+// address into one real wallet you control, fully automatically. Index 0 of
+// the SAME HD tree is reserved as the "gas tank": it never gets assigned to
+// a user (hd_deposit_index_seq starts at 1), and admin keeps it topped up
+// with a small BNB balance so the sweep bot can pay gas on users' behalf.
+const MAIN_COLLECTION_WALLET = process.env.MAIN_COLLECTION_WALLET || null; // address only — where swept funds end up
+const GAS_TOPUP_BNB          = process.env.GAS_TOPUP_BNB || '0.0008';       // BNB sent to a child address before sweeping it
+const GAS_RESERVE_INDEX      = 0;
+const GAS_RESERVE_LOW_THRESHOLD = parseFloat(process.env.GAS_RESERVE_LOW_THRESHOLD) || 0.01; // BNB — below this, alert admin
+const GAS_ALERT_COOLDOWN_HOURS  = 6; // don't re-alert more often than this while still low
+
+let hdMaster = null;     // ethers.HDNodeWallet — used only to derive addresses/keys, never persisted
+let bscProvider = null;  // ethers.JsonRpcProvider — used only by the background scanner
+if (HD_MNEMONIC) {
+  try {
+    hdMaster = ethers.HDNodeWallet.fromPhrase(HD_MNEMONIC.trim());
+    bscProvider = new ethers.JsonRpcProvider(BSC_RPC_URL);
+    console.log('✅ HD wallet master loaded — auto-deposit scanning available');
+  } catch (e) {
+    console.error('❌ HD_MASTER_MNEMONIC is invalid — auto-deposit disabled:', e.message);
+  }
+} else {
+  console.log('ℹ️  HD_MASTER_MNEMONIC not set — per-user deposit addresses disabled (manual deposit flow still works)');
+}
+
+// Deterministic — no DB lookup needed to compute an address for a given index.
+function deriveDepositAddress(index) {
+  if (!hdMaster) return null;
+  return hdMaster.derivePath(HD_DERIVATION_BASE + index).address;
+}
+// Only called when actually sweeping funds out of a child address — derives
+// the private key for that one index on demand; never stored anywhere.
+function deriveDepositWallet(index) {
+  if (!hdMaster) return null;
+  return hdMaster.derivePath(HD_DERIVATION_BASE + index);
+}
+
+const USDT_ABI = ['event Transfer(address indexed from, address indexed to, uint256 value)'];
+let _scannerRunning = false;
+
+// Scans confirmed blocks since the last check for USDT (BEP20) Transfer
+// events landing in ANY known user deposit address, and auto-credits the
+// matching user the instant one is found — no admin approval needed, since
+// the blockchain confirmation itself is the verification. After crediting,
+// it also attempts to auto-sweep that deposit into MAIN_COLLECTION_WALLET —
+// sweep success/failure never affects the user's already-credited balance.
+async function scanOnchainDeposits() {
+  if (!hdMaster || !bscProvider || _scannerRunning) return;
+  _scannerRunning = true;
+  try {
+    const { rows: addrRows } = await db(`SELECT id, deposit_address, deposit_address_index FROM users WHERE deposit_address IS NOT NULL`);
+    if (!addrRows.length) return; // nobody has a generated address yet — nothing to watch
+    const addrToUser = {};
+    addrRows.forEach(r => { addrToUser[r.deposit_address.toLowerCase()] = { userId: r.id, index: r.deposit_address_index }; });
+    const knownAddresses = addrRows.map(r => r.deposit_address);
+
+    const { rows: settingsRows } = await db(`SELECT value FROM settings WHERE key='onchain_scanner'`);
+    let lastCheckedBlock = settingsRows[0]?.value?.lastCheckedBlock;
+    const latestBlock = await bscProvider.getBlockNumber();
+    const toBlock = latestBlock - DEPOSIT_CONFIRMATIONS;
+    if (!lastCheckedBlock) lastCheckedBlock = toBlock - 1; // first run ever — start from "now", don't scan all history
+    if (toBlock <= lastCheckedBlock) { await retryFailedSweeps(addrToUser); return; }
+
+    const contract = new ethers.Contract(USDT_BEP20_CONTRACT, USDT_ABI, bscProvider);
+    const filter = contract.filters.Transfer(null, knownAddresses);
+    // Large gaps (e.g. after downtime) are scanned in chunks so one RPC call
+    // never spans an unreasonable block range.
+    const CHUNK = 4500;
+    let cursor = lastCheckedBlock + 1;
+    while (cursor <= toBlock) {
+      const end = Math.min(cursor + CHUNK - 1, toBlock);
+      const logs = await contract.queryFilter(filter, cursor, end);
+      for (const log of logs) {
+        const toAddr = (log.args.to || '').toLowerCase();
+        const match = addrToUser[toAddr];
+        if (!match) continue;
+        const amount = parseFloat(ethers.formatUnits(log.args.value, USDT_DECIMALS));
+        if (!amount || amount <= 0) continue;
+        const logIndex = log.index ?? log.logIndex ?? 0;
+        try {
+          const { rows: inserted } = await db(
+            `INSERT INTO onchain_deposits(user_id, tx_hash, log_index, from_address, to_address, amount, block_number, amount_wei)
+             VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (tx_hash, log_index) DO NOTHING RETURNING id`,
+            [match.userId, log.transactionHash, logIndex, log.args.from, toAddr, amount, log.blockNumber, log.args.value.toString()]);
+          if (!inserted.length) continue; // already processed this exact log before — skip, never double-credit
+          await db('UPDATE users SET balance=balance+$1, total_deposited=total_deposited+$1 WHERE id=$2', [amount, match.userId]);
+          await db(`INSERT INTO transactions(user_id,type,amount,status,description,meta) VALUES($1,'deposit',$2,'completed',$3,$4)`,
+            [match.userId, amount, `Auto-detected deposit (${LIVE_PAYMENT.network||'BEP20'})`, JSON.stringify({network:LIVE_PAYMENT.network||'BEP20', txHash:log.transactionHash, auto:true})]);
+          await notif(match.userId, 'deposit', 'Deposit Received', `$${amount.toFixed(2)} USDT detected on-chain and credited to your balance automatically.`);
+          // Best-effort — a sweep failure (e.g. gas reserve empty) is logged
+          // and retried automatically on later cycles; it never blocks or
+          // reverses the balance credit above.
+          await attemptSweep(inserted[0].id, match.index, toAddr);
+        } catch (e) {
+          console.error('Onchain deposit credit error:', e.message);
+        }
+      }
+      cursor = end + 1;
+    }
+    await saveSetting('onchain_scanner', { lastCheckedBlock: toBlock }, null);
+    await retryFailedSweeps(addrToUser);
+  } catch (e) {
+    console.error('Onchain scanner error:', e.message);
+  } finally {
+    _scannerRunning = false;
+  }
+}
+
+// Moves one deposit's USDT out of the user's child address into
+// MAIN_COLLECTION_WALLET, using the EXACT on-chain amount (amount_wei) — never
+// a value re-derived from a rounded display float, so the transfer can never
+// overshoot the child address's real token balance. Tops up gas (BNB) from the
+// reserved index-0 wallet first if the child address doesn't already have
+// enough. Never throws — failures are recorded on the row and retried next cycle.
+async function attemptSweep(depositId, index, childAddress) {
+  if (!MAIN_COLLECTION_WALLET || index==null) return;
+  try {
+    const { rows:[dep] } = await db(`SELECT amount_wei, swept FROM onchain_deposits WHERE id=$1`, [depositId]);
+    if (!dep || dep.swept || !dep.amount_wei) return;
+    const amountWei = BigInt(dep.amount_wei);
+    if (amountWei <= 0n) return;
+
+    const gasReserve  = deriveDepositWallet(GAS_RESERVE_INDEX).connect(bscProvider);
+    const childWallet = deriveDepositWallet(index).connect(bscProvider);
+    const topupAmount = ethers.parseEther(GAS_TOPUP_BNB);
+
+    const childBnbBalance = await bscProvider.getBalance(childAddress);
+    if (childBnbBalance < topupAmount / 2n) {
+      const topupTx = await gasReserve.sendTransaction({ to: childAddress, value: topupAmount });
+      await topupTx.wait(1);
+    }
+
+    const usdt = new ethers.Contract(USDT_BEP20_CONTRACT, ['function transfer(address,uint256) returns (bool)'], childWallet);
+    const sweepTx = await usdt.transfer(MAIN_COLLECTION_WALLET, amountWei);
+    await sweepTx.wait(1);
+    await db(`UPDATE onchain_deposits SET swept=TRUE, sweep_tx_hash=$1, sweep_error=NULL WHERE id=$2`, [sweepTx.hash, depositId]);
+  } catch (e) {
+    console.error(`Sweep failed for deposit ${depositId}:`, e.message);
+    await db(`UPDATE onchain_deposits SET sweep_error=$1 WHERE id=$2`, [String(e.message||'').slice(0,500), depositId]).catch(()=>{});
+  }
+}
+
+// Each cycle, retries any deposit that was credited to a user but never
+// successfully swept yet (e.g. the gas reserve ran dry last time) — so admin
+// only ever needs to top up the gas reserve address; everything else recovers
+// on its own without manual intervention.
+async function retryFailedSweeps(addrToUserFallback) {
+  if (!MAIN_COLLECTION_WALLET) return;
+  try {
+    const { rows } = await db(`SELECT id, to_address, user_id FROM onchain_deposits WHERE swept=FALSE ORDER BY created_at ASC LIMIT 20`);
+    if (!rows.length) return;
+    for (const r of rows) {
+      let index = addrToUserFallback?.[r.to_address.toLowerCase()]?.index;
+      if (index == null) {
+        const { rows:[u] } = await db(`SELECT deposit_address_index FROM users WHERE id=$1`, [r.user_id]);
+        index = u?.deposit_address_index;
+      }
+      if (index == null) continue;
+      await attemptSweep(r.id, index, r.to_address);
+    }
+  } catch (e) {
+    console.error('retryFailedSweeps error:', e.message);
+  }
+}
+
+// Checks the Gas Reserve's BNB balance and pushes a Telegram alert to the
+// admin (same bot used for support/backups) the moment it drops below
+// threshold — throttled so it fires once, not every cycle, while it stays
+// low. Re-alerts again after the cooldown if nobody has topped it up yet.
+async function checkGasReserveAlert() {
+  if (!hdMaster || !bscProvider || !MAIN_COLLECTION_WALLET) return;
+  try {
+    const gasReserveAddress = deriveDepositAddress(GAS_RESERVE_INDEX);
+    const balance = parseFloat(ethers.formatEther(await bscProvider.getBalance(gasReserveAddress)));
+    if (balance >= GAS_RESERVE_LOW_THRESHOLD) return; // healthy — nothing to do
+
+    const { rows } = await db(`SELECT value FROM settings WHERE key='gas_reserve_alert'`);
+    const lastAlertAt = rows[0]?.value?.lastAlertAt;
+    const hoursSinceLastAlert = lastAlertAt ? (Date.now() - new Date(lastAlertAt).getTime()) / 3600000 : Infinity;
+    if (hoursSinceLastAlert < GAS_ALERT_COOLDOWN_HOURS) return; // already alerted recently — don't spam
+
+    await tgSend(
+      `⚠️ <b>Gas Reserve Running Low</b>\n\n` +
+      `Balance: <b>${balance.toFixed(5)} BNB</b> (threshold: ${GAS_RESERVE_LOW_THRESHOLD} BNB)\n` +
+      `Address: <code>${gasReserveAddress}</code>\n\n` +
+      `Auto-sweep to your main wallet will start failing once this runs out. Send some BNB (e.g. 0.05–0.1) to the address above.\n\n` +
+      `Deposits are still credited to users normally either way — this only affects moving funds to your main wallet.`
+    );
+    await saveSetting('gas_reserve_alert', { lastAlertAt: new Date().toISOString(), balanceAtAlert: balance }, null);
+  } catch (e) {
+    console.error('checkGasReserveAlert error:', e.message);
+  }
+}
+
+
 
 // ── Create all tables on first run ───────────────────────────────────────
 const initDB = async () => {
@@ -76,6 +286,8 @@ const initDB = async () => {
       meta        JSONB DEFAULT '{}',
       created_at  TIMESTAMPTZ DEFAULT NOW()
     );
+    -- Speeds up the deposit txHash duplicate-submission check.
+    CREATE INDEX IF NOT EXISTS idx_transactions_deposit_txhash ON transactions((meta->>'txHash')) WHERE type='deposit';
     CREATE TABLE IF NOT EXISTS notifications (
       id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       user_id    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -237,6 +449,44 @@ const initDB = async () => {
     ALTER TABLE users ADD COLUMN IF NOT EXISTS date_of_birth   DATE;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS phone           VARCHAR(30);
     ALTER TABLE users ADD COLUMN IF NOT EXISTS withdrawal_pass VARCHAR(255);
+    -- HD wallet: each user's own permanent BEP20 deposit address + the child
+    -- derivation index it came from (index is what lets us re-derive the
+    -- private key later for sweeping — the key itself is never stored).
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS deposit_address       VARCHAR(42);
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS deposit_address_index INT;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_users_deposit_address ON users(deposit_address) WHERE deposit_address IS NOT NULL;
+
+    -- Atomic, concurrency-safe counter for "next HD derivation index to hand
+    -- out" — a DB sequence guarantees two simultaneous signups can never be
+    -- assigned the same index (which would mean the same deposit address).
+    CREATE SEQUENCE IF NOT EXISTS hd_deposit_index_seq START 1;
+
+    -- Every on-chain USDT (BEP20) transfer the scanner detects into a known
+    -- deposit address gets one row here — UNIQUE(tx_hash, log_index) means a
+    -- transfer can only ever be credited once, no matter how many times the
+    -- scanner re-checks the same block range.
+    CREATE TABLE IF NOT EXISTS onchain_deposits (
+      id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id      UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      tx_hash      VARCHAR(80) NOT NULL,
+      log_index    INT NOT NULL,
+      from_address VARCHAR(42),
+      to_address   VARCHAR(42) NOT NULL,
+      amount       NUMERIC(20,6) NOT NULL,
+      block_number BIGINT NOT NULL,
+      swept        BOOLEAN DEFAULT FALSE,   -- has this user's deposited USDT been moved to the main collection wallet yet?
+      sweep_tx_hash VARCHAR(80),
+      sweep_error   TEXT,                   -- last sweep failure reason (e.g. gas reserve empty) — retried automatically next cycle
+      amount_wei    TEXT,                    -- exact on-chain amount (base units, as a string) — the sweep moves this exact value, never a re-derived float
+      created_at   TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(tx_hash, log_index)
+    );
+    ALTER TABLE onchain_deposits ADD COLUMN IF NOT EXISTS swept BOOLEAN DEFAULT FALSE;
+    ALTER TABLE onchain_deposits ADD COLUMN IF NOT EXISTS sweep_tx_hash VARCHAR(80);
+    ALTER TABLE onchain_deposits ADD COLUMN IF NOT EXISTS sweep_error TEXT;
+    ALTER TABLE onchain_deposits ADD COLUMN IF NOT EXISTS amount_wei TEXT;
+    CREATE INDEX IF NOT EXISTS idx_onchain_deposits_user ON onchain_deposits(user_id);
+    CREATE INDEX IF NOT EXISTS idx_onchain_deposits_unswept ON onchain_deposits(swept) WHERE swept=FALSE;
 
     CREATE TABLE IF NOT EXISTS login_history (
       id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -921,6 +1171,7 @@ const DEFAULT_PAYMENT = {
   withdrawalMax: parseFloat(process.env.WITHDRAWAL_MAX)||10000,
   withdrawalFeePercent: 5,
   network: 'BEP20',
+  depositAddress: process.env.DEPOSIT_ADDRESS || '0x742d35Cc6634C0532925a3b8D4C9C0a6bEf4267',
 };
 const DEFAULT_REFERRAL = { enabled: true };
 const DEFAULT_MAINTENANCE = { enabled: false, message: 'We are performing scheduled maintenance and will be back shortly.' };
@@ -1089,6 +1340,8 @@ app.get('/api/content/payment-info', async (_,res) => {
     withdrawalMin: LIVE_PAYMENT.withdrawalMin,
     withdrawalMax: LIVE_PAYMENT.withdrawalMax,
     withdrawalFeePercent: LIVE_PAYMENT.withdrawalFeePercent,
+    depositAddress: LIVE_PAYMENT.depositAddress,
+    network: LIVE_PAYMENT.network,
   }});
 });
 
@@ -1550,16 +1803,43 @@ app.get('/api/wallet/transactions', auth, async (req,res) => {
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
+// Returns the user's own permanent BEP20 deposit address, generating one on
+// first call (atomic via a DB sequence, so no two users can ever collide).
+// Falls back to the shared platform address if HD wallet isn't configured.
+app.get('/api/wallet/deposit-address', auth, async (req,res) => {
+  try {
+    const { rows:[u] } = await db('SELECT deposit_address FROM users WHERE id=$1', [req.user.id]);
+    if (u.deposit_address) {
+      return res.json({success:true,data:{ address:u.deposit_address, network:LIVE_PAYMENT.network||'BEP20', autoDetect:true }});
+    }
+    if (!hdMaster) {
+      return res.json({success:true,data:{ address:LIVE_PAYMENT.depositAddress, network:LIVE_PAYMENT.network||'BEP20', autoDetect:false }});
+    }
+    const { rows:[seq] } = await db(`SELECT nextval('hd_deposit_index_seq') AS idx`);
+    const idx = parseInt(seq.idx);
+    const address = deriveDepositAddress(idx);
+    await db('UPDATE users SET deposit_address=$1, deposit_address_index=$2 WHERE id=$3', [address, idx, req.user.id]);
+    res.json({success:true,data:{ address, network:LIVE_PAYMENT.network||'BEP20', autoDetect:true }});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
 app.post('/api/wallet/deposit', auth, async (req,res) => {
   try {
     const {amount,network,txHash}=req.body;
     const MIN=LIVE_PAYMENT.depositMin, amt=parseFloat(amount);
     if (!amt||amt<MIN) return res.status(400).json({success:false,message:`Min deposit $${MIN}`});
-    if (!txHash)       return res.status(400).json({success:false,message:'Transaction hash required'});
+    if (!txHash||!txHash.trim()) return res.status(400).json({success:false,message:'Transaction hash required'});
+    // A transaction hash is a one-time reference to a real on-chain transfer —
+    // block resubmitting the same hash (whether by the same user or a
+    // different one) so it can never be counted/approved twice.
+    const { rows: dupe } = await db(
+      `SELECT id FROM transactions WHERE type='deposit' AND meta->>'txHash' = $1 LIMIT 1`,
+      [txHash.trim()]);
+    if (dupe.length) return res.status(400).json({success:false,message:'This transaction hash has already been submitted'});
     // Deposits are held as 'pending' until an admin approves them in the admin console.
     // Balance is only credited on approval — see PUT /api/admin/deposits/:id/approve
     const {rows}=await db(`INSERT INTO transactions(user_id,type,amount,status,description,meta) VALUES($1,'deposit',$2,'pending',$3,$4) RETURNING *`,
-      [req.user.id,amt,`Deposit via ${network||'BEP20'}`,JSON.stringify({network,txHash})]);
+      [req.user.id,amt,`Deposit via ${network||'BEP20'}`,JSON.stringify({network,txHash:txHash.trim()})]);
     await notif(req.user.id,'deposit','Deposit Submitted',`$${amt} USDT submitted, awaiting confirmation`);
     res.status(201).json({success:true,message:`$${amt} deposit submitted and is pending confirmation`,data:{transaction:cc(rows[0])}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
@@ -1594,7 +1874,13 @@ app.post('/api/wallet/withdraw', auth, async (req,res) => {
       return res.json({success:true,requireOtp:true,message:`OTP sent to confirm withdrawal. Valid for ${LIVE_OTP.withdrawExpiryMin} minutes.`,data:{fee,netAmount:net}});
     }
     if (otp) await verifyOTP(u.email, otp, 'withdraw');
-    await db('UPDATE users SET balance=balance-$1,total_withdrawn=total_withdrawn+$2 WHERE id=$3',[amt,net,req.user.id]);
+    // Atomic check-and-deduct in one statement: if two requests race (e.g. a
+    // double-submit), only one can succeed since the WHERE clause re-checks
+    // balance at the moment of the UPDATE itself, not from the earlier SELECT.
+    const { rowCount } = await db(
+      'UPDATE users SET balance=balance-$1,total_withdrawn=total_withdrawn+$2 WHERE id=$3 AND balance>=$1',
+      [amt,net,req.user.id]);
+    if (rowCount === 0) return res.status(400).json({success:false,message:'Insufficient balance'});
     const {rows}=await db(
       `INSERT INTO transactions(user_id,type,amount,status,description,meta)
        VALUES($1,'withdrawal',$2,'pending',$3,$4) RETURNING *`,
@@ -2930,6 +3216,35 @@ app.post('/api/admin/users/:id/reset-password', adminAuth, requirePermission('us
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
+// ── On-chain auto-deposit scanner status ──────────────────────────────────
+app.get('/api/admin/onchain/status', adminAuth, requirePermission('deposits'), async (req,res) => {
+  try {
+    const enabled = !!(hdMaster && bscProvider);
+    let latestBlock = null, lastCheckedBlock = null, lag = null, gasReserveAddress = null, gasReserveBnbBalance = null;
+    if (enabled) {
+      try { latestBlock = await bscProvider.getBlockNumber(); } catch(e){}
+      const { rows } = await db(`SELECT value FROM settings WHERE key='onchain_scanner'`);
+      lastCheckedBlock = rows[0]?.value?.lastCheckedBlock ?? null;
+      if (latestBlock!=null && lastCheckedBlock!=null) lag = latestBlock - lastCheckedBlock;
+      gasReserveAddress = deriveDepositAddress(GAS_RESERVE_INDEX);
+      try { gasReserveBnbBalance = ethers.formatEther(await bscProvider.getBalance(gasReserveAddress)); } catch(e){}
+    }
+    const { rows:[{count:addressesGenerated}] } = await db(`SELECT COUNT(*)::int AS count FROM users WHERE deposit_address IS NOT NULL`);
+    const { rows:[{count:autoDepositsCount}] } = await db(`SELECT COUNT(*)::int AS count FROM onchain_deposits`);
+    const { rows:[{count:sweptCount}] } = await db(`SELECT COUNT(*)::int AS count FROM onchain_deposits WHERE swept=TRUE`);
+    const { rows:[{count:unsweptCount}] } = await db(`SELECT COUNT(*)::int AS count FROM onchain_deposits WHERE swept=FALSE`);
+    res.json({success:true,data:{
+      enabled, latestBlock, lastCheckedBlock, lag, confirmationsRequired:DEPOSIT_CONFIRMATIONS,
+      addressesGenerated, autoDepositsCount, contract:USDT_BEP20_CONTRACT, rpcUrl:BSC_RPC_URL,
+      sweepEnabled: !!MAIN_COLLECTION_WALLET, mainCollectionWallet: MAIN_COLLECTION_WALLET,
+      gasReserveAddress, gasReserveBnbBalance, gasTopupBnb: GAS_TOPUP_BNB,
+      gasReserveLowThreshold: GAS_RESERVE_LOW_THRESHOLD,
+      gasReserveLow: gasReserveBnbBalance!=null ? parseFloat(gasReserveBnbBalance) < GAS_RESERVE_LOW_THRESHOLD : null,
+      sweptCount, unsweptCount,
+    }});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
 // ── Deposit moderation ────────────────────────────────────────────────────
 app.get('/api/admin/deposits', adminAuth, requirePermission('deposits'), async (req,res) => {
   try {
@@ -2972,11 +3287,20 @@ app.get('/api/admin/deposits/export', adminAuth, requirePermission('deposits'), 
 
 app.put('/api/admin/deposits/:id/approve', adminAuth, requirePermission('deposits'), async (req,res) => {
   try {
-    const {rows:[tx]} = await db(`SELECT * FROM transactions WHERE id=$1 AND type='deposit'`,[req.params.id]);
-    if (!tx) return res.status(404).json({success:false,message:'Deposit not found'});
-    if (tx.status !== 'pending') return res.status(400).json({success:false,message:'Only pending deposits can be approved'});
+    // Atomically claim the pending deposit first. Only one concurrent request
+    // (two admins, or a double-click) can flip status pending→approved; the
+    // loser gets 0 rows back and never touches the user's balance — closes a
+    // double-credit race that existed in the old select-then-update version.
+    const {rows:[tx]} = await db(
+      `UPDATE transactions SET status='approved', reviewed_by=$1, reviewed_at=NOW()
+       WHERE id=$2 AND type='deposit' AND status='pending' RETURNING *`,
+      [req.admin.id, req.params.id]);
+    if (!tx) {
+      const {rows:[existing]} = await db(`SELECT id FROM transactions WHERE id=$1 AND type='deposit'`,[req.params.id]);
+      if (!existing) return res.status(404).json({success:false,message:'Deposit not found'});
+      return res.status(400).json({success:false,message:'Only pending deposits can be approved'});
+    }
     await db('UPDATE users SET balance=balance+$1, total_deposited=total_deposited+$1 WHERE id=$2',[tx.amount,tx.user_id]);
-    await db(`UPDATE transactions SET status='approved', reviewed_by=$1, reviewed_at=NOW() WHERE id=$2`,[req.admin.id,req.params.id]);
     await notif(tx.user_id,'deposit','Deposit Approved',`$${tx.amount} has been credited to your balance.`);
     await logAdmin(req.admin.id, `Approved deposit $${tx.amount}`, {depositId:req.params.id,userId:tx.user_id});
     res.json({success:true,message:'Deposit approved and credited'});
@@ -2986,10 +3310,15 @@ app.put('/api/admin/deposits/:id/approve', adminAuth, requirePermission('deposit
 app.put('/api/admin/deposits/:id/reject', adminAuth, requirePermission('deposits'), async (req,res) => {
   try {
     const {reason} = req.body;
-    const {rows:[tx]} = await db(`SELECT * FROM transactions WHERE id=$1 AND type='deposit'`,[req.params.id]);
-    if (!tx) return res.status(404).json({success:false,message:'Deposit not found'});
-    if (tx.status !== 'pending') return res.status(400).json({success:false,message:'Only pending deposits can be rejected'});
-    await db(`UPDATE transactions SET status='rejected', reviewed_by=$1, reviewed_at=NOW(), reject_reason=$2 WHERE id=$3`,[req.admin.id,reason||'',req.params.id]);
+    const {rows:[tx]} = await db(
+      `UPDATE transactions SET status='rejected', reviewed_by=$1, reviewed_at=NOW(), reject_reason=$2
+       WHERE id=$3 AND type='deposit' AND status='pending' RETURNING *`,
+      [req.admin.id, reason||'', req.params.id]);
+    if (!tx) {
+      const {rows:[existing]} = await db(`SELECT id FROM transactions WHERE id=$1 AND type='deposit'`,[req.params.id]);
+      if (!existing) return res.status(404).json({success:false,message:'Deposit not found'});
+      return res.status(400).json({success:false,message:'Only pending deposits can be rejected'});
+    }
     await notif(tx.user_id,'deposit','Deposit Rejected',reason||'Your deposit could not be confirmed. Contact support if you believe this is a mistake.');
     await logAdmin(req.admin.id, `Rejected deposit $${tx.amount}`, {depositId:req.params.id,userId:tx.user_id,reason});
     res.json({success:true,message:'Deposit rejected'});
@@ -3002,10 +3331,12 @@ app.post('/api/admin/deposits/bulk-approve', adminAuth, requirePermission('depos
     if (!Array.isArray(ids) || !ids.length) return res.status(400).json({success:false,message:'No deposits selected'});
     let approved = 0, skipped = 0;
     for (const id of ids) {
-      const {rows:[tx]} = await db(`SELECT * FROM transactions WHERE id=$1 AND type='deposit'`,[id]);
-      if (!tx || tx.status !== 'pending') { skipped++; continue; }
+      const {rows:[tx]} = await db(
+        `UPDATE transactions SET status='approved', reviewed_by=$1, reviewed_at=NOW()
+         WHERE id=$2 AND type='deposit' AND status='pending' RETURNING *`,
+        [req.admin.id, id]);
+      if (!tx) { skipped++; continue; }
       await db('UPDATE users SET balance=balance+$1, total_deposited=total_deposited+$1 WHERE id=$2',[tx.amount,tx.user_id]);
-      await db(`UPDATE transactions SET status='approved', reviewed_by=$1, reviewed_at=NOW() WHERE id=$2`,[req.admin.id,id]);
       await notif(tx.user_id,'deposit','Deposit Approved',`$${tx.amount} has been credited to your balance.`);
       approved++;
     }
@@ -3057,10 +3388,15 @@ app.get('/api/admin/withdrawals/export', adminAuth, requirePermission('withdrawa
 
 app.put('/api/admin/withdrawals/:id/approve', adminAuth, requirePermission('withdrawals'), async (req,res) => {
   try {
-    const {rows:[tx]} = await db(`SELECT * FROM transactions WHERE id=$1 AND type='withdrawal'`,[req.params.id]);
-    if (!tx) return res.status(404).json({success:false,message:'Withdrawal not found'});
-    if (tx.status !== 'pending') return res.status(400).json({success:false,message:'Only pending withdrawals can be approved'});
-    await db(`UPDATE transactions SET status='approved', reviewed_by=$1, reviewed_at=NOW() WHERE id=$2`,[req.admin.id,req.params.id]);
+    const {rows:[tx]} = await db(
+      `UPDATE transactions SET status='approved', reviewed_by=$1, reviewed_at=NOW()
+       WHERE id=$2 AND type='withdrawal' AND status='pending' RETURNING *`,
+      [req.admin.id, req.params.id]);
+    if (!tx) {
+      const {rows:[existing]} = await db(`SELECT id FROM transactions WHERE id=$1 AND type='withdrawal'`,[req.params.id]);
+      if (!existing) return res.status(404).json({success:false,message:'Withdrawal not found'});
+      return res.status(400).json({success:false,message:'Only pending withdrawals can be approved'});
+    }
     await notif(tx.user_id,'withdrawal','Withdrawal Approved','Your withdrawal has been approved and will be paid out shortly.');
     await logAdmin(req.admin.id, `Approved withdrawal $${tx.amount}`, {withdrawalId:req.params.id,userId:tx.user_id});
     res.json({success:true,message:'Withdrawal approved'});
@@ -3070,15 +3406,22 @@ app.put('/api/admin/withdrawals/:id/approve', adminAuth, requirePermission('with
 app.put('/api/admin/withdrawals/:id/reject', adminAuth, requirePermission('withdrawals'), async (req,res) => {
   try {
     const {reason, refund} = req.body;
-    const {rows:[tx]} = await db(`SELECT * FROM transactions WHERE id=$1 AND type='withdrawal'`,[req.params.id]);
-    if (!tx) return res.status(404).json({success:false,message:'Withdrawal not found'});
-    if (tx.status !== 'pending') return res.status(400).json({success:false,message:'Only pending withdrawals can be rejected'});
+    // Atomic claim first — critical here because the refund path moves money
+    // back to the user; without this guard a double-click could refund twice.
+    const {rows:[tx]} = await db(
+      `UPDATE transactions SET status='rejected', reviewed_by=$1, reviewed_at=NOW(), reject_reason=$2
+       WHERE id=$3 AND type='withdrawal' AND status='pending' RETURNING *`,
+      [req.admin.id, reason||'', req.params.id]);
+    if (!tx) {
+      const {rows:[existing]} = await db(`SELECT id FROM transactions WHERE id=$1 AND type='withdrawal'`,[req.params.id]);
+      if (!existing) return res.status(404).json({success:false,message:'Withdrawal not found'});
+      return res.status(400).json({success:false,message:'Only pending withdrawals can be rejected'});
+    }
     if (refund) {
       const meta = tx.meta || {};
       const gross = parseFloat(tx.amount) + parseFloat(meta.fee||0);
       await db('UPDATE users SET balance=balance+$1, total_withdrawn=total_withdrawn-$2 WHERE id=$3',[gross,tx.amount,tx.user_id]);
     }
-    await db(`UPDATE transactions SET status='rejected', reviewed_by=$1, reviewed_at=NOW(), reject_reason=$2 WHERE id=$3`,[req.admin.id,reason||'',req.params.id]);
     await notif(tx.user_id,'withdrawal','Withdrawal Rejected',(reason||'Your withdrawal request was rejected.') + (refund?' The amount has been refunded to your balance.':''));
     await logAdmin(req.admin.id, `Rejected withdrawal $${tx.amount}`, {withdrawalId:req.params.id,userId:tx.user_id,reason,refund:!!refund});
     res.json({success:true,message:'Withdrawal rejected'+(refund?' and refunded':'')});
@@ -3089,11 +3432,15 @@ app.put('/api/admin/withdrawals/:id/paid', adminAuth, requirePermission('withdra
   try {
     const {payoutTxnId} = req.body;
     if (!payoutTxnId) return res.status(400).json({success:false,message:'Payout transaction ID required'});
-    const {rows:[tx]} = await db(`SELECT * FROM transactions WHERE id=$1 AND type='withdrawal'`,[req.params.id]);
-    if (!tx) return res.status(404).json({success:false,message:'Withdrawal not found'});
-    if (tx.status !== 'approved') return res.status(400).json({success:false,message:'Only approved withdrawals can be marked paid'});
-    const meta = { ...(tx.meta||{}), payoutTxnId };
-    await db(`UPDATE transactions SET status='paid', meta=$1, reviewed_by=$2, reviewed_at=NOW() WHERE id=$3`,[JSON.stringify(meta),req.admin.id,req.params.id]);
+    const {rows:[existingTx]} = await db(`SELECT * FROM transactions WHERE id=$1 AND type='withdrawal'`,[req.params.id]);
+    if (!existingTx) return res.status(404).json({success:false,message:'Withdrawal not found'});
+    if (existingTx.status !== 'approved') return res.status(400).json({success:false,message:'Only approved withdrawals can be marked paid'});
+    const meta = { ...(existingTx.meta||{}), payoutTxnId };
+    const {rows:[tx]} = await db(
+      `UPDATE transactions SET status='paid', meta=$1, reviewed_by=$2, reviewed_at=NOW()
+       WHERE id=$3 AND status='approved' RETURNING *`,
+      [JSON.stringify(meta), req.admin.id, req.params.id]);
+    if (!tx) return res.status(400).json({success:false,message:'Only approved withdrawals can be marked paid'});
     await notif(tx.user_id,'withdrawal','Withdrawal Paid',`$${tx.amount} USDT (BEP20) has been sent. TXN: ${payoutTxnId}`);
     await logAdmin(req.admin.id, `Marked withdrawal paid $${tx.amount}`, {withdrawalId:req.params.id,userId:tx.user_id,payoutTxnId});
     res.json({success:true,message:'Withdrawal marked as paid'});
@@ -3106,9 +3453,11 @@ app.post('/api/admin/withdrawals/bulk-approve', adminAuth, requirePermission('wi
     if (!Array.isArray(ids) || !ids.length) return res.status(400).json({success:false,message:'No withdrawals selected'});
     let approved = 0, skipped = 0;
     for (const id of ids) {
-      const {rows:[tx]} = await db(`SELECT * FROM transactions WHERE id=$1 AND type='withdrawal'`,[id]);
-      if (!tx || tx.status !== 'pending') { skipped++; continue; }
-      await db(`UPDATE transactions SET status='approved', reviewed_by=$1, reviewed_at=NOW() WHERE id=$2`,[req.admin.id,id]);
+      const {rows:[tx]} = await db(
+        `UPDATE transactions SET status='approved', reviewed_by=$1, reviewed_at=NOW()
+         WHERE id=$2 AND type='withdrawal' AND status='pending' RETURNING *`,
+        [req.admin.id, id]);
+      if (!tx) { skipped++; continue; }
       await notif(tx.user_id,'withdrawal','Withdrawal Approved','Your withdrawal has been approved and will be paid out shortly.');
       approved++;
     }
@@ -3904,11 +4253,12 @@ app.put('/api/admin/settings/referral', adminAuth, requireRole('Super Admin'), a
 
 app.put('/api/admin/settings/payment', adminAuth, requireRole('Super Admin'), async (req,res) => {
   try {
-    const { depositMin, withdrawalMin, withdrawalMax, withdrawalFeePercent } = req.body;
+    const { depositMin, withdrawalMin, withdrawalMax, withdrawalFeePercent, depositAddress } = req.body;
     if (depositMin!==undefined) LIVE_PAYMENT.depositMin = parseFloat(depositMin);
     if (withdrawalMin!==undefined) LIVE_PAYMENT.withdrawalMin = parseFloat(withdrawalMin);
     if (withdrawalMax!==undefined) LIVE_PAYMENT.withdrawalMax = parseFloat(withdrawalMax);
     if (withdrawalFeePercent!==undefined) LIVE_PAYMENT.withdrawalFeePercent = parseFloat(withdrawalFeePercent);
+    if (depositAddress!==undefined) LIVE_PAYMENT.depositAddress = String(depositAddress).trim();
     await saveSetting('payment', LIVE_PAYMENT, req.admin.id);
     await logAdmin(req.admin.id, 'Updated payment settings', req.body);
     res.json({success:true,message:'Payment settings updated',data:{payment:LIVE_PAYMENT}});
@@ -4550,6 +4900,16 @@ initDB().then(async ()=>{
   };
   setTimeout(runDailyBackup, 30_000);
   setInterval(runDailyBackup, 24 * 60 * 60 * 1000);
+
+  // On-chain auto-deposit scanner (only active when HD_MASTER_MNEMONIC is set).
+  // First run 20s after startup, then every 30s.
+  if (hdMaster && bscProvider) {
+    setTimeout(scanOnchainDeposits, 20_000);
+    setInterval(scanOnchainDeposits, 30_000);
+    // Gas reserve balance check — independent, lighter-weight, every 10 min.
+    setTimeout(checkGasReserveAlert, 25_000);
+    setInterval(checkGasReserveAlert, 10 * 60 * 1000);
+  }
 });
 
 module.exports = app;
