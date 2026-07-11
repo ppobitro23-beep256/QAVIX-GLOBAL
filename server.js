@@ -50,8 +50,27 @@ const GAS_RESERVE_INDEX      = 0;
 const GAS_RESERVE_LOW_THRESHOLD = parseFloat(process.env.GAS_RESERVE_LOW_THRESHOLD) || 0.01; // BNB — below this, alert admin
 const GAS_ALERT_COOLDOWN_HOURS  = 6; // don't re-alert more often than this while still low
 
-let hdMaster = null;     // ethers.HDNodeWallet — used only to derive addresses/keys, never persisted
-let bscProvider = null;  // ethers.JsonRpcProvider — used only by the background scanner
+// ── Withdrawal Wallet — a single, separate wallet admin tops up manually
+// (with USDT for payouts + a bit of BNB for gas). When configured, approving
+// a withdrawal in the admin panel automatically sends the USDT on-chain —
+// admin just confirms, no manual sending needed. If not configured, the old
+// fully-manual flow (approve → send yourself → mark paid with a tx id) still
+// works exactly as before.
+const WITHDRAWAL_WALLET_PRIVATE_KEY = process.env.WITHDRAWAL_WALLET_PRIVATE_KEY || null; // hex private key — Render env var ONLY, never commit
+const WITHDRAWAL_GAS_MIN_BNB = parseFloat(process.env.WITHDRAWAL_GAS_MIN_BNB) || 0.001; // refuse to auto-send below this much gas
+
+let hdMaster = null;         // ethers.HDNodeWallet — used only to derive addresses/keys, never persisted
+let bscProvider = null;      // ethers.JsonRpcProvider — shared by the deposit scanner AND the withdrawal payout sender
+let withdrawalWallet = null; // ethers.Wallet — the single wallet that actually sends withdrawal payouts
+
+if (HD_MNEMONIC || WITHDRAWAL_WALLET_PRIVATE_KEY) {
+  // batchMaxCount:1 disables request batching — Binance's free public RPC
+  // specifically rate-limits BATCHED eth_getLogs calls ("method eth_getLogs
+  // in batch triggered rate limit"), so sending requests one at a time
+  // avoids that entirely.
+  bscProvider = new ethers.JsonRpcProvider(BSC_RPC_URL, undefined, { batchMaxCount: 1 });
+}
+
 if (HD_MNEMONIC) {
   try {
     // IMPORTANT: fromPhrase()'s 3rd argument is the derivation path, and if
@@ -62,17 +81,23 @@ if (HD_MNEMONIC) {
     // 'm' explicitly here gives the actual root, from which arbitrary child
     // indexes can be derived correctly.
     hdMaster = ethers.HDNodeWallet.fromPhrase(HD_MNEMONIC.trim(), undefined, 'm');
-    // batchMaxCount:1 disables request batching — Binance's free public RPC
-    // specifically rate-limits BATCHED eth_getLogs calls ("method eth_getLogs
-    // in batch triggered rate limit"), so sending requests one at a time
-    // avoids that entirely.
-    bscProvider = new ethers.JsonRpcProvider(BSC_RPC_URL, undefined, { batchMaxCount: 1 });
     console.log('✅ HD wallet master loaded — auto-deposit scanning available');
   } catch (e) {
     console.error('❌ HD_MASTER_MNEMONIC is invalid — auto-deposit disabled:', e.message);
   }
 } else {
   console.log('ℹ️  HD_MASTER_MNEMONIC not set — per-user deposit addresses disabled (manual deposit flow still works)');
+}
+
+if (WITHDRAWAL_WALLET_PRIVATE_KEY) {
+  try {
+    withdrawalWallet = new ethers.Wallet(WITHDRAWAL_WALLET_PRIVATE_KEY.trim(), bscProvider);
+    console.log('✅ Withdrawal wallet loaded:', withdrawalWallet.address, '— auto-payout on approve available');
+  } catch (e) {
+    console.error('❌ WITHDRAWAL_WALLET_PRIVATE_KEY is invalid — withdrawals will stay fully manual:', e.message);
+  }
+} else {
+  console.log('ℹ️  WITHDRAWAL_WALLET_PRIVATE_KEY not set — withdrawal approval stays fully manual');
 }
 
 // Deterministic — no DB lookup needed to compute an address for a given index.
@@ -86,6 +111,31 @@ function deriveDepositWallet(index) {
   if (!hdMaster) return null;
   return hdMaster.derivePath(HD_DERIVATION_BASE + index);
 }
+
+// Sends one withdrawal's USDT from the Withdrawal Wallet straight to the
+// user's address. Throws (never silently fails) if balance/gas is short or
+// the send errors — the caller is responsible for reverting the withdrawal's
+// status back to 'pending' on failure so it can be retried once funded.
+async function sendWithdrawalPayout(toAddress, amountUsdt) {
+  if (!withdrawalWallet) throw new Error('Withdrawal wallet is not configured');
+  if (!toAddress || !ethers.isAddress(toAddress)) throw new Error(`Invalid destination address: ${toAddress}`);
+  if (!amountUsdt || amountUsdt <= 0) throw new Error(`Invalid payout amount: ${amountUsdt}`);
+  const usdt = new ethers.Contract(
+    USDT_BEP20_CONTRACT,
+    ['function transfer(address,uint256) returns (bool)', 'function balanceOf(address) view returns (uint256)'],
+    withdrawalWallet
+  );
+  const amountWei = ethers.parseUnits(amountUsdt.toFixed(6), USDT_DECIMALS);
+  const bal = await usdt.balanceOf(withdrawalWallet.address);
+  if (bal < amountWei) throw new Error(`Insufficient USDT in withdrawal wallet (has ${ethers.formatUnits(bal, USDT_DECIMALS)}, needs ${amountUsdt})`);
+  const gasBal = await bscProvider.getBalance(withdrawalWallet.address);
+  if (gasBal < ethers.parseEther(String(WITHDRAWAL_GAS_MIN_BNB))) throw new Error(`Insufficient BNB gas in withdrawal wallet (has ${ethers.formatEther(gasBal)} BNB)`);
+  const tx = await usdt.transfer(toAddress, amountWei);
+  await tx.wait(1);
+  return tx.hash;
+}
+
+
 
 const USDT_ABI = ['event Transfer(address indexed from, address indexed to, uint256 value)'];
 let _scannerRunning = false;
@@ -535,6 +585,14 @@ const initDB = async () => {
     ALTER TABLE users ADD COLUMN IF NOT EXISTS date_of_birth   DATE;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS phone           VARCHAR(30);
     ALTER TABLE users ADD COLUMN IF NOT EXISTS withdrawal_pass VARCHAR(255);
+    -- One withdrawal wallet address can only ever be linked to ONE account —
+    -- stops the common multi-accounting trick of farming referral bonuses on
+    -- several accounts then draining them all to the same wallet. The column
+    -- defaults to '' (not NULL) for users who haven't bound one yet, so the
+    -- partial index must exclude both NULL and '' or it would immediately
+    -- conflict across every not-yet-bound account.
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_users_wallet_address_unique
+      ON users(LOWER(wallet_address)) WHERE wallet_address IS NOT NULL AND wallet_address != '';
     -- HD wallet: each user's own permanent BEP20 deposit address + the child
     -- derivation index it came from (index is what lets us re-derive the
     -- private key later for sweeping — the key itself is never stored).
@@ -881,6 +939,7 @@ const OTP_CONFIG = {
   change_email      : { expiry: 5,  subject: '📧 QAVIX Email Change Verification',  action: 'change your email'             },
   change_password   : { expiry: 5,  subject: '🔑 QAVIX Password Change',            action: 'change your login password'    },
   admin_login       : { expiry: 5,  subject: '🛡️ QAVIX Admin Panel — New Sign-in',  action: 'verify this admin sign-in'     },
+  wallet_address_change : { expiry: 5, subject: '💳 QAVIX Withdrawal Wallet Change', action: 'change your withdrawal wallet address' },
 };
 
 const MAX_RESENDS   = 3;   // max resend attempts in 10 minutes
@@ -1516,6 +1575,16 @@ app.post('/api/auth/register', limit10, async (req,res) => {
     if (meta.referredBy) {
       await db(`INSERT INTO transactions(user_id,type,amount,description,meta)
         VALUES($1,'commission',0,'New referral joined','{}')`,[meta.referredBy]);
+      // Visible in Render logs — quick "who joined under whom" trail without
+      // needing to open the admin panel.
+      try {
+        const { rows:[referrer] } = await db('SELECT name, uid FROM users WHERE id=$1', [meta.referredBy]);
+        console.log(`👥 Referral: ${newUser.name} (${newUser.uid}) joined under ${referrer ? referrer.name + ' (' + referrer.uid + ')' : meta.referredBy}`);
+      } catch(e) {
+        console.log(`👥 Referral: ${newUser.name} (${newUser.uid}) joined under referrer id ${meta.referredBy}`);
+      }
+    } else {
+      console.log(`👤 New signup: ${newUser.name} (${newUser.uid}) — no referral`);
     }
 
     await notif(newUser.id,'system','Welcome to QAVIX GLOBAL 🎉','Your account is ready. Start investing today!');
@@ -1801,11 +1870,29 @@ app.post('/api/user/change-email', auth, async (req,res) => {
 
 app.put('/api/user/wallet-address', auth, async (req,res) => {
   try {
-    const {walletAddress,network}=req.body;
+    const {walletAddress,network,otp}=req.body;
     if (!walletAddress) return res.status(400).json({success:false,message:'Wallet address required'});
+    const {rows:[u]} = await db('SELECT wallet_address, email FROM users WHERE id=$1', [req.user.id]);
+    const hasExisting = !!(u && u.wallet_address);
+    if (hasExisting) {
+      // Changing an already-bound wallet requires OTP — previously this had
+      // NO protection at all server-side (the frontend just displayed a
+      // "contact support" message, but the endpoint itself accepted any
+      // change unverified). This is what actually stands between a stolen
+      // session and silently redirecting future withdrawals elsewhere.
+      if (!otp) {
+        await issueOTP(req.user.id, u.email, 'wallet_address_change', {walletAddress, network});
+        return res.json({success:true, requireOtp:true, message:'OTP sent to your email to confirm this change.'});
+      }
+      await verifyOTP(u.email, otp, 'wallet_address_change');
+    }
     await db('UPDATE users SET wallet_address=$1,wallet_network=$2 WHERE id=$3',[walletAddress,network||'BEP20',req.user.id]);
     res.json({success:true,message:'Wallet address updated'});
-  } catch(e){res.status(500).json({success:false,message:e.message});}
+  } catch(e){
+    // 23505 = unique_violation — this exact address is already bound to a different account.
+    if (e.code === '23505') return res.status(400).json({success:false,message:'This wallet address is already linked to another account. Each withdrawal wallet can only be used by one account.'});
+    res.status(500).json({success:false,message:e.message});
+  }
 });
 
 // ── Plans ─────────────────────────────────────────────────────────────────
@@ -3202,7 +3289,10 @@ app.put('/api/admin/users/:id/wallet', adminAuth, requirePermission('users'), as
     await db('UPDATE users SET wallet_address=$1, wallet_network=$2 WHERE id=$3',[walletAddress, network||'BEP20', req.params.id]);
     await logAdmin(req.admin.id, `Updated wallet address for user ${req.params.id}`, {network});
     res.json({success:true,message:'Wallet address updated'});
-  } catch(e){res.status(500).json({success:false,message:e.message});}
+  } catch(e){
+    if (e.code === '23505') return res.status(400).json({success:false,message:'This wallet address is already linked to another account.'});
+    res.status(500).json({success:false,message:e.message});
+  }
 });
 
 app.get('/api/admin/users/:id/login-history', adminAuth, requirePermission('users'), async (req,res) => {
@@ -3327,6 +3417,32 @@ app.get('/api/admin/onchain/status', adminAuth, requirePermission('deposits'), a
       gasReserveLowThreshold: GAS_RESERVE_LOW_THRESHOLD,
       gasReserveLow: gasReserveBnbBalance!=null ? parseFloat(gasReserveBnbBalance) < GAS_RESERVE_LOW_THRESHOLD : null,
       sweptCount, unsweptCount,
+    }});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── Withdrawal Wallet status (semi-automated payout) ──────────────────────
+app.get('/api/admin/withdrawal-wallet/status', adminAuth, requirePermission('withdrawals'), async (req,res) => {
+  try {
+    const enabled = !!(withdrawalWallet && bscProvider);
+    let address = null, usdtBalance = null, bnbBalance = null;
+    if (enabled) {
+      address = withdrawalWallet.address;
+      try {
+        const usdt = new ethers.Contract(USDT_BEP20_CONTRACT, ['function balanceOf(address) view returns (uint256)'], bscProvider);
+        usdtBalance = ethers.formatUnits(await usdt.balanceOf(address), USDT_DECIMALS);
+      } catch(e){}
+      try { bnbBalance = ethers.formatEther(await bscProvider.getBalance(address)); } catch(e){}
+    }
+    const { rows:[{count:pendingCount}] } = await db(`SELECT COUNT(*)::int AS count FROM transactions WHERE type='withdrawal' AND status='pending'`);
+    const { rows:[{sum:pendingTotal}] } = await db(`SELECT COALESCE(SUM(amount),0)::float AS sum FROM transactions WHERE type='withdrawal' AND status='pending'`);
+    const { rows:[{count:paidCount}] } = await db(`SELECT COUNT(*)::int AS count FROM transactions WHERE type='withdrawal' AND status='paid'`);
+    res.json({success:true,data:{
+      enabled, address, usdtBalance, bnbBalance,
+      gasMinBnb: WITHDRAWAL_GAS_MIN_BNB,
+      lowUsdt: usdtBalance!=null ? parseFloat(usdtBalance) < parseFloat(pendingTotal||0) : null,
+      lowGas: bnbBalance!=null ? parseFloat(bnbBalance) < WITHDRAWAL_GAS_MIN_BNB : null,
+      pendingCount, pendingTotal, paidCount,
     }});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
@@ -3474,8 +3590,11 @@ app.get('/api/admin/withdrawals/export', adminAuth, requirePermission('withdrawa
 
 app.put('/api/admin/withdrawals/:id/approve', adminAuth, requirePermission('withdrawals'), async (req,res) => {
   try {
+    // Atomically claim it first — 'processing' is a brief transitional state
+    // that closes the double-click/two-admin race: only one request can flip
+    // pending→processing, so only one can ever reach the send step below.
     const {rows:[tx]} = await db(
-      `UPDATE transactions SET status='approved', reviewed_by=$1, reviewed_at=NOW()
+      `UPDATE transactions SET status='processing', reviewed_by=$1, reviewed_at=NOW()
        WHERE id=$2 AND type='withdrawal' AND status='pending' RETURNING *`,
       [req.admin.id, req.params.id]);
     if (!tx) {
@@ -3483,9 +3602,37 @@ app.put('/api/admin/withdrawals/:id/approve', adminAuth, requirePermission('with
       if (!existing) return res.status(404).json({success:false,message:'Withdrawal not found'});
       return res.status(400).json({success:false,message:'Only pending withdrawals can be approved'});
     }
-    await notif(tx.user_id,'withdrawal','Withdrawal Approved','Your withdrawal has been approved and will be paid out shortly.');
-    await logAdmin(req.admin.id, `Approved withdrawal $${tx.amount}`, {withdrawalId:req.params.id,userId:tx.user_id});
-    res.json({success:true,message:'Withdrawal approved'});
+
+    const meta = tx.meta || {};
+
+    if (!withdrawalWallet) {
+      // No auto-payout configured — same manual flow as before: mark approved,
+      // admin sends it themselves and later calls PUT .../paid with the tx id.
+      await db(`UPDATE transactions SET status='approved' WHERE id=$1`, [req.params.id]);
+      await notif(tx.user_id,'withdrawal','Withdrawal Approved','Your withdrawal has been approved and will be paid out shortly.');
+      await logAdmin(req.admin.id, `Approved withdrawal $${tx.amount} (manual payout)`, {withdrawalId:req.params.id,userId:tx.user_id});
+      return res.json({success:true,message:'Withdrawal approved (manual payout — send it yourself, then mark paid)'});
+    }
+
+    // Auto-payout path — sends the exact net amount the user was quoted, straight to their bound address.
+    try {
+      const txHash = await sendWithdrawalPayout(meta.walletAddress, parseFloat(tx.amount));
+      await db(
+        `UPDATE transactions SET status='paid', meta=$1, reviewed_by=$2, reviewed_at=NOW() WHERE id=$3`,
+        [JSON.stringify({...meta, payoutTxHash:txHash, autoSent:true}), req.admin.id, req.params.id]);
+      await notif(tx.user_id,'withdrawal','Withdrawal Paid',`$${tx.amount} USDT (BEP20) has been sent. TX: ${txHash}`);
+      await logAdmin(req.admin.id, `Approved + auto-paid withdrawal $${tx.amount}`, {withdrawalId:req.params.id,userId:tx.user_id,txHash});
+      res.json({success:true,message:`Approved and sent automatically! $${tx.amount} USDT paid out.`,data:{txHash}});
+    } catch (sendErr) {
+      // Revert to pending (not stuck in 'processing') so it can simply be
+      // retried once the withdrawal wallet is topped up — nothing was lost,
+      // the user's balance was already debited at submission time and stays that way.
+      await db(
+        `UPDATE transactions SET status='pending', meta=$1 WHERE id=$2`,
+        [JSON.stringify({...meta, lastSendError:sendErr.message}), req.params.id]);
+      await logAdmin(req.admin.id, `Auto-payout failed for withdrawal $${tx.amount}`, {withdrawalId:req.params.id,userId:tx.user_id,error:sendErr.message});
+      res.status(400).json({success:false,message:'Approve failed — ' + sendErr.message + '. Top up the Withdrawal Wallet and try again.'});
+    }
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
@@ -3521,14 +3668,16 @@ app.put('/api/admin/withdrawals/:id/paid', adminAuth, requirePermission('withdra
     const {rows:[existingTx]} = await db(`SELECT * FROM transactions WHERE id=$1 AND type='withdrawal'`,[req.params.id]);
     if (!existingTx) return res.status(404).json({success:false,message:'Withdrawal not found'});
     if (existingTx.status !== 'approved') return res.status(400).json({success:false,message:'Only approved withdrawals can be marked paid'});
-    const meta = { ...(existingTx.meta||{}), payoutTxnId };
+    // Stored as payoutTxHash — the SAME key the auto-payout path uses — so the
+    // admin UI can read one consistent field regardless of which path paid it.
+    const meta = { ...(existingTx.meta||{}), payoutTxHash:payoutTxnId };
     const {rows:[tx]} = await db(
       `UPDATE transactions SET status='paid', meta=$1, reviewed_by=$2, reviewed_at=NOW()
        WHERE id=$3 AND status='approved' RETURNING *`,
       [JSON.stringify(meta), req.admin.id, req.params.id]);
     if (!tx) return res.status(400).json({success:false,message:'Only approved withdrawals can be marked paid'});
-    await notif(tx.user_id,'withdrawal','Withdrawal Paid',`$${tx.amount} USDT (BEP20) has been sent. TXN: ${payoutTxnId}`);
-    await logAdmin(req.admin.id, `Marked withdrawal paid $${tx.amount}`, {withdrawalId:req.params.id,userId:tx.user_id,payoutTxnId});
+    await notif(tx.user_id,'withdrawal','Withdrawal Paid',`$${tx.amount} USDT (BEP20) has been sent. TX: ${payoutTxnId}`);
+    await logAdmin(req.admin.id, `Marked withdrawal paid $${tx.amount}`, {withdrawalId:req.params.id,userId:tx.user_id,payoutTxHash:payoutTxnId});
     res.json({success:true,message:'Withdrawal marked as paid'});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
@@ -3537,18 +3686,33 @@ app.post('/api/admin/withdrawals/bulk-approve', adminAuth, requirePermission('wi
   try {
     const { ids } = req.body;
     if (!Array.isArray(ids) || !ids.length) return res.status(400).json({success:false,message:'No withdrawals selected'});
-    let approved = 0, skipped = 0;
+    let approved = 0, skipped = 0, failed = 0;
     for (const id of ids) {
       const {rows:[tx]} = await db(
-        `UPDATE transactions SET status='approved', reviewed_by=$1, reviewed_at=NOW()
+        `UPDATE transactions SET status='processing', reviewed_by=$1, reviewed_at=NOW()
          WHERE id=$2 AND type='withdrawal' AND status='pending' RETURNING *`,
         [req.admin.id, id]);
       if (!tx) { skipped++; continue; }
-      await notif(tx.user_id,'withdrawal','Withdrawal Approved','Your withdrawal has been approved and will be paid out shortly.');
-      approved++;
+      const meta = tx.meta || {};
+      if (!withdrawalWallet) {
+        await db(`UPDATE transactions SET status='approved' WHERE id=$1`, [id]);
+        await notif(tx.user_id,'withdrawal','Withdrawal Approved','Your withdrawal has been approved and will be paid out shortly.');
+        approved++;
+        continue;
+      }
+      try {
+        const txHash = await sendWithdrawalPayout(meta.walletAddress, parseFloat(tx.amount));
+        await db(`UPDATE transactions SET status='paid', meta=$1, reviewed_by=$2, reviewed_at=NOW() WHERE id=$3`,
+          [JSON.stringify({...meta, payoutTxHash:txHash, autoSent:true}), req.admin.id, id]);
+        await notif(tx.user_id,'withdrawal','Withdrawal Paid',`$${tx.amount} USDT (BEP20) has been sent. TX: ${txHash}`);
+        approved++;
+      } catch (sendErr) {
+        await db(`UPDATE transactions SET status='pending', meta=$1 WHERE id=$2`, [JSON.stringify({...meta, lastSendError:sendErr.message}), id]);
+        failed++;
+      }
     }
-    await logAdmin(req.admin.id, `Bulk-approved ${approved} withdrawal(s)`, {ids, skipped});
-    res.json({success:true,message:`${approved} withdrawal(s) approved${skipped?`, ${skipped} skipped (not pending)`:''}`,data:{approved,skipped}});
+    await logAdmin(req.admin.id, `Bulk-approved ${approved} withdrawal(s)`, {ids, skipped, failed});
+    res.json({success:true,message:`${approved} paid out${failed?`, ${failed} failed (insufficient funds — check Withdrawal Wallet)`:''}${skipped?`, ${skipped} skipped (not pending)`:''}`,data:{approved,skipped,failed}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
