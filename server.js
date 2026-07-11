@@ -545,6 +545,10 @@ const initDB = async () => {
       claimed_at              TIMESTAMPTZ,
       created_at              TIMESTAMPTZ DEFAULT NOW()
     );
+    -- Daily investment profit now accrues here instead of going straight into
+    -- balance — the user must tap "Collect" to move it into their withdrawable
+    -- balance (same pattern already used for pending_earnings/referral commission).
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS pending_profit NUMERIC(14,2) DEFAULT 0;
     -- Tracks the last time each investment was credited its daily profit, so the
     -- cron only pays out once per real 24h window per investment — not once per
     -- server restart (previous behavior over-credited on frequent Render restarts
@@ -1759,7 +1763,7 @@ app.get('/api/user/dashboard', auth, async (req,res) => {
       db('SELECT * FROM transactions WHERE user_id=$1 ORDER BY created_at DESC LIMIT 5',[req.user.id]),
     ]);
     const user=cc(u);
-    res.json({success:true,data:{user:safe(user),balance:user.balance,pendingEarnings:user.pendingEarnings,totalDeposited:user.totalDeposited,totalWithdrawn:user.totalWithdrawn,activeInvestments:ccAll(inv),recentTransactions:ccAll(tx)}});
+    res.json({success:true,data:{user:safe(user),balance:user.balance,pendingEarnings:user.pendingEarnings,pendingProfit:user.pendingProfit,totalDeposited:user.totalDeposited,totalWithdrawn:user.totalWithdrawn,activeInvestments:ccAll(inv),recentTransactions:ccAll(tx)}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
@@ -2219,6 +2223,28 @@ app.post('/api/referral/collect', auth, async (req,res) => {
     if (amount<=0) return res.status(400).json({success:false,message:'No earnings to collect'});
     await db('UPDATE users SET balance=balance+$1,pending_earnings=0 WHERE id=$2',[amount,req.user.id]);
     await db(`INSERT INTO transactions(user_id,type,amount,description) VALUES($1,'commission',$2,'Referral commission collected')`,[req.user.id,amount]);
+    res.json({success:true,message:`$${amount.toFixed(2)} collected!`,data:{collected:amount,newBalance:parseFloat(u.balance)+amount}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── Investment profit: view pending / manually collect ─────────────────────
+// Daily profit no longer auto-lands in balance (see runDailyProfits) — it sits
+// in pending_profit until the user taps Collect here, same pattern as referral
+// commission collection above.
+app.get('/api/investments/pending-profit', auth, async (req,res) => {
+  try {
+    const {rows:[u]}=await db('SELECT pending_profit FROM users WHERE id=$1',[req.user.id]);
+    res.json({success:true,data:{pending:+parseFloat(u.pending_profit).toFixed(2)}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.post('/api/investments/collect-profit', auth, async (req,res) => {
+  try {
+    const {rows:[u]}=await db('SELECT pending_profit,balance FROM users WHERE id=$1',[req.user.id]);
+    const amount=parseFloat(u.pending_profit);
+    if (amount<=0) return res.status(400).json({success:false,message:'No profit to collect'});
+    await db('UPDATE users SET balance=balance+$1,pending_profit=0 WHERE id=$2',[amount,req.user.id]);
+    await db(`INSERT INTO transactions(user_id,type,amount,description) VALUES($1,'profit',$2,'Daily investment profit collected')`,[req.user.id,amount]);
     res.json({success:true,message:`$${amount.toFixed(2)} collected!`,data:{collected:amount,newBalance:parseFloat(u.balance)+amount}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
@@ -5091,9 +5117,13 @@ const runDailyProfits = async () => {
     );
     let count = 0;
     for (const inv of rows) {
-      // Credit daily income to user balance
+      // Accrue into pending_profit — NOT balance. The user must tap "Collect"
+      // on the dashboard to move this into their withdrawable balance (mirrors
+      // the existing referral-commission pending_earnings/collect flow). No
+      // transaction row is written here; one is written at collect time,
+      // same as commission collection.
       await db(
-        `UPDATE users SET balance=balance+$1 WHERE id=$2`,
+        `UPDATE users SET pending_profit=pending_profit+$1 WHERE id=$2`,
         [inv.daily_income, inv.user_id]
       );
       // Update investment progress
@@ -5101,17 +5131,9 @@ const runDailyProfits = async () => {
         `UPDATE investments SET days_elapsed=days_elapsed+1, earned_so_far=earned_so_far+$1, last_credit_at=NOW() WHERE id=$2`,
         [inv.daily_income, inv.id]
       );
-      // Record transaction
-      await db(
-        `INSERT INTO transactions(user_id,type,amount,description,meta)
-         VALUES($1,'profit',$2,$3,$4)`,
-        [inv.user_id, inv.daily_income,
-         `Daily profit — ${inv.plan_name}`,
-         JSON.stringify({ investmentId: inv.id, planId: inv.plan_id })]
-      );
       // Send notification
-      await notif(inv.user_id, 'profit', 'Daily profit credited 💰',
-        `$${parseFloat(inv.daily_income).toFixed(2)} from ${inv.plan_name}`);
+      await notif(inv.user_id, 'profit', 'Daily profit ready to collect 💰',
+        `$${parseFloat(inv.daily_income).toFixed(2)} from ${inv.plan_name} — tap Collect to add it to your balance.`);
       // Mark completed if all days done
       await db(
         `UPDATE investments SET status='completed'
