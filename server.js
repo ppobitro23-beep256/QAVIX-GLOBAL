@@ -545,6 +545,12 @@ const initDB = async () => {
       claimed_at              TIMESTAMPTZ,
       created_at              TIMESTAMPTZ DEFAULT NOW()
     );
+    -- Tracks the last time each investment was credited its daily profit, so the
+    -- cron only pays out once per real 24h window per investment — not once per
+    -- server restart (previous behavior over-credited on frequent Render restarts
+    -- and could pay profit within seconds of purchase).
+    ALTER TABLE investments ADD COLUMN IF NOT EXISTS last_credit_at TIMESTAMPTZ DEFAULT NOW();
+    UPDATE investments SET last_credit_at = COALESCE(last_credit_at, start_date, created_at, NOW()) WHERE last_credit_at IS NULL;
     -- Safe migrations in case these tables already exist from an earlier deploy —
     -- must run BEFORE any CREATE INDEX that references these columns.
     ALTER TABLE lottery_prizes ADD COLUMN IF NOT EXISTS task_title VARCHAR(150);
@@ -5073,8 +5079,15 @@ const runDailyProfits = async () => {
        WHERE status='active' AND end_date <= NOW()`
     );
 
+    // Only pick up investments where a full 24h has actually passed since the
+    // last credit (or since purchase, for the first credit). This is what makes
+    // profit start 24h after buying instead of instantly, and also prevents
+    // over-crediting when the server restarts/redeploys multiple times a day —
+    // each investment is credited on its own clock, not the server's uptime.
     const { rows } = await db(
-      `SELECT * FROM investments WHERE status='active' AND end_date > NOW()`
+      `SELECT * FROM investments
+       WHERE status='active' AND end_date > NOW()
+       AND last_credit_at <= NOW() - INTERVAL '24 hours'`
     );
     let count = 0;
     for (const inv of rows) {
@@ -5085,7 +5098,7 @@ const runDailyProfits = async () => {
       );
       // Update investment progress
       await db(
-        `UPDATE investments SET days_elapsed=days_elapsed+1, earned_so_far=earned_so_far+$1 WHERE id=$2`,
+        `UPDATE investments SET days_elapsed=days_elapsed+1, earned_so_far=earned_so_far+$1, last_credit_at=NOW() WHERE id=$2`,
         [inv.daily_income, inv.id]
       );
       // Record transaction
@@ -5173,10 +5186,13 @@ initDB().then(async ()=>{
     registerTgWebhook(appUrl);
   });
 
-  // Run daily profits every 24 hours
-  // First run 10s after startup (catches up if server was down)
+  // Check for due profit credits every hour. The query inside runDailyProfits
+  // only credits an investment once its OWN 24h window has elapsed (see
+  // last_credit_at check above), so running this hourly just means each
+  // investment gets paid within an hour of its true 24h mark — it does NOT
+  // cause extra/duplicate payouts, and it's safe across server restarts.
   setTimeout(runDailyProfits, 10_000);
-  setInterval(runDailyProfits, 24 * 60 * 60 * 1000);
+  setInterval(runDailyProfits, 60 * 60 * 1000);
 
   // Daily automatic backup → sent to admin Telegram (no persistent disk needed on Render)
   const runDailyBackup = async () => {
