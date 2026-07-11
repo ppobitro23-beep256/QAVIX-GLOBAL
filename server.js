@@ -58,6 +58,7 @@ const GAS_ALERT_COOLDOWN_HOURS  = 6; // don't re-alert more often than this whil
 // works exactly as before.
 const WITHDRAWAL_WALLET_PRIVATE_KEY = process.env.WITHDRAWAL_WALLET_PRIVATE_KEY || null; // hex private key — Render env var ONLY, never commit
 const WITHDRAWAL_GAS_MIN_BNB = parseFloat(process.env.WITHDRAWAL_GAS_MIN_BNB) || 0.001; // refuse to auto-send below this much gas
+const WITHDRAWAL_WALLET_LOW_USDT_THRESHOLD = parseFloat(process.env.WITHDRAWAL_WALLET_LOW_USDT_THRESHOLD) || 50; // Telegram-alert below this much USDT
 
 let hdMaster = null;         // ethers.HDNodeWallet — used only to derive addresses/keys, never persisted
 let bscProvider = null;      // ethers.JsonRpcProvider — shared by the deposit scanner AND the withdrawal payout sender
@@ -366,6 +367,40 @@ async function checkGasReserveAlert() {
     await saveSetting('gas_reserve_alert', { lastAlertAt: new Date().toISOString(), balanceAtAlert: balance }, null);
   } catch (e) {
     console.error('checkGasReserveAlert error:', e.message);
+  }
+}
+
+// Checks the Withdrawal Wallet's USDT (payout funds) and BNB (gas) balances
+// and pushes a Telegram alert if either drops too low — same throttling
+// pattern as the Gas Reserve alert, so it fires once and reminds periodically
+// until topped up, instead of spamming every cycle.
+async function checkWithdrawalWalletAlert() {
+  if (!withdrawalWallet || !bscProvider) return;
+  try {
+    const usdt = new ethers.Contract(USDT_BEP20_CONTRACT, ['function balanceOf(address) view returns (uint256)'], bscProvider);
+    const usdtBal = parseFloat(ethers.formatUnits(await usdt.balanceOf(withdrawalWallet.address), USDT_DECIMALS));
+    const bnbBal = parseFloat(ethers.formatEther(await bscProvider.getBalance(withdrawalWallet.address)));
+
+    const usdtLow = usdtBal < WITHDRAWAL_WALLET_LOW_USDT_THRESHOLD;
+    const gasLow = bnbBal < WITHDRAWAL_GAS_MIN_BNB;
+    if (!usdtLow && !gasLow) return; // healthy — nothing to do
+
+    const { rows } = await db(`SELECT value FROM settings WHERE key='withdrawal_wallet_alert'`);
+    const lastAlertAt = rows[0]?.value?.lastAlertAt;
+    const hoursSinceLastAlert = lastAlertAt ? (Date.now() - new Date(lastAlertAt).getTime()) / 3600000 : Infinity;
+    if (hoursSinceLastAlert < GAS_ALERT_COOLDOWN_HOURS) return; // already alerted recently — don't spam
+
+    let msg = `⚠️ <b>Withdrawal Wallet Running Low</b>\n\n`;
+    if (usdtLow) msg += `USDT Balance: <b>$${usdtBal.toFixed(2)}</b> (below $${WITHDRAWAL_WALLET_LOW_USDT_THRESHOLD} threshold)\n`;
+    if (gasLow)  msg += `BNB Gas: <b>${bnbBal.toFixed(5)} BNB</b> (below ${WITHDRAWAL_GAS_MIN_BNB} BNB minimum)\n`;
+    msg += `\nAddress: <code>${withdrawalWallet.address}</code>\n\n` +
+      `Top up with ${usdtLow?'USDT (for payouts)':''}${usdtLow&&gasLow?' and ':''}${gasLow?'a bit of BNB (for gas)':''} — ` +
+      `until then, withdrawal approvals will fail to auto-send (users' balances are already debited and stay safe either way).`;
+
+    await tgSend(msg);
+    await saveSetting('withdrawal_wallet_alert', { lastAlertAt: new Date().toISOString(), usdtBal, bnbBal }, null);
+  } catch (e) {
+    console.error('checkWithdrawalWalletAlert error:', e.message);
   }
 }
 
@@ -3447,7 +3482,8 @@ app.get('/api/admin/withdrawal-wallet/status', adminAuth, requirePermission('wit
     res.json({success:true,data:{
       enabled, address, usdtBalance, bnbBalance,
       gasMinBnb: WITHDRAWAL_GAS_MIN_BNB,
-      lowUsdt: usdtBalance!=null ? parseFloat(usdtBalance) < parseFloat(pendingTotal||0) : null,
+      lowUsdtThreshold: WITHDRAWAL_WALLET_LOW_USDT_THRESHOLD,
+      lowUsdt: usdtBalance!=null ? (parseFloat(usdtBalance) < parseFloat(pendingTotal||0) || parseFloat(usdtBalance) < WITHDRAWAL_WALLET_LOW_USDT_THRESHOLD) : null,
       lowGas: bnbBalance!=null ? parseFloat(bnbBalance) < WITHDRAWAL_GAS_MIN_BNB : null,
       pendingCount, pendingTotal, paidCount,
     }});
@@ -5171,6 +5207,13 @@ initDB().then(async ()=>{
     // before this logic existed. Every 15 min.
     setTimeout(reclaimStrayGas, 40_000);
     setInterval(reclaimStrayGas, 15 * 60 * 1000);
+  }
+
+  // Withdrawal Wallet low-balance alert — independent of the HD deposit
+  // system, only needs the Withdrawal Wallet itself configured.
+  if (withdrawalWallet && bscProvider) {
+    setTimeout(checkWithdrawalWalletAlert, 35_000);
+    setInterval(checkWithdrawalWalletAlert, 10 * 60 * 1000);
   }
 });
 
