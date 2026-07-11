@@ -850,6 +850,19 @@ const initDB = async () => {
       updated_at  TIMESTAMPTZ DEFAULT NOW()
     );
 
+    -- Stores the single downloadable Whitepaper PDF as a binary blob so it can
+    -- be uploaded/replaced from the admin panel with no redeploy. Single-row
+    -- table (id always 1) since there's only ever one active whitepaper file.
+    CREATE TABLE IF NOT EXISTS whitepaper (
+      id           INTEGER PRIMARY KEY DEFAULT 1,
+      filename     VARCHAR(255) NOT NULL,
+      file_data    BYTEA NOT NULL,
+      file_size    INTEGER NOT NULL,
+      uploaded_by  UUID REFERENCES admins(id) ON DELETE SET NULL,
+      uploaded_at  TIMESTAMPTZ DEFAULT NOW(),
+      CONSTRAINT whitepaper_single_row CHECK (id = 1)
+    );
+
     -- ── Reports gap-fill: manual loss/bad-debt entries (Loss Report) ────────
     CREATE TABLE IF NOT EXISTS loss_entries (
       id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -1592,6 +1605,28 @@ app.get('/api/content/pages/:slug', async (req,res) => {
     const {rows} = await db('SELECT slug,title,body,updated_at FROM content_pages WHERE slug=$1',[req.params.slug]);
     if (!rows[0]) return res.status(404).json({success:false,message:'Page not found'});
     res.json({success:true,data:{page:cc(rows[0])}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// Metadata only (no binary) — lets the frontend know whether a whitepaper has
+// been uploaded yet and show its filename/size without downloading the file.
+app.get('/api/content/whitepaper', async (req,res) => {
+  try {
+    const {rows} = await db('SELECT filename, file_size, uploaded_at FROM whitepaper WHERE id=1');
+    if (!rows[0]) return res.json({success:true,data:{exists:false}});
+    res.json({success:true,data:{exists:true, ...cc(rows[0])}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// Streams the actual PDF for download. Public — no auth needed to read a
+// whitepaper, same as any other marketing document.
+app.get('/api/content/whitepaper/file', async (req,res) => {
+  try {
+    const {rows} = await db('SELECT filename, file_data FROM whitepaper WHERE id=1');
+    if (!rows[0]) return res.status(404).json({success:false,message:'Whitepaper not available yet'});
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${rows[0].filename.replace(/"/g,'')}"`);
+    res.send(rows[0].file_data);
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
@@ -5071,6 +5106,30 @@ app.put('/api/admin/content/pages/:slug', adminAuth, requireRole('Super Admin','
     res.json({success:true,message:'Page saved',data:{page:cc(p)}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
+
+// Whitepaper PDF upload — auth/permission checks run BEFORE the raw-body
+// parser so an unauthenticated request never gets to consume a large payload.
+// express.raw() only engages for Content-Type: application/pdf, so this can't
+// collide with the global express.json({limit:'10kb'}) parser used elsewhere.
+app.post('/api/admin/content/whitepaper', adminAuth, requirePermission('content'),
+  express.raw({ type: 'application/pdf', limit: '15mb' }),
+  async (req,res) => {
+    try {
+      if (!req.body || !req.body.length) return res.status(400).json({success:false,message:'No file data received'});
+      if (req.body.slice(0,4).toString('ascii') !== '%PDF') return res.status(400).json({success:false,message:'That file does not appear to be a valid PDF'});
+      const rawName = (req.query.filename || 'QAVIX-GLOBAL-Whitepaper.pdf').toString();
+      const filename = rawName.replace(/[^\w\-. ]/g,'_').slice(0,200) || 'whitepaper.pdf';
+      await db(
+        `INSERT INTO whitepaper(id,filename,file_data,file_size,uploaded_by,uploaded_at)
+         VALUES(1,$1,$2,$3,$4,NOW())
+         ON CONFLICT (id) DO UPDATE SET filename=$1, file_data=$2, file_size=$3, uploaded_by=$4, uploaded_at=NOW()`,
+        [filename, req.body, req.body.length, req.admin.id]
+      );
+      await logAdmin(req.admin.id, `Uploaded whitepaper: ${filename} (${(req.body.length/1024).toFixed(0)} KB)`);
+      res.json({success:true,message:'Whitepaper uploaded successfully'});
+    } catch(e){res.status(500).json({success:false,message:e.message});}
+  }
+);
 
 // ── Phase 7: Backup ─────────────────────────────────────────────────────────
 // Render's free/standard web service has no persistent disk, so backups are
