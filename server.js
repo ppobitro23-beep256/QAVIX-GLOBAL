@@ -549,6 +549,12 @@ const initDB = async () => {
     -- balance — the user must tap "Collect" to move it into their withdrawable
     -- balance (same pattern already used for pending_earnings/referral commission).
     ALTER TABLE users ADD COLUMN IF NOT EXISTS pending_profit NUMERIC(14,2) DEFAULT 0;
+    -- "Today's Profit" dashboard stat: how much was actually credited during
+    -- today's Singapore-time calendar day. Resets to 0 the moment the SGT date
+    -- rolls over (checked at read-time in /api/user/dashboard — no separate
+    -- midnight cron needed).
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS today_profit_amount NUMERIC(14,2) DEFAULT 0;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS today_profit_date VARCHAR(10);
     -- Tracks the last time each investment was credited its daily profit, so the
     -- cron only pays out once per real 24h window per investment — not once per
     -- server restart (previous behavior over-credited on frequent Render restarts
@@ -954,6 +960,11 @@ const ccAll  = (rows) => rows.map(cc);
 const safe   = (u) => { const r={...u}; delete r.password; r.hasWithdrawalPass = !!r.withdrawalPass; delete r.withdrawalPass; return r; };
 const notif  = (uid,type,title,body='') =>
   db('INSERT INTO notifications(user_id,type,title,body) VALUES($1,$2,$3,$4)',[uid,type,title,body]).catch(()=>{});
+
+// "Today's Profit" resets at midnight Singapore time (SGT, UTC+8, no DST) —
+// this returns today's SGT calendar date as 'YYYY-MM-DD', used to detect the
+// day rolling over regardless of what timezone the server itself runs in.
+const sgtDateString = () => new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Singapore' });
 
 // ── Brevo HTTP API Email Service ─────────────────────────────────────────
 // NOTE: Render free plan blocks outbound SMTP — HTTP API only
@@ -1763,7 +1774,11 @@ app.get('/api/user/dashboard', auth, async (req,res) => {
       db('SELECT * FROM transactions WHERE user_id=$1 ORDER BY created_at DESC LIMIT 5',[req.user.id]),
     ]);
     const user=cc(u);
-    res.json({success:true,data:{user:safe(user),balance:user.balance,pendingEarnings:user.pendingEarnings,pendingProfit:user.pendingProfit,totalDeposited:user.totalDeposited,totalWithdrawn:user.totalWithdrawn,activeInvestments:ccAll(inv),recentTransactions:ccAll(tx)}});
+    // "Today's Profit" only counts if it was accrued on today's Singapore-time
+    // calendar date — otherwise the day has rolled over and it reads as 0,
+    // with no separate midnight cron needed to explicitly zero it out.
+    const todayProfit = (user.todayProfitDate === sgtDateString()) ? parseFloat(user.todayProfitAmount||0) : 0;
+    res.json({success:true,data:{user:safe(user),balance:user.balance,pendingEarnings:user.pendingEarnings,pendingProfit:user.pendingProfit,todayProfit:+todayProfit.toFixed(2),totalDeposited:user.totalDeposited,totalWithdrawn:user.totalWithdrawn,activeInvestments:ccAll(inv),recentTransactions:ccAll(tx)}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
@@ -5122,9 +5137,17 @@ const runDailyProfits = async () => {
       // the existing referral-commission pending_earnings/collect flow). No
       // transaction row is written here; one is written at collect time,
       // same as commission collection.
+      // Also accumulate today_profit_amount for the "Today's Profit" stat,
+      // resetting it automatically when the Singapore-time calendar day has
+      // rolled over since the last credit.
+      const today = sgtDateString();
       await db(
-        `UPDATE users SET pending_profit=pending_profit+$1 WHERE id=$2`,
-        [inv.daily_income, inv.user_id]
+        `UPDATE users SET
+           pending_profit = pending_profit + $1,
+           today_profit_amount = CASE WHEN today_profit_date = $2 THEN today_profit_amount + $1 ELSE $1 END,
+           today_profit_date = $2
+         WHERE id=$3`,
+        [inv.daily_income, today, inv.user_id]
       );
       // Update investment progress
       await db(
