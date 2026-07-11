@@ -3757,18 +3757,46 @@ app.put('/api/admin/withdrawals/:id/paid', adminAuth, requirePermission('withdra
     if (!payoutTxnId) return res.status(400).json({success:false,message:'Payout transaction ID required'});
     const {rows:[existingTx]} = await db(`SELECT * FROM transactions WHERE id=$1 AND type='withdrawal'`,[req.params.id]);
     if (!existingTx) return res.status(404).json({success:false,message:'Withdrawal not found'});
-    if (existingTx.status !== 'approved') return res.status(400).json({success:false,message:'Only approved withdrawals can be marked paid'});
+    // Also allow this for a withdrawal stuck in 'processing' — e.g. the server
+    // crashed/restarted mid-send and the row never reached 'approved'/'paid'.
+    // Admin verifies on BscScan that the payout actually went out, then records
+    // the real tx hash here rather than resending (which would double-pay).
+    if (existingTx.status !== 'approved' && existingTx.status !== 'processing') return res.status(400).json({success:false,message:'Only approved or stuck-processing withdrawals can be marked paid'});
     // Stored as payoutTxHash — the SAME key the auto-payout path uses — so the
     // admin UI can read one consistent field regardless of which path paid it.
     const meta = { ...(existingTx.meta||{}), payoutTxHash:payoutTxnId };
     const {rows:[tx]} = await db(
       `UPDATE transactions SET status='paid', meta=$1, reviewed_by=$2, reviewed_at=NOW()
-       WHERE id=$3 AND status='approved' RETURNING *`,
+       WHERE id=$3 AND status IN ('approved','processing') RETURNING *`,
       [JSON.stringify(meta), req.admin.id, req.params.id]);
-    if (!tx) return res.status(400).json({success:false,message:'Only approved withdrawals can be marked paid'});
+    if (!tx) return res.status(400).json({success:false,message:'Only approved or stuck-processing withdrawals can be marked paid'});
     await notif(tx.user_id,'withdrawal','Withdrawal Paid',`$${tx.amount} USDT (BEP20) has been sent. TX: ${payoutTxnId}`);
     await logAdmin(req.admin.id, `Marked withdrawal paid $${tx.amount}`, {withdrawalId:req.params.id,userId:tx.user_id,payoutTxHash:payoutTxnId});
     res.json({success:true,message:'Withdrawal marked as paid'});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// A withdrawal can get stuck permanently in 'processing' if the server
+// crashes/restarts in the exact window between the pending->processing claim
+// and the send finishing (the normal error-handling revert in the /approve
+// route never runs in that case). There was previously no way to recover from
+// this in the admin UI. This lets an admin manually send it back to 'pending'
+// so it becomes retryable — ONLY use after confirming on BscScan that nothing
+// was actually sent, otherwise use the "mark paid" flow above instead to avoid
+// a double payout.
+app.put('/api/admin/withdrawals/:id/force-reset', adminAuth, requirePermission('withdrawals'), async (req,res) => {
+  try {
+    const {rows:[existingTx]} = await db(`SELECT * FROM transactions WHERE id=$1 AND type='withdrawal'`,[req.params.id]);
+    if (!existingTx) return res.status(404).json({success:false,message:'Withdrawal not found'});
+    if (existingTx.status !== 'processing') return res.status(400).json({success:false,message:'Only withdrawals stuck in processing can be force-reset'});
+    const meta = { ...(existingTx.meta||{}), forceResetBy:req.admin.id, forceResetAt:new Date().toISOString() };
+    const {rows:[tx]} = await db(
+      `UPDATE transactions SET status='pending', meta=$1
+       WHERE id=$2 AND status='processing' RETURNING *`,
+      [JSON.stringify(meta), req.params.id]);
+    if (!tx) return res.status(400).json({success:false,message:'Only withdrawals stuck in processing can be force-reset'});
+    await logAdmin(req.admin.id, `Force-reset stuck withdrawal $${tx.amount} back to pending`, {withdrawalId:req.params.id,userId:tx.user_id});
+    res.json({success:true,message:'Reset to pending — you can now approve/retry it.'});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
