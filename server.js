@@ -186,7 +186,7 @@ async function scanOnchainDeposits() {
             [match.userId, log.transactionHash, logIndex, log.args.from, toAddr, amount, log.blockNumber, log.args.value.toString()]);
           if (!inserted.length) continue; // already processed this exact log before — skip, never double-credit
           await db('UPDATE users SET balance=balance+$1, total_deposited=total_deposited+$1 WHERE id=$2', [amount, match.userId]);
-          await db(`INSERT INTO transactions(user_id,type,amount,status,description,meta) VALUES($1,'deposit',$2,'completed',$3,$4)`,
+          await db(`INSERT INTO transactions(user_id,type,amount,status,description,meta,reviewed_at) VALUES($1,'deposit',$2,'approved',$3,$4,NOW())`,
             [match.userId, amount, `Auto-detected deposit (${LIVE_PAYMENT.network||'BEP20'})`, JSON.stringify({network:LIVE_PAYMENT.network||'BEP20', txHash:log.transactionHash, auto:true})]);
           await notif(match.userId, 'deposit', 'Deposit Received', `$${amount.toFixed(2)} USDT detected on-chain and credited to your balance automatically.`);
           // Best-effort — a sweep failure (e.g. gas reserve empty) is logged
@@ -831,6 +831,13 @@ const initDB = async () => {
     ALTER TABLE transactions ADD COLUMN IF NOT EXISTS reviewed_by UUID REFERENCES admins(id) ON DELETE SET NULL;
     ALTER TABLE transactions ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMPTZ;
     ALTER TABLE transactions ADD COLUMN IF NOT EXISTS reject_reason TEXT;
+    -- One-time fix: earlier auto-deposits were recorded with status='completed',
+    -- a value the admin panel never recognized (it only knows pending/approved/
+    -- rejected) — they fell through its status-pill fallback and showed as
+    -- "Rejected", and were invisible in every KPI total. Safe to run every
+    -- startup: once there are no more 'completed' deposit rows, this is a no-op.
+    UPDATE transactions SET status='approved', reviewed_at=COALESCE(reviewed_at, created_at)
+      WHERE type='deposit' AND status='completed';
   `);
 
   // Link the Super Admin to their existing QAVIX GLOBAL user account.
