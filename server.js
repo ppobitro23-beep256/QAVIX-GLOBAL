@@ -561,6 +561,30 @@ const initDB = async () => {
     -- and could pay profit within seconds of purchase).
     ALTER TABLE investments ADD COLUMN IF NOT EXISTS last_credit_at TIMESTAMPTZ DEFAULT NOW();
     UPDATE investments SET last_credit_at = COALESCE(last_credit_at, start_date, created_at, NOW()) WHERE last_credit_at IS NULL;
+    -- Per-investment pending profit — each active plan now accrues and is
+    -- collected independently (its own "Claim" button on its own 24h clock),
+    -- instead of every plan's profit being dumped into one shared pool with a
+    -- single collect button for the whole account.
+    ALTER TABLE investments ADD COLUMN IF NOT EXISTS pending_profit NUMERIC(14,2) DEFAULT 0;
+    -- One-time migration: move any pre-existing pooled users.pending_profit
+    -- (from before per-investment tracking existed) onto that user's oldest
+    -- active investment so no money is lost in the switch-over. If the user
+    -- has no active investment to attach it to, credit it straight to their
+    -- balance instead. This is safe to run on every boot — after the first
+    -- run users.pending_profit is 0 for everyone, so it becomes a no-op.
+    DO $mig$
+    DECLARE r RECORD; inv_id INTEGER;
+    BEGIN
+      FOR r IN SELECT id, pending_profit FROM users WHERE pending_profit > 0 LOOP
+        SELECT id INTO inv_id FROM investments WHERE user_id = r.id AND status='active' ORDER BY created_at ASC LIMIT 1;
+        IF inv_id IS NOT NULL THEN
+          UPDATE investments SET pending_profit = pending_profit + r.pending_profit WHERE id = inv_id;
+        ELSE
+          UPDATE users SET balance = balance + r.pending_profit WHERE id = r.id;
+        END IF;
+        UPDATE users SET pending_profit = 0 WHERE id = r.id;
+      END LOOP;
+    END $mig$;
     -- Safe migrations in case these tables already exist from an earlier deploy —
     -- must run BEFORE any CREATE INDEX that references these columns.
     ALTER TABLE lottery_prizes ADD COLUMN IF NOT EXISTS task_title VARCHAR(150);
@@ -2277,25 +2301,37 @@ app.post('/api/referral/collect', auth, async (req,res) => {
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
-// ── Investment profit: view pending / manually collect ─────────────────────
-// Daily profit no longer auto-lands in balance (see runDailyProfits) — it sits
-// in pending_profit until the user taps Collect here, same pattern as referral
-// commission collection above.
-app.get('/api/investments/pending-profit', auth, async (req,res) => {
+// ── Investment profit: per-plan pending / manually collect ─────────────────
+// Each active investment accrues its own daily profit independently (own 24h
+// clock via last_credit_at) into its own pending_profit — NOT a shared pool.
+// The user taps "Claim" under that specific plan's card to move just that
+// plan's pending profit into their withdrawable balance.
+app.post('/api/investments/:id/collect-profit', auth, async (req,res) => {
   try {
-    const {rows:[u]}=await db('SELECT pending_profit FROM users WHERE id=$1',[req.user.id]);
-    res.json({success:true,data:{pending:+parseFloat(u.pending_profit).toFixed(2)}});
-  } catch(e){res.status(500).json({success:false,message:e.message});}
-});
-
-app.post('/api/investments/collect-profit', auth, async (req,res) => {
-  try {
-    const {rows:[u]}=await db('SELECT pending_profit,balance FROM users WHERE id=$1',[req.user.id]);
-    const amount=parseFloat(u.pending_profit);
+    const { rows:[inv] } = await db(
+      'SELECT * FROM investments WHERE id=$1 AND user_id=$2',
+      [req.params.id, req.user.id]
+    );
+    if (!inv) return res.status(404).json({success:false,message:'Investment not found'});
+    const amount = parseFloat(inv.pending_profit || 0);
     if (amount<=0) return res.status(400).json({success:false,message:'No profit to collect'});
-    await db('UPDATE users SET balance=balance+$1,pending_profit=0 WHERE id=$2',[amount,req.user.id]);
-    await db(`INSERT INTO transactions(user_id,type,amount,description) VALUES($1,'profit',$2,'Daily investment profit collected')`,[req.user.id,amount]);
-    res.json({success:true,message:`$${amount.toFixed(2)} collected!`,data:{collected:amount,newBalance:parseFloat(u.balance)+amount}});
+    // "Today's Profit" on the dashboard reflects profit actually moved into
+    // balance today — same same-day-accumulate pattern used elsewhere.
+    const today = sgtDateString();
+    await db('UPDATE investments SET pending_profit=0 WHERE id=$1',[inv.id]);
+    const { rows:[u] } = await db(
+      `UPDATE users SET
+         balance=balance+$1,
+         today_profit_amount = CASE WHEN today_profit_date = $2 THEN today_profit_amount + $1 ELSE $1 END,
+         today_profit_date = $2
+       WHERE id=$3 RETURNING balance`,
+      [amount, today, req.user.id]
+    );
+    await db(
+      `INSERT INTO transactions(user_id,type,amount,description) VALUES($1,'profit',$2,$3)`,
+      [req.user.id, amount, `Daily profit collected — ${inv.plan_name}`]
+    );
+    res.json({success:true,message:`$${amount.toFixed(2)} collected!`,data:{collected:amount,newBalance:parseFloat(u.balance)}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
@@ -5219,31 +5255,22 @@ const runDailyProfits = async () => {
     );
     let count = 0;
     for (const inv of rows) {
-      // Accrue into pending_profit — NOT balance. The user must tap "Collect"
-      // on the dashboard to move this into their withdrawable balance (mirrors
-      // the existing referral-commission pending_earnings/collect flow). No
-      // transaction row is written here; one is written at collect time,
-      // same as commission collection.
-      // Also accumulate today_profit_amount for the "Today's Profit" stat,
-      // resetting it automatically when the Singapore-time calendar day has
-      // rolled over since the last credit.
-      const today = sgtDateString();
+      // Accrue into this investment's OWN pending_profit — NOT balance, and
+      // NOT a shared per-user pool. Each active plan is claimed independently
+      // via its own "Claim" button, on its own 24h clock. No transaction row
+      // is written here; one is written at collect time, per-plan.
       await db(
-        `UPDATE users SET
+        `UPDATE investments SET
            pending_profit = pending_profit + $1,
-           today_profit_amount = CASE WHEN today_profit_date = $2 THEN today_profit_amount + $1 ELSE $1 END,
-           today_profit_date = $2
-         WHERE id=$3`,
-        [inv.daily_income, today, inv.user_id]
-      );
-      // Update investment progress
-      await db(
-        `UPDATE investments SET days_elapsed=days_elapsed+1, earned_so_far=earned_so_far+$1, last_credit_at=NOW() WHERE id=$2`,
+           days_elapsed = days_elapsed + 1,
+           earned_so_far = earned_so_far + $1,
+           last_credit_at = NOW()
+         WHERE id=$2`,
         [inv.daily_income, inv.id]
       );
       // Send notification
       await notif(inv.user_id, 'profit', 'Daily profit ready to collect 💰',
-        `$${parseFloat(inv.daily_income).toFixed(2)} from ${inv.plan_name} — tap Collect to add it to your balance.`);
+        `$${parseFloat(inv.daily_income).toFixed(2)} from ${inv.plan_name} — tap Claim to add it to your balance.`);
       // Mark completed if all days done
       await db(
         `UPDATE investments SET status='completed'
