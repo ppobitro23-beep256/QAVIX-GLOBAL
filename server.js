@@ -26,6 +26,41 @@ const pool = process.env.DATABASE_URL
 
 const db = (text, params) => pool.query(text, params);
 
+// ── Transactional helper ──────────────────────────────────────────────────
+// Runs several queries as ONE atomic unit on a single dedicated connection.
+// Either every statement commits, or (if anything throws) they all roll back
+// and the DB is left exactly as it was.
+//
+// This matters for money: operations like "collect profit" touch 3 tables in
+// sequence (zero pending_profit → credit balance → write transaction row). With
+// plain db() calls each one commits immediately, so a crash/redeploy/DB blip
+// between them (Render restarts are routine) could zero a user's pending profit
+// without ever crediting their balance — the money would simply vanish, with no
+// record. Wrapping in BEGIN/COMMIT makes that impossible.
+//
+// Usage:
+//   const result = await withTx(async (q) => {
+//     const { rows } = await q('UPDATE ... RETURNING *', [x]);
+//     await q('INSERT ...', [y]);
+//     return rows[0];          // returned value comes back from withTx()
+//   });
+// Throw anywhere inside and everything above it is rolled back.
+const withTx = async (fn) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const q = (text, params) => client.query(text, params);
+    const result = await fn(q);
+    await client.query('COMMIT');
+    return result;
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch (_) { /* connection already dead */ }
+    throw e;
+  } finally {
+    client.release();
+  }
+};
+
 // ═══════════════════════════════════════════════════════════════════════
 //  HD WALLET — one master seed → a unique, permanent BEP20 deposit address
 //  per user (BIP-44, same derivation as Ethereum since BSC is EVM-compatible).
@@ -181,19 +216,32 @@ async function scanOnchainDeposits() {
         if (!amount || amount <= 0) continue;
         const logIndex = log.index ?? log.logIndex ?? 0;
         try {
-          const { rows: inserted } = await db(
-            `INSERT INTO onchain_deposits(user_id, tx_hash, log_index, from_address, to_address, amount, block_number, amount_wei)
-             VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (tx_hash, log_index) DO NOTHING RETURNING id`,
-            [match.userId, log.transactionHash, logIndex, log.args.from, toAddr, amount, log.blockNumber, log.args.value.toString()]);
-          if (!inserted.length) continue; // already processed this exact log before — skip, never double-credit
-          await db('UPDATE users SET balance=balance+$1, total_deposited=total_deposited+$1 WHERE id=$2', [amount, match.userId]);
-          await db(`INSERT INTO transactions(user_id,type,amount,status,description,meta,reviewed_at) VALUES($1,'deposit',$2,'approved',$3,$4,NOW())`,
-            [match.userId, amount, `Auto-detected deposit (${LIVE_PAYMENT.network||'BEP20'})`, JSON.stringify({network:LIVE_PAYMENT.network||'BEP20', txHash:log.transactionHash, auto:true})]);
+          // The dedup row, the balance credit and the transaction row must all
+          // commit together. Previously they were separate: the onchain_deposits
+          // INSERT is what marks this log as "already processed", so if the
+          // balance credit then failed, the next scan would hit
+          // ON CONFLICT DO NOTHING and skip this log FOREVER — a real on-chain
+          // deposit silently lost. Inside a transaction, a failure rolls back
+          // the dedup row too, so the deposit is simply retried next cycle.
+          const credited = await withTx(async (q) => {
+            const { rows: inserted } = await q(
+              `INSERT INTO onchain_deposits(user_id, tx_hash, log_index, from_address, to_address, amount, block_number, amount_wei)
+               VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (tx_hash, log_index) DO NOTHING RETURNING id`,
+              [match.userId, log.transactionHash, logIndex, log.args.from, toAddr, amount, log.blockNumber, log.args.value.toString()]);
+            if (!inserted.length) return null; // already processed this exact log — never double-credit
+            await q('UPDATE users SET balance=balance+$1, total_deposited=total_deposited+$1 WHERE id=$2', [amount, match.userId]);
+            await q(`INSERT INTO transactions(user_id,type,amount,status,description,meta,reviewed_at) VALUES($1,'deposit',$2,'approved',$3,$4,NOW())`,
+              [match.userId, amount, `Auto-detected deposit (${LIVE_PAYMENT.network||'BEP20'})`, JSON.stringify({network:LIVE_PAYMENT.network||'BEP20', txHash:log.transactionHash, auto:true})]);
+            return inserted[0].id;
+          });
+          if (!credited) continue; // already processed on an earlier scan
+          // Everything below is best-effort and deliberately OUTSIDE the
+          // transaction — the balance is already safely credited, and neither a
+          // notification hiccup nor a sweep failure should ever roll that back.
           await notif(match.userId, 'deposit', 'Deposit Received', `$${amount.toFixed(2)} USDT detected on-chain and credited to your balance automatically.`);
-          // Best-effort — a sweep failure (e.g. gas reserve empty) is logged
-          // and retried automatically on later cycles; it never blocks or
-          // reverses the balance credit above.
-          await attemptSweep(inserted[0].id, match.index, toAddr);
+          // A sweep failure (e.g. gas reserve empty) is logged and retried
+          // automatically on later cycles; it never reverses the credit above.
+          await attemptSweep(credited, match.index, toAddr);
         } catch (e) {
           console.error('Onchain deposit credit error:', e.message);
         }
@@ -1557,6 +1605,34 @@ app.use(async (req,res,next) => {
 
 const limit10 = rateLimit({windowMs:15*60000, max:10});
 
+// ── Rate limits for endpoints that verify a secret or move money ───────────
+// These are keyed by USER ID rather than IP: the endpoints all sit behind
+// `auth`, so we know who's calling. Keying by user means an attacker can't
+// dodge the limit by rotating IPs/proxies, and legitimate users sharing an IP
+// (mobile carriers, offices) don't lock each other out.
+const byUser = (req,res) => req.user?.id || req.ip;
+
+// Withdrawal password + login password are the last line of defence on a real
+// USDT balance, and the withdrawal PIN is only 6 digits — without a limit it's
+// brute-forceable in minutes. 5 tries / 15 min per user.
+const limitSecret = rateLimit({
+  windowMs: 15*60000, max: 5, keyGenerator: byUser,
+  message: {success:false, message:'Too many attempts. Please wait 15 minutes and try again.'},
+});
+
+// Withdrawal submissions themselves — generous enough for real use, tight
+// enough to stop scripted abuse / accidental double-submit storms.
+const limitWithdraw = rateLimit({
+  windowMs: 15*60000, max: 10, keyGenerator: byUser,
+  message: {success:false, message:'Too many withdrawal requests. Please wait a few minutes.'},
+});
+
+// OTP issuance — stops someone spamming a user's inbox or burning our email quota.
+const limitOtp = rateLimit({
+  windowMs: 15*60000, max: 8, keyGenerator: byUser,
+  message: {success:false, message:'Too many OTP requests. Please wait before requesting another code.'},
+});
+
 // ═══════════════════════════════════════════════════════════════════════
 //  ROUTES
 // ═══════════════════════════════════════════════════════════════════════
@@ -1877,7 +1953,7 @@ app.put('/api/user/personal-info', auth, async (req,res) => {
 });
 
 // ── Withdrawal Password ───────────────────────────────────────────────────
-app.post('/api/user/set-withdrawal-password', auth, async (req,res) => {
+app.post('/api/user/set-withdrawal-password', auth, limitSecret, async (req,res) => {
   try {
     const {password} = req.body;
     if (!password||password.length<6) return res.status(400).json({success:false,message:'Min 6 characters'});
@@ -1888,7 +1964,7 @@ app.post('/api/user/set-withdrawal-password', auth, async (req,res) => {
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
-app.post('/api/user/change-withdrawal-password', auth, async (req,res) => {
+app.post('/api/user/change-withdrawal-password', auth, limitSecret, async (req,res) => {
   try {
     const {oldPassword, newPassword, otp, forgotMode} = req.body;
     const {rows:[u]} = await db('SELECT withdrawal_pass,email FROM users WHERE id=$1',[req.user.id]);
@@ -1934,7 +2010,7 @@ app.get('/api/user/login-history', auth, async (req,res) => {
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
-app.post('/api/user/change-password', auth, async (req,res) => {
+app.post('/api/user/change-password', auth, limitSecret, async (req,res) => {
   try {
     const {oldPassword, newPassword, otp, forgotMode} = req.body;
 
@@ -1968,7 +2044,7 @@ app.post('/api/user/change-password', auth, async (req,res) => {
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
-app.post('/api/user/change-email', auth, async (req,res) => {
+app.post('/api/user/change-email', auth, limitOtp, async (req,res) => {
   try {
     const {newEmail, otp} = req.body;
     if (!newEmail) return res.status(400).json({success:false,message:'New email required'});
@@ -2144,7 +2220,7 @@ app.post('/api/wallet/deposit', auth, async (req,res) => {
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
-app.post('/api/wallet/withdraw', auth, async (req,res) => {
+app.post('/api/wallet/withdraw', auth, limitWithdraw, async (req,res) => {
   try {
     const {amount,walletAddress,network,withdrawalPassword,otp} = req.body;
     const MIN = LIVE_PAYMENT.withdrawalMin;
@@ -2173,20 +2249,31 @@ app.post('/api/wallet/withdraw', auth, async (req,res) => {
       return res.json({success:true,requireOtp:true,message:`OTP sent to confirm withdrawal. Valid for ${LIVE_OTP.withdrawExpiryMin} minutes.`,data:{fee,netAmount:net}});
     }
     if (otp) await verifyOTP(u.email, otp, 'withdraw');
-    // Atomic check-and-deduct in one statement: if two requests race (e.g. a
-    // double-submit), only one can succeed since the WHERE clause re-checks
-    // balance at the moment of the UPDATE itself, not from the earlier SELECT.
-    const { rowCount } = await db(
-      'UPDATE users SET balance=balance-$1,total_withdrawn=total_withdrawn+$2 WHERE id=$3 AND balance>=$1',
-      [amt,net,req.user.id]);
-    if (rowCount === 0) return res.status(400).json({success:false,message:'Insufficient balance'});
-    const {rows}=await db(
-      `INSERT INTO transactions(user_id,type,amount,status,description,meta)
-       VALUES($1,'withdrawal',$2,'pending',$3,$4) RETURNING *`,
-      [req.user.id,net,`Withdrawal to ${walletAddress}`,JSON.stringify({walletAddress,network,fee})]
-    );
+    // Deduct + create the withdrawal record as ONE atomic unit. Previously these
+    // were separate commits: if the INSERT failed after the balance was already
+    // deducted (crash, redeploy, DB blip), the user's money was gone with NO
+    // withdrawal row for admin to see or process — silently unrecoverable.
+    // Now either both happen or neither does.
+    const created = await withTx(async (q) => {
+      // Atomic check-and-deduct: the WHERE re-checks balance at the moment of
+      // the UPDATE (not from the earlier SELECT), so a double-submit race can
+      // only succeed once.
+      const { rowCount } = await q(
+        'UPDATE users SET balance=balance-$1,total_withdrawn=total_withdrawn+$2 WHERE id=$3 AND balance>=$1',
+        [amt,net,req.user.id]);
+      if (rowCount === 0) return null;
+      const {rows} = await q(
+        `INSERT INTO transactions(user_id,type,amount,status,description,meta)
+         VALUES($1,'withdrawal',$2,'pending',$3,$4) RETURNING *`,
+        [req.user.id,net,`Withdrawal to ${walletAddress}`,JSON.stringify({walletAddress,network,fee})]
+      );
+      return rows[0];
+    });
+    if (!created) return res.status(400).json({success:false,message:'Insufficient balance'});
+    // Non-critical, and notif() swallows its own errors — safe to leave outside
+    // the transaction so a notification hiccup can never roll back a withdrawal.
     await notif(req.user.id,'withdrawal','Withdrawal Submitted',`$${net} USDT withdrawal submitted for review`);
-    res.status(201).json({success:true,message:`$${net} withdrawal submitted for admin review`,data:{transaction:cc(rows[0]),fee,netAmount:net}});
+    res.status(201).json({success:true,message:`$${net} withdrawal submitted for admin review`,data:{transaction:cc(created),fee,netAmount:net}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
@@ -2292,12 +2379,34 @@ app.get('/api/referral/earnings', auth, async (req,res) => {
 
 app.post('/api/referral/collect', auth, async (req,res) => {
   try {
-    const {rows:[u]}=await db('SELECT pending_earnings,balance FROM users WHERE id=$1',[req.user.id]);
-    const amount=parseFloat(u.pending_earnings);
-    if (amount<=0) return res.status(400).json({success:false,message:'No earnings to collect'});
-    await db('UPDATE users SET balance=balance+$1,pending_earnings=0 WHERE id=$2',[amount,req.user.id]);
-    await db(`INSERT INTO transactions(user_id,type,amount,description) VALUES($1,'commission',$2,'Referral commission collected')`,[req.user.id,amount]);
-    res.json({success:true,message:`$${amount.toFixed(2)} collected!`,data:{collected:amount,newBalance:parseFloat(u.balance)+amount}});
+    // Credit + transaction log commit as one atomic unit — a crash between them
+    // can't leave pending_earnings zeroed with the balance never credited.
+    const out = await withTx(async (q) => {
+      // Atomic collect: move pending_earnings into balance and zero it, but only
+      // if it's still > 0. A rapid double-tap can't double-collect: the second
+      // request finds pending_earnings already 0 and matches no row.
+      const { rows:[claimed] } = await q(
+        `WITH sel AS (
+           SELECT id, pending_earnings FROM users WHERE id=$1 FOR UPDATE
+         ),
+         upd AS (
+           UPDATE users u
+           SET balance = u.balance + sel.pending_earnings,
+               pending_earnings = 0
+           FROM sel
+           WHERE u.id = sel.id AND sel.pending_earnings > 0
+           RETURNING u.balance, sel.pending_earnings AS amount
+         )
+         SELECT balance, amount FROM upd`,
+        [req.user.id]
+      );
+      if (!claimed) return null;
+      const amount = parseFloat(claimed.amount);
+      await q(`INSERT INTO transactions(user_id,type,amount,description) VALUES($1,'commission',$2,'Referral commission collected')`,[req.user.id,amount]);
+      return { amount, balance: parseFloat(claimed.balance) };
+    });
+    if (!out) return res.status(400).json({success:false,message:'No earnings to collect'});
+    res.json({success:true,message:`$${out.amount.toFixed(2)} collected!`,data:{collected:out.amount,newBalance:out.balance}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
@@ -2308,30 +2417,52 @@ app.post('/api/referral/collect', auth, async (req,res) => {
 // plan's pending profit into their withdrawable balance.
 app.post('/api/investments/:id/collect-profit', auth, async (req,res) => {
   try {
-    const { rows:[inv] } = await db(
-      'SELECT * FROM investments WHERE id=$1 AND user_id=$2',
-      [req.params.id, req.user.id]
-    );
-    if (!inv) return res.status(404).json({success:false,message:'Investment not found'});
-    const amount = parseFloat(inv.pending_profit || 0);
-    if (amount<=0) return res.status(400).json({success:false,message:'No profit to collect'});
-    // "Today's Profit" on the dashboard reflects profit actually moved into
-    // balance today — same same-day-accumulate pattern used elsewhere.
-    const today = sgtDateString();
-    await db('UPDATE investments SET pending_profit=0 WHERE id=$1',[inv.id]);
-    const { rows:[u] } = await db(
-      `UPDATE users SET
-         balance=balance+$1,
-         today_profit_amount = CASE WHEN today_profit_date = $2 THEN today_profit_amount + $1 ELSE $1 END,
-         today_profit_date = $2
-       WHERE id=$3 RETURNING balance`,
-      [amount, today, req.user.id]
-    );
-    await db(
-      `INSERT INTO transactions(user_id,type,amount,description) VALUES($1,'profit',$2,$3)`,
-      [req.user.id, amount, `Daily profit collected — ${inv.plan_name}`]
-    );
-    res.json({success:true,message:`$${amount.toFixed(2)} collected!`,data:{collected:amount,newBalance:parseFloat(u.balance)}});
+    // All three steps (claim → credit → log) run inside ONE transaction: if the
+    // server dies or the DB blips partway through, everything rolls back and the
+    // user's pending profit is still there to claim again. Nothing can vanish.
+    const out = await withTx(async (q) => {
+      // Atomic claim: the `sel` CTE locks the row (FOR UPDATE) and reads the
+      // current pending_profit; `upd` zeroes it only if it's still > 0. A
+      // concurrent double-tap blocks on the lock, then sees 0 and claims
+      // nothing — so the same profit can never be collected twice.
+      const { rows:[claimed] } = await q(
+        `WITH sel AS (
+           SELECT id, plan_name, pending_profit
+           FROM investments
+           WHERE id=$1 AND user_id=$2
+           FOR UPDATE
+         ),
+         upd AS (
+           UPDATE investments i
+           SET pending_profit = 0
+           FROM sel
+           WHERE i.id = sel.id AND sel.pending_profit > 0
+           RETURNING sel.pending_profit AS amount, sel.plan_name
+         )
+         SELECT amount, plan_name FROM upd`,
+        [req.params.id, req.user.id]
+      );
+      if (!claimed) return null;
+      const amount = parseFloat(claimed.amount);
+      // "Today's Profit" reflects profit actually moved into balance today —
+      // same same-day-accumulate pattern used by the accrual cron.
+      const today = sgtDateString();
+      const { rows:[u] } = await q(
+        `UPDATE users SET
+           balance = balance + $1,
+           today_profit_amount = CASE WHEN today_profit_date = $2 THEN today_profit_amount + $1 ELSE $1 END,
+           today_profit_date = $2
+         WHERE id=$3 RETURNING balance`,
+        [amount, today, req.user.id]
+      );
+      await q(
+        `INSERT INTO transactions(user_id,type,amount,description) VALUES($1,'profit',$2,$3)`,
+        [req.user.id, amount, `Daily profit collected — ${claimed.plan_name}`]
+      );
+      return { amount, balance: parseFloat(u.balance) };
+    });
+    if (!out) return res.status(400).json({success:false,message:'No profit to collect'});
+    res.json({success:true,message:`$${out.amount.toFixed(2)} collected!`,data:{collected:out.amount,newBalance:out.balance}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
