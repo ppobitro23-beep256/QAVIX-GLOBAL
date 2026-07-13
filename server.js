@@ -2328,7 +2328,11 @@ app.get('/api/referral/info', auth, async (req,res) => {
   try {
     const {rows}=await db('SELECT referral_code FROM users WHERE id=$1',[req.user.id]);
     const code=rows[0].referral_code;
-    res.json({success:true,data:{referralCode:code,referralLink:`https://qavixglobal.pages.dev/?ref=${code}`,commissionRates:LIVE_COMM}});
+    // Uses FRONTEND_URL (set on Render) so the referral link always points to
+    // the live custom domain — a future domain change just needs the env var
+    // updated, never a code edit.
+    const frontendUrl = process.env.FRONTEND_URL || 'https://qavix-global.com';
+    res.json({success:true,data:{referralCode:code,referralLink:`${frontendUrl}/?ref=${code}`,commissionRates:LIVE_COMM}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
