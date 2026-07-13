@@ -693,6 +693,16 @@ const initDB = async () => {
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
 
+    -- One frictionless (no-OTP) signup per IP address. The first registration
+    -- from a given IP creates the account immediately with no email
+    -- verification step; recorded here so any FURTHER signup attempt from
+    -- that same IP falls back to the normal OTP-verified flow instead of
+    -- being able to mint unverified accounts repeatedly.
+    CREATE TABLE IF NOT EXISTS signup_free_pass (
+      ip_address VARCHAR(64) PRIMARY KEY,
+      used_at    TIMESTAMPTZ DEFAULT NOW()
+    );
+
     CREATE TABLE IF NOT EXISTS user_sessions (
       id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       user_id       UUID REFERENCES users(id) ON DELETE CASCADE,
@@ -1098,34 +1108,42 @@ const buildOTPEmail = (otp, purpose, expiryMin) => `
 <!DOCTYPE html>
 <html>
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"></head>
-<body style="margin:0;padding:20px;background:#0a0a0a;font-family:Arial,sans-serif">
-  <div style="max-width:480px;margin:0 auto;background:#111;border-radius:20px;overflow:hidden;border:1px solid rgba(201,162,39,0.15)">
+<body style="margin:0;padding:16px 10px;background:#0a0a0a;font-family:Arial,sans-serif">
+  <div style="max-width:480px;margin:0 auto;background:#111;border-radius:20px;overflow:hidden;border:1px solid rgba(201,162,39,0.25);box-shadow:0 0 50px rgba(201,162,39,0.08)">
+
+    <!-- Gold accent bar -->
+    <div style="height:3px;background:linear-gradient(90deg,#9B7A10,#E8C84A 25%,#C9A227 50%,#E8C84A 75%,#9B7A10)"></div>
 
     <!-- Header -->
-    <div style="background:linear-gradient(135deg,#0d0d0d 0%,#1a1208 100%);padding:28px 32px;text-align:center;border-bottom:1px solid rgba(201,162,39,0.2)">
+    <div style="background:radial-gradient(ellipse at 50% -20%,rgba(201,162,39,0.16),transparent 60%),linear-gradient(135deg,#0d0d0d 0%,#1a1208 100%);padding:26px 20px;text-align:center;border-bottom:1px solid rgba(201,162,39,0.2)">
       <div style="display:inline-flex;align-items:center;gap:10px">
-        <div style="width:36px;height:36px;background:rgba(201,162,39,0.15);border-radius:10px;display:flex;align-items:center;justify-content:center">
+        <div style="width:38px;height:38px;background:linear-gradient(150deg,rgba(201,162,39,0.22),rgba(201,162,39,0.08));border:1px solid rgba(201,162,39,0.35);border-radius:11px;display:flex;align-items:center;justify-content:center;box-shadow:0 0 18px rgba(201,162,39,0.3)">
           <span style="font-size:18px">⚡</span>
         </div>
         <div>
           <div style="font-size:18px;font-weight:900;color:#fff;letter-spacing:.12em">QAVIX <span style="color:#C9A227">GLOBAL</span></div>
-          <div style="font-size:9px;color:rgba(255,255,255,0.35);letter-spacing:.15em;margin-top:1px">PREMIUM INVESTMENT PLATFORM</div>
+          <div style="font-size:9px;color:rgba(255,255,255,0.4);letter-spacing:.1em;margin-top:1px">SMART INVESTMENT · GREATER RETURNS · INFINITE OPPORTUNITIES</div>
         </div>
       </div>
     </div>
 
     <!-- Body -->
-    <div style="padding:36px 32px;text-align:center">
+    <div style="padding:34px 18px;text-align:center;box-sizing:border-box">
       <div style="font-size:13px;color:#888;margin-bottom:6px;letter-spacing:.05em;text-transform:uppercase">Your verification code to</div>
-      <div style="font-size:15px;color:#bbb;margin-bottom:24px">${OTP_CONFIG[purpose]?.action||'verify your action'}</div>
+      <div style="font-size:15px;color:#bbb;margin-bottom:26px">${OTP_CONFIG[purpose]?.action||'verify your action'}</div>
 
-      <!-- OTP Box -->
-      <div style="background:rgba(201,162,39,0.06);border:1.5px solid rgba(201,162,39,0.25);border-radius:16px;padding:24px 32px;margin:0 auto 24px;display:inline-block">
-        <div style="font-size:44px;font-weight:900;color:#C9A227;letter-spacing:.22em;font-family:monospace">${otp}</div>
+      <!-- OTP Box — width:100%/border-box so it can never exceed the phone's
+           screen width; font-size/letter-spacing sized to fit 6 digits
+           comfortably even on ~320px-wide screens (fixes digits being cut
+           off in the Gmail app and similar narrow mobile clients). Golden
+           glow via box-shadow + text-shadow for a premium feel; both
+           degrade harmlessly to a flat look in clients that ignore them. -->
+      <div style="width:100%;box-sizing:border-box;background:radial-gradient(ellipse at 50% 0%,rgba(201,162,39,0.12),rgba(201,162,39,0.05) 70%);border:1.5px solid rgba(201,162,39,0.4);border-radius:16px;padding:20px 8px;margin:0 0 26px;box-shadow:0 0 30px rgba(201,162,39,0.18), inset 0 1px 0 rgba(255,255,255,0.04)">
+        <div style="font-size:32px;font-weight:900;color:#E8C84A;letter-spacing:.12em;font-family:monospace;word-break:break-all;text-shadow:0 0 18px rgba(232,200,74,0.6), 0 0 3px rgba(232,200,74,0.8)">${otp}</div>
       </div>
 
       <!-- Expiry -->
-      <div style="display:inline-flex;align-items:center;gap:8px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:999px;padding:8px 18px;margin-bottom:24px">
+      <div style="display:inline-flex;align-items:center;gap:8px;background:rgba(201,162,39,0.06);border:1px solid rgba(201,162,39,0.2);border-radius:999px;padding:8px 18px;margin-bottom:26px">
         <span style="font-size:14px">⏱</span>
         <span style="font-size:12px;color:#999">Expires in <strong style="color:#C9A227">${expiryMin} minutes</strong></span>
       </div>
@@ -1141,9 +1159,9 @@ const buildOTPEmail = (otp, purpose, expiryMin) => `
     </div>
 
     <!-- Footer -->
-    <div style="padding:16px 32px;border-top:1px solid rgba(255,255,255,0.06);text-align:center">
-      <div style="font-size:10px;color:#444">© 2025 QAVIX GLOBAL · All rights reserved</div>
-      <div style="font-size:10px;color:#333;margin-top:3px">This is an automated message. Do not reply.</div>
+    <div style="padding:16px 18px;border-top:1px solid rgba(201,162,39,0.12);text-align:center">
+      <div style="font-size:10px;color:#555">© 2025 <span style="color:#8a6d1a">QAVIX GLOBAL</span> · All rights reserved</div>
+      <div style="font-size:10px;color:#3a3a3a;margin-top:3px">This is an automated message. Do not reply.</div>
     </div>
   </div>
 </body>
@@ -1732,6 +1750,41 @@ app.get('/api/content/whitepaper/file', async (req,res) => {
 
 // ── Auth ─────────────────────────────────────────────────────────────────
 // ── Registration — Step 1: Send OTP ──────────────────────────────────────
+// ── Shared account-creation logic ───────────────────────────────────────
+// Used by both signup paths below: the frictionless first-time-per-IP path
+// (no OTP) and the normal OTP-verified path. Keeping this in one place means
+// referral tracking, the welcome notification, and token issuance can never
+// drift out of sync between the two paths.
+async function createUserAccount(meta) {
+  const hash  = await bcrypt.hash(meta.password, 12);
+  const uid   = 'QVX-' + Math.floor(100000+Math.random()*900000);
+  const code  = meta.name.replace(/\s+/g,'').substring(0,2).toUpperCase() + Math.floor(100000+Math.random()*900000);
+
+  const {rows:[newUser]} = await db(
+    `INSERT INTO users(name,email,phone,password,uid,referral_code,referred_by,is_verified,last_login)
+     VALUES($1,$2,$3,$4,$5,$6,$7,TRUE,NOW()) RETURNING *`,
+    [meta.name, meta.email, meta.phone||'', hash, uid, code, meta.referredBy||null]
+  );
+
+  if (meta.referredBy) {
+    await db(`INSERT INTO transactions(user_id,type,amount,description,meta)
+      VALUES($1,'commission',0,'New referral joined','{}')`,[meta.referredBy]);
+    try {
+      const { rows:[referrer] } = await db('SELECT name, uid FROM users WHERE id=$1', [meta.referredBy]);
+      console.log(`👥 Referral: ${newUser.name} (${newUser.uid}) joined under ${referrer ? referrer.name + ' (' + referrer.uid + ')' : meta.referredBy}`);
+    } catch(e) {
+      console.log(`👥 Referral: ${newUser.name} (${newUser.uid}) joined under referrer id ${meta.referredBy}`);
+    }
+  } else {
+    console.log(`👤 New signup: ${newUser.name} (${newUser.uid}) — no referral`);
+  }
+
+  await notif(newUser.id,'system','Welcome to QAVIX GLOBAL 🎉','Your account is ready. Start investing today!');
+  const aT = signA(newUser.id), rT = signR(newUser.id);
+  await db('INSERT INTO refresh_tokens(token) VALUES($1)',[rT]);
+  return { user: newUser, accessToken: aT, refreshToken: rT };
+}
+
 app.post('/api/auth/register/send-otp', limit10, async (req,res) => {
   try {
     const {name,email,password,phone,referralCode} = req.body;
@@ -1745,7 +1798,21 @@ app.post('/api/auth/register/send-otp', limit10, async (req,res) => {
     const {rows:r} = await db('SELECT id FROM users WHERE referral_code=$1',[referralCode.toUpperCase()]);
     if (!r[0]) return res.status(400).json({success:false,message:'Invalid referral code'});
 
-    await issueOTP(null, email.toLowerCase(), 'register', {name,email:email.toLowerCase(),password,phone,referralCode:referralCode.toUpperCase(),referredBy:r[0].id});
+    const meta = {name, email:email.toLowerCase(), password, phone, referralCode:referralCode.toUpperCase(), referredBy:r[0].id};
+
+    // First signup ever from this IP skips OTP entirely — the account is
+    // created immediately, no email verification step. Any signup attempt
+    // AFTER that from the same IP falls back to the normal OTP-verified flow
+    // below, so the free pass can't be reused to mint unverified accounts.
+    const ip = req.ip;
+    const { rows: pass } = await db('SELECT ip_address FROM signup_free_pass WHERE ip_address=$1',[ip]);
+    if (!pass[0]) {
+      const { user: newUser, accessToken: aT, refreshToken: rT } = await createUserAccount(meta);
+      await db('INSERT INTO signup_free_pass(ip_address) VALUES($1) ON CONFLICT DO NOTHING',[ip]);
+      return res.status(201).json({success:true,requireOtp:false,message:'Account created successfully!',data:{user:safe(cc(newUser)),accessToken:aT,refreshToken:rT}});
+    }
+
+    await issueOTP(null, email.toLowerCase(), 'register', meta);
     res.json({success:true,requireOtp:true,message:'OTP sent to your email. Valid for 5 minutes.'});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
@@ -1758,36 +1825,7 @@ app.post('/api/auth/register', limit10, async (req,res) => {
 
     const record = await verifyOTP(email.toLowerCase(), otp, 'register');
     const meta   = record.meta || {};
-
-    const hash  = await bcrypt.hash(meta.password, 12);
-    const uid   = 'QVX-' + Math.floor(100000+Math.random()*900000);
-    const code  = meta.name.replace(/\s+/g,'').substring(0,2).toUpperCase() + Math.floor(100000+Math.random()*900000);
-
-    const {rows:[newUser]} = await db(
-      `INSERT INTO users(name,email,phone,password,uid,referral_code,referred_by,is_verified)
-       VALUES($1,$2,$3,$4,$5,$6,$7,TRUE) RETURNING *`,
-      [meta.name, meta.email, meta.phone||'', hash, uid, code, meta.referredBy||null]
-    );
-
-    // Commission tracking setup
-    if (meta.referredBy) {
-      await db(`INSERT INTO transactions(user_id,type,amount,description,meta)
-        VALUES($1,'commission',0,'New referral joined','{}')`,[meta.referredBy]);
-      // Visible in Render logs — quick "who joined under whom" trail without
-      // needing to open the admin panel.
-      try {
-        const { rows:[referrer] } = await db('SELECT name, uid FROM users WHERE id=$1', [meta.referredBy]);
-        console.log(`👥 Referral: ${newUser.name} (${newUser.uid}) joined under ${referrer ? referrer.name + ' (' + referrer.uid + ')' : meta.referredBy}`);
-      } catch(e) {
-        console.log(`👥 Referral: ${newUser.name} (${newUser.uid}) joined under referrer id ${meta.referredBy}`);
-      }
-    } else {
-      console.log(`👤 New signup: ${newUser.name} (${newUser.uid}) — no referral`);
-    }
-
-    await notif(newUser.id,'system','Welcome to QAVIX GLOBAL 🎉','Your account is ready. Start investing today!');
-    const aT=signA(newUser.id), rT=signR(newUser.id);
-    await db('INSERT INTO refresh_tokens(token) VALUES($1)',[rT]);
+    const { user: newUser, accessToken: aT, refreshToken: rT } = await createUserAccount(meta);
     res.status(201).json({success:true,message:'Account created successfully!',data:{user:safe(cc(newUser)),accessToken:aT,refreshToken:rT}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
@@ -1830,13 +1868,21 @@ app.post('/api/auth/login', limit10, async (req,res) => {
     if (user.status === 'suspended') return res.status(403).json({success:false,message:'Your account has been suspended. Contact support for help.'});
     if (user.status === 'banned')    return res.status(403).json({success:false,message:'Your account has been banned.'});
 
-    // Step 1: credentials OK → send OTP (unless login OTP has been turned off in Settings)
-    if (!otp && LIVE_OTP.loginOtpEnabled) {
+    // Registration itself counts as the account's first "login" (it signs
+    // the user in immediately with tokens, and now stamps last_login at
+    // creation — see createUserAccount()). So by the time someone actually
+    // uses the login page, last_login is already set and OTP is required as
+    // normal. This NULL check is really just a safety net for any legacy
+    // account that predates that stamp.
+    const isFirstLogin = !user.last_login;
+
+    // Step 1: credentials OK → send OTP (unless first login, or login OTP disabled in Settings)
+    if (!otp && LIVE_OTP.loginOtpEnabled && !isFirstLogin) {
       await issueOTP(user.id, user.email, 'login');
       return res.json({success:true,requireOtp:true,message:`OTP sent to your email. Valid for ${LIVE_OTP.loginExpiryMin} minutes.`});
     }
 
-    // Step 2: verify OTP → issue tokens (skipped entirely when login OTP is disabled)
+    // Step 2: verify OTP → issue tokens (skipped when first login, or login OTP disabled)
     if (otp) await verifyOTP(user.email, otp, 'login');
     await db('UPDATE users SET last_login=NOW() WHERE id=$1',[user.id]);
     const ip  = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || req.connection?.remoteAddress || 'unknown';
