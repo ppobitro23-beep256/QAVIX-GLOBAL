@@ -718,6 +718,9 @@ const initDB = async () => {
     ALTER TABLE users ADD COLUMN IF NOT EXISTS date_of_birth   DATE;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS phone           VARCHAR(30);
     ALTER TABLE users ADD COLUMN IF NOT EXISTS withdrawal_pass VARCHAR(255);
+    -- Sticky tag set by admin's most recent manual balance adjustment
+    -- (User / Manager / Promoters) — shown on the user list & profile.
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS admin_tag VARCHAR(20) DEFAULT 'User';
     -- One withdrawal wallet address can only ever be linked to ONE account —
     -- stops the common multi-accounting trick of farming referral bonuses on
     -- several accounts then draining them all to the same wallet. The column
@@ -3472,20 +3475,46 @@ app.get('/api/admin/me', adminAuth, (req,res) => res.json({success:true,data:{ad
 // ── Dashboard stats ───────────────────────────────────────────────────────
 app.get('/api/admin/stats', adminAuth, async (_,res) => {
   try {
-    const [users, deposits, withdrawals, investments, today] = await Promise.all([
+    const [users, deposits, withdrawals, investments, today, managerDep, promoterDep] = await Promise.all([
       db(`SELECT COUNT(*) total, COUNT(*) FILTER (WHERE status='active') active, COUNT(*) FILTER (WHERE status='banned') banned, COUNT(*) FILTER (WHERE created_at::date=CURRENT_DATE) today FROM users`),
       db(`SELECT COALESCE(SUM(amount) FILTER (WHERE status='approved'),0) total, COUNT(*) FILTER (WHERE status='pending') pending, COALESCE(SUM(amount) FILTER (WHERE created_at::date=CURRENT_DATE AND status='approved'),0) today FROM transactions WHERE type='deposit'`),
       db(`SELECT COALESCE(SUM(amount) FILTER (WHERE status='approved'),0) total, COUNT(*) FILTER (WHERE status='pending') pending, COALESCE(SUM(amount) FILTER (WHERE created_at::date=CURRENT_DATE AND status='approved'),0) today FROM transactions WHERE type='withdrawal'`),
       db(`SELECT COUNT(*) FILTER (WHERE status='active') active, COALESCE(SUM(amount) FILTER (WHERE status='active'),0) capital FROM investments`),
-      db(`SELECT COALESCE(SUM(amount),0) profit FROM transactions WHERE type='deposit' AND status='approved' AND created_at::date=CURRENT_DATE`)
+      db(`SELECT COALESCE(SUM(amount),0) profit FROM transactions WHERE type='deposit' AND status='approved' AND created_at::date=CURRENT_DATE`),
+      // Manual admin-panel credits tagged 'Manager' — separate from normal on-chain/user deposits.
+      db(`SELECT COALESCE(SUM(amount),0) total FROM transactions WHERE type='admin_adjustment' AND status='approved' AND amount>0 AND meta->>'tag'='Manager'`),
+      // Manual admin-panel credits tagged 'Promoters' — separate from normal on-chain/user deposits.
+      db(`SELECT COALESCE(SUM(amount),0) total FROM transactions WHERE type='admin_adjustment' AND status='approved' AND amount>0 AND meta->>'tag'='Promoters'`),
     ]);
     res.json({success:true,data:{
       totalUsers: parseInt(users.rows[0].total), activeUsers: parseInt(users.rows[0].active), bannedUsers: parseInt(users.rows[0].banned), newUsersToday: parseInt(users.rows[0].today),
       totalDeposits: parseFloat(deposits.rows[0].total), pendingDeposits: parseInt(deposits.rows[0].pending), depositsToday: parseFloat(deposits.rows[0].today),
       totalWithdrawals: parseFloat(withdrawals.rows[0].total), pendingWithdrawals: parseInt(withdrawals.rows[0].pending), withdrawalsToday: parseFloat(withdrawals.rows[0].today),
       activeInvestments: parseInt(investments.rows[0].active), capitalDeployed: parseFloat(investments.rows[0].capital),
-      revenueToday: parseFloat(today.rows[0].profit)
+      revenueToday: parseFloat(today.rows[0].profit),
+      managerDeposits: parseFloat(managerDep.rows[0].total), promoterDeposits: parseFloat(promoterDep.rows[0].total)
     }});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── Per-user breakdown of tagged manual balance credits (Manager / Promoters) ──
+// Powers the drill-down list when tapping the "Manager Deposit" / "Promoters
+// Deposit" KPI cards — shows exactly who was credited how much under that tag.
+app.get('/api/admin/tag-deposits', adminAuth, async (req,res) => {
+  try {
+    const tag = req.query.tag;
+    if (!['Manager','Promoters'].includes(tag)) return res.status(400).json({success:false,message:'Invalid tag'});
+    const { rows } = await db(
+      `SELECT u.id AS user_id, u.name, u.email, u.uid,
+              SUM(t.amount) AS total_given, COUNT(t.id)::int AS times_given, MAX(t.created_at) AS last_given_at
+       FROM transactions t
+       JOIN users u ON u.id = t.user_id
+       WHERE t.type='admin_adjustment' AND t.status='approved' AND t.amount>0 AND t.meta->>'tag'=$1
+       GROUP BY u.id, u.name, u.email, u.uid
+       ORDER BY total_given DESC`,
+      [tag]
+    );
+    res.json({success:true,data:{tag, users:ccAll(rows)}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
@@ -3572,7 +3601,7 @@ app.get('/api/admin/users', adminAuth, requirePermission('users'), async (req,re
     params.push(limit, (page-1)*limit);
     const {rows} = await db(
       `SELECT u.id, u.name, u.email, u.uid, u.balance, u.total_deposited, u.total_withdrawn,
-              u.membership_level, u.status, u.created_at,
+              u.membership_level, u.status, u.created_at, u.admin_tag,
               r.name AS referrer_name, r.uid AS referrer_uid
        FROM users u LEFT JOIN users r ON r.id=u.referred_by
        ${whereSql} ORDER BY u.created_at DESC LIMIT $${params.length-1} OFFSET $${params.length}`, params);
@@ -3711,16 +3740,17 @@ app.put('/api/admin/users/:id/status', adminAuth, requirePermission('users'), as
 app.post('/api/admin/users/:id/balance', adminAuth, requireRole('Super Admin'), async (req,res) => {
   try {
     const {type, amount, ledger, reason} = req.body; // type: 'credit' | 'debit'
+    const tag = ['Manager','Promoters'].includes(req.body.tag) ? req.body.tag : 'User';
     const amt = parseFloat(amount);
     if (!amt||amt<=0) return res.status(400).json({success:false,message:'Enter a valid amount'});
     const column = ledger === 'Referral Income' ? 'pending_earnings' : 'balance';
     const delta = type === 'debit' ? -amt : amt;
-    const {rows} = await db(`UPDATE users SET ${column}=${column}+$1 WHERE id=$2 RETURNING id,name,email,balance,pending_earnings`,[delta,req.params.id]);
+    const {rows} = await db(`UPDATE users SET ${column}=${column}+$1, admin_tag=$3 WHERE id=$2 RETURNING id,name,email,balance,pending_earnings,admin_tag`,[delta,req.params.id,tag]);
     if (!rows[0]) return res.status(404).json({success:false,message:'User not found'});
-    await db(`INSERT INTO transactions(user_id,type,amount,status,description,reviewed_by,reviewed_at) VALUES($1,'admin_adjustment',$2,'approved',$3,$4,NOW())`,
-      [req.params.id, delta, reason||`Manual ${type} by admin`, req.admin.id]);
+    await db(`INSERT INTO transactions(user_id,type,amount,status,description,reviewed_by,reviewed_at,meta) VALUES($1,'admin_adjustment',$2,'approved',$3,$4,NOW(),$5)`,
+      [req.params.id, delta, reason||`Manual ${type} by admin`, req.admin.id, JSON.stringify({tag})]);
     await notif(req.params.id,'system','Balance Updated',`Your ${ledger||'Main Balance'} was ${type==='debit'?'debited':'credited'} by $${amt}.`);
-    await logAdmin(req.admin.id, `${type==='debit'?'Debited':'Credited'} $${amt} for ${rows[0].email}`, {userId:req.params.id,amount:amt,type,reason});
+    await logAdmin(req.admin.id, `${type==='debit'?'Debited':'Credited'} $${amt} (${tag}) for ${rows[0].email}`, {userId:req.params.id,amount:amt,type,tag,reason});
     res.json({success:true,message:`$${amt} ${type==='debit'?'debited from':'credited to'} the account`,data:{user:cc(rows[0])}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
