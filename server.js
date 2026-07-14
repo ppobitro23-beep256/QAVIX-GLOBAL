@@ -2464,7 +2464,9 @@ app.post('/api/referral/collect', auth, async (req,res) => {
 // Each active investment accrues its own daily profit independently (own 24h
 // clock via last_credit_at) into its own pending_profit — NOT a shared pool.
 // The user taps "Claim" under that specific plan's card to move just that
-// plan's pending profit into their withdrawable balance.
+// plan's pending profit into their withdrawable balance. Claiming ALSO resets
+// last_credit_at to NOW(), so the next 24h countdown shown on the card starts
+// fresh from the moment of claim (not from whenever the cron last accrued).
 app.post('/api/investments/:id/collect-profit', auth, async (req,res) => {
   try {
     // All three steps (claim → credit → log) run inside ONE transaction: if the
@@ -2472,9 +2474,11 @@ app.post('/api/investments/:id/collect-profit', auth, async (req,res) => {
     // user's pending profit is still there to claim again. Nothing can vanish.
     const out = await withTx(async (q) => {
       // Atomic claim: the `sel` CTE locks the row (FOR UPDATE) and reads the
-      // current pending_profit; `upd` zeroes it only if it's still > 0. A
-      // concurrent double-tap blocks on the lock, then sees 0 and claims
-      // nothing — so the same profit can never be collected twice.
+      // current pending_profit; `upd` zeroes it only if it's still > 0 AND resets
+      // last_credit_at = NOW() so the next accrual (and the UI countdown) is
+      // exactly 24h from this claim. A concurrent double-tap blocks on the
+      // lock, then sees 0 and claims nothing — so the same profit can never
+      // be collected twice.
       const { rows:[claimed] } = await q(
         `WITH sel AS (
            SELECT id, plan_name, pending_profit
@@ -2484,7 +2488,8 @@ app.post('/api/investments/:id/collect-profit', auth, async (req,res) => {
          ),
          upd AS (
            UPDATE investments i
-           SET pending_profit = 0
+           SET pending_profit = 0,
+               last_credit_at = NOW()
            FROM sel
            WHERE i.id = sel.id AND sel.pending_profit > 0
            RETURNING sel.pending_profit AS amount, sel.plan_name
