@@ -223,25 +223,39 @@ async function scanOnchainDeposits() {
           // ON CONFLICT DO NOTHING and skip this log FOREVER — a real on-chain
           // deposit silently lost. Inside a transaction, a failure rolls back
           // the dedup row too, so the deposit is simply retried next cycle.
-          const credited = await withTx(async (q) => {
+          const result = await withTx(async (q) => {
             const { rows: inserted } = await q(
               `INSERT INTO onchain_deposits(user_id, tx_hash, log_index, from_address, to_address, amount, block_number, amount_wei)
                VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (tx_hash, log_index) DO NOTHING RETURNING id`,
               [match.userId, log.transactionHash, logIndex, log.args.from, toAddr, amount, log.blockNumber, log.args.value.toString()]);
             if (!inserted.length) return null; // already processed this exact log — never double-credit
+            // Lock the user row before crediting/counting — kept consistent
+            // with the admin-approve paths so all three deposit-credit routes
+            // use the identical safe pattern against concurrent same-user deposits.
+            await q('SELECT id FROM users WHERE id=$1 FOR UPDATE', [match.userId]);
             await q('UPDATE users SET balance=balance+$1, total_deposited=total_deposited+$1 WHERE id=$2', [amount, match.userId]);
             await q(`INSERT INTO transactions(user_id,type,amount,status,description,meta,reviewed_at) VALUES($1,'deposit',$2,'approved',$3,$4,NOW())`,
               [match.userId, amount, `Auto-detected deposit (${LIVE_PAYMENT.network||'BEP20'})`, JSON.stringify({network:LIVE_PAYMENT.network||'BEP20', txHash:log.transactionHash, auto:true})]);
-            return inserted[0].id;
+            // Referral commission is paid once ever per referred account, on
+            // their very first successful deposit only — never on later
+            // deposits, and never on investment purchases. Counting approved
+            // deposits inside this same transaction (which already includes
+            // the row just inserted above) means exactly one deposit sees
+            // count===1, even under concurrent scans.
+            const { rows: cnt } = await q(
+              `SELECT COUNT(*) AS c FROM transactions WHERE user_id=$1 AND type='deposit' AND status='approved'`,
+              [match.userId]);
+            return { id: inserted[0].id, isFirstDeposit: parseInt(cnt[0].c, 10) === 1 };
           });
-          if (!credited) continue; // already processed on an earlier scan
+          if (!result) continue; // already processed on an earlier scan
           // Everything below is best-effort and deliberately OUTSIDE the
           // transaction — the balance is already safely credited, and neither a
           // notification hiccup nor a sweep failure should ever roll that back.
           await notif(match.userId, 'deposit', 'Deposit Received', `$${amount.toFixed(2)} USDT detected on-chain and credited to your balance automatically.`);
+          if (result.isFirstDeposit) await payComm(match.userId, amount);
           // A sweep failure (e.g. gas reserve empty) is logged and retried
           // automatically on later cycles; it never reverses the credit above.
-          await attemptSweep(credited, match.index, toAddr);
+          await attemptSweep(result.id, match.index, toAddr);
         } catch (e) {
           console.error('Onchain deposit credit error:', e.message);
         }
@@ -1560,7 +1574,9 @@ const REWARDS = [
   {id:'ref10',  name:'10 Member Milestone', amount:15.00, cd:null},
 ];
 
-// Pay referral commissions up the chain
+// Pay referral commissions up the chain. Callers only invoke this once ever
+// per referred account — on that account's very first successful (approved)
+// deposit — never on later deposits and never on investment/plan purchases.
 const payComm = async (investorId, amount) => {
   if (!LIVE_REFERRAL.enabled) return;
   let cur = investorId;
@@ -2191,7 +2207,6 @@ app.post('/api/plans/purchase', auth, async (req,res) => {
     if (getTierRank(planId) > getTierRank(u.membership_level)) {
       await db('UPDATE users SET membership_level=$1 WHERE id=$2',[planId, req.user.id]);
     }
-    await payComm(req.user.id, amt);
     await notif(req.user.id,'investment',`${plan.name} activated!`,
       `Daily profit: $${daily.toFixed(2)} for ${plan.days} days. Capital is locked.`);
     res.status(201).json({success:true,
@@ -3879,8 +3894,25 @@ app.put('/api/admin/deposits/:id/approve', adminAuth, requirePermission('deposit
       if (!existing) return res.status(404).json({success:false,message:'Deposit not found'});
       return res.status(400).json({success:false,message:'Only pending deposits can be approved'});
     }
-    await db('UPDATE users SET balance=balance+$1, total_deposited=total_deposited+$1 WHERE id=$2',[tx.amount,tx.user_id]);
+    // Credit the balance and check first-deposit commission eligibility inside
+    // one DB transaction, with a row lock on the user. Without this lock, two
+    // concurrent approvals for the same user (another pending deposit approved
+    // at the same instant, or the on-chain auto-scanner crediting a deposit for
+    // this same user right now) could both see themselves as "first" and both
+    // pay commission — the lock forces the second one to wait until the first
+    // fully commits, so its COUNT always reflects the other's result.
+    const isFirstDeposit = await withTx(async (q) => {
+      await q('SELECT id FROM users WHERE id=$1 FOR UPDATE', [tx.user_id]);
+      await q('UPDATE users SET balance=balance+$1, total_deposited=total_deposited+$1 WHERE id=$2', [tx.amount, tx.user_id]);
+      const { rows: cnt } = await q(
+        `SELECT COUNT(*) AS c FROM transactions WHERE user_id=$1 AND type='deposit' AND status='approved'`,
+        [tx.user_id]);
+      return parseInt(cnt[0].c, 10) === 1;
+    });
     await notif(tx.user_id,'deposit','Deposit Approved',`$${tx.amount} has been credited to your balance.`);
+    // Referral commission is paid once ever per referred account, on their
+    // very first successful (approved) deposit only — never on later deposits.
+    if (isFirstDeposit) await payComm(tx.user_id, tx.amount);
     await logAdmin(req.admin.id, `Approved deposit $${tx.amount}`, {depositId:req.params.id,userId:tx.user_id});
     res.json({success:true,message:'Deposit approved and credited'});
   } catch(e){res.status(500).json({success:false,message:e.message});}
@@ -3915,8 +3947,19 @@ app.post('/api/admin/deposits/bulk-approve', adminAuth, requirePermission('depos
          WHERE id=$2 AND type='deposit' AND status='pending' RETURNING *`,
         [req.admin.id, id]);
       if (!tx) { skipped++; continue; }
-      await db('UPDATE users SET balance=balance+$1, total_deposited=total_deposited+$1 WHERE id=$2',[tx.amount,tx.user_id]);
+      // Same row-locked pattern as single-approve — prevents a double commission
+      // if this user has another deposit being approved/credited concurrently
+      // elsewhere (another admin, another bulk-approve, or the auto-scanner).
+      const isFirstDeposit = await withTx(async (q) => {
+        await q('SELECT id FROM users WHERE id=$1 FOR UPDATE', [tx.user_id]);
+        await q('UPDATE users SET balance=balance+$1, total_deposited=total_deposited+$1 WHERE id=$2', [tx.amount, tx.user_id]);
+        const { rows: cnt } = await q(
+          `SELECT COUNT(*) AS c FROM transactions WHERE user_id=$1 AND type='deposit' AND status='approved'`,
+          [tx.user_id]);
+        return parseInt(cnt[0].c, 10) === 1;
+      });
       await notif(tx.user_id,'deposit','Deposit Approved',`$${tx.amount} has been credited to your balance.`);
+      if (isFirstDeposit) await payComm(tx.user_id, tx.amount);
       approved++;
     }
     await logAdmin(req.admin.id, `Bulk-approved ${approved} deposit(s)`, {ids, skipped});
