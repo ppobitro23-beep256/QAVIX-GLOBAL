@@ -1503,6 +1503,7 @@ const DEFAULT_PAYMENT = {
 };
 const DEFAULT_REFERRAL = { enabled: true };
 const DEFAULT_MAINTENANCE = { enabled: false, message: 'We are performing scheduled maintenance and will be back shortly.' };
+const DEFAULT_PRELAUNCH = { enabled: false, launchAt: null, title: '🚀 Launching Soon', subtitle: 'Launch হতে বাকি:' };
 const DEFAULT_SECURITY = { ipWhitelistEnabled: false, adminTwoFactorEnabled: false };
 const DEFAULT_GENERAL = { siteName: 'QAVIX GLOBAL', supportEmail: 'support@qavixglobal.com', timezone: 'UTC', language: 'en' };
 // Email delivery actually runs on the Brevo HTTP API (see sendEmail) — there is no
@@ -1535,6 +1536,11 @@ let LIVE_COMM = {...DEFAULT_COMM};
 let LIVE_PAYMENT = {...DEFAULT_PAYMENT};
 let LIVE_REFERRAL = {...DEFAULT_REFERRAL};
 let LIVE_MAINTENANCE = {...DEFAULT_MAINTENANCE};
+let LIVE_PRELAUNCH = {...DEFAULT_PRELAUNCH};
+// True only while the toggle is on AND the configured launch moment hasn't
+// arrived yet — flips itself off automatically once launchAt passes, with no
+// admin action needed.
+const isPrelaunchLocked = () => LIVE_PRELAUNCH.enabled && LIVE_PRELAUNCH.launchAt && new Date(LIVE_PRELAUNCH.launchAt) > new Date();
 let LIVE_SECURITY = {...DEFAULT_SECURITY};
 let LIVE_GENERAL = {...DEFAULT_GENERAL};
 let LIVE_EMAIL_SENDER = {...DEFAULT_EMAIL_SENDER};
@@ -1555,6 +1561,7 @@ const loadSettingsCache = async () => {
       if (r.key === 'payment') LIVE_PAYMENT = {...DEFAULT_PAYMENT, ...r.value};
       if (r.key === 'referral') LIVE_REFERRAL = {...DEFAULT_REFERRAL, ...r.value};
       if (r.key === 'maintenance') LIVE_MAINTENANCE = {...DEFAULT_MAINTENANCE, ...r.value};
+      if (r.key === 'prelaunch') LIVE_PRELAUNCH = {...DEFAULT_PRELAUNCH, ...r.value};
       if (r.key === 'security') LIVE_SECURITY = {...DEFAULT_SECURITY, ...r.value};
       if (r.key === 'general') LIVE_GENERAL = {...DEFAULT_GENERAL, ...r.value};
       if (r.key === 'smtp') LIVE_EMAIL_SENDER = {...DEFAULT_EMAIL_SENDER, ...r.value};
@@ -1710,6 +1717,19 @@ app.get('/api/content/general-info', async (_,res) => {
   res.json({success:true,data:{
     siteName: LIVE_GENERAL.siteName,
     supportEmail: LIVE_GENERAL.supportEmail,
+  }});
+});
+
+// Pre-launch lock: while enabled and now < launchAt, the frontend locks the
+// Deposit/Withdraw buttons behind a countdown popup instead of opening those
+// pages. Public and unauthenticated on purpose — the countdown needs to show
+// before a user ever logs in.
+app.get('/api/content/prelaunch', async (_,res) => {
+  res.json({success:true,data:{
+    enabled: LIVE_PRELAUNCH.enabled,
+    launchAt: LIVE_PRELAUNCH.launchAt,
+    title: LIVE_PRELAUNCH.title,
+    subtitle: LIVE_PRELAUNCH.subtitle,
   }});
 });
 
@@ -2264,6 +2284,7 @@ app.get('/api/wallet/deposit-address', auth, async (req,res) => {
 
 app.post('/api/wallet/deposit', auth, async (req,res) => {
   try {
+    if (isPrelaunchLocked()) return res.status(403).json({success:false,message:'Deposits open at launch — check back soon!'});
     const {amount,network,txHash}=req.body;
     const MIN=LIVE_PAYMENT.depositMin, amt=parseFloat(amount);
     if (!amt||amt<MIN) return res.status(400).json({success:false,message:`Min deposit $${MIN}`});
@@ -2286,6 +2307,7 @@ app.post('/api/wallet/deposit', auth, async (req,res) => {
 
 app.post('/api/wallet/withdraw', auth, limitWithdraw, async (req,res) => {
   try {
+    if (isPrelaunchLocked()) return res.status(403).json({success:false,message:'Withdrawals open at launch — check back soon!'});
     const {amount,walletAddress,network,withdrawalPassword,otp} = req.body;
     const MIN = LIVE_PAYMENT.withdrawalMin;
     const MAX = LIVE_PAYMENT.withdrawalMax;
@@ -4673,6 +4695,7 @@ app.get('/api/admin/settings', adminAuth, requirePermission('settings'), async (
   res.json({success:true,data:{
     plans: LIVE_PLANS, commission: LIVE_COMM, payment: LIVE_PAYMENT,
     referral: LIVE_REFERRAL, maintenance: LIVE_MAINTENANCE, security: LIVE_SECURITY,
+    prelaunch: LIVE_PRELAUNCH,
     general: LIVE_GENERAL,
     emailSender: LIVE_EMAIL_SENDER,
     otp: LIVE_OTP,
@@ -4971,6 +4994,19 @@ app.put('/api/admin/settings/maintenance', adminAuth, requireRole('Super Admin')
     await saveSetting('maintenance', LIVE_MAINTENANCE, req.admin.id);
     await logAdmin(req.admin.id, `Maintenance mode ${LIVE_MAINTENANCE.enabled?'enabled':'disabled'}`);
     res.json({success:true,message:`Maintenance mode is now ${LIVE_MAINTENANCE.enabled?'ON':'OFF'}`,data:{maintenance:LIVE_MAINTENANCE}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.put('/api/admin/settings/prelaunch', adminAuth, requireRole('Super Admin'), async (req,res) => {
+  try {
+    const { enabled, launchAt, title, subtitle } = req.body;
+    if (enabled !== undefined) LIVE_PRELAUNCH.enabled = !!enabled;
+    if (launchAt !== undefined) LIVE_PRELAUNCH.launchAt = launchAt || null;
+    if (title !== undefined) LIVE_PRELAUNCH.title = title || DEFAULT_PRELAUNCH.title;
+    if (subtitle !== undefined) LIVE_PRELAUNCH.subtitle = subtitle || DEFAULT_PRELAUNCH.subtitle;
+    await saveSetting('prelaunch', LIVE_PRELAUNCH, req.admin.id);
+    await logAdmin(req.admin.id, `Pre-launch lock ${LIVE_PRELAUNCH.enabled?'enabled':'disabled'}`, {launchAt: LIVE_PRELAUNCH.launchAt});
+    res.json({success:true,message:`Pre-launch lock is now ${LIVE_PRELAUNCH.enabled?'ON':'OFF'}`,data:{prelaunch:LIVE_PRELAUNCH}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
