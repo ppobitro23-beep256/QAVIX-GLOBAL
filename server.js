@@ -1322,9 +1322,11 @@ const requireRole = (...roles) => (req, res, next) => {
   next();
 };
 
-// Default permission matrix per role — what each role can do out of the box.
-// Owner and Super Admin always get everything and cannot be restricted.
-// These are used when an admin has no custom permissions saved yet.
+// Default permission matrix per role — what each role can do out of the box
+// when it has no custom permissions saved yet. Only Owner is truly
+// unrestrictable (see hasPermission below); Super Admin's "true" defaults
+// here are just a starting point — an individual Super Admin CAN be
+// restricted from specific modules via custom permissions.
 const DEFAULT_ROLE_PERMISSIONS = {
   'Owner':       { dashboard:true, users:true, deposits:true, withdrawals:true, plans:true, investments:true, referral:true, reports:true, settings:true, security:true, support:true, announcements:true, content:true, admins:true, logs:true, backup:true, tasks:true, lottery:true, salary:true },
   'Super Admin': { dashboard:true, users:true, deposits:true, withdrawals:true, plans:true, investments:true, referral:true, reports:true, settings:true, security:true, support:true, announcements:true, content:true, admins:true, logs:true, backup:true, tasks:true, lottery:true, salary:true },
@@ -1332,9 +1334,14 @@ const DEFAULT_ROLE_PERMISSIONS = {
 };
 
 // Check if an admin has permission for a given module key.
-// Owner and Super Admin always pass; others check custom permissions, falling back to role defaults.
+// Owner always passes (there's only one, no reason to self-restrict). Every
+// other role — including Super Admin — checks custom permissions first, and
+// only falls back to that role's defaults when no custom permissions have
+// been saved for this specific admin yet. This is what lets a Super Admin be
+// restricted from specific pages (e.g. Settings, Admins) via the Permissions
+// Matrix, instead of always having unconditional full access.
 const hasPermission = (admin, module) => {
-  if (admin.role === 'Owner' || admin.role === 'Super Admin') return true;
+  if (admin.role === 'Owner') return true;
   const perms = admin.permissions && Object.keys(admin.permissions).length > 0
     ? admin.permissions
     : (DEFAULT_ROLE_PERMISSIONS[admin.role] || {});
@@ -4190,7 +4197,7 @@ app.post('/api/admin/withdrawals/bulk-approve', adminAuth, requirePermission('wi
 // Admins are just platform users granted console access — there is no separate
 // admin password. They always log in with the same email + password they use
 // on the main QAVIX GLOBAL site.
-app.get('/api/admin/admins', adminAuth, requireRole('Super Admin'), async (_,res) => {
+app.get('/api/admin/admins', adminAuth, requirePermission('admins'), async (_,res) => {
   try {
     const {rows} = await db(
       `SELECT a.id, a.role, a.status, a.last_login, a.created_at, a.permissions, u.name, u.email FROM admins a
@@ -4200,7 +4207,7 @@ app.get('/api/admin/admins', adminAuth, requireRole('Super Admin'), async (_,res
 });
 
 // Update a single admin's custom permissions (Super Admin only)
-app.put('/api/admin/admins/:id/permissions', adminAuth, requireRole('Super Admin'), async (req,res) => {
+app.put('/api/admin/admins/:id/permissions', adminAuth, requirePermission('admins'), async (req,res) => {
   try {
     const {permissions} = req.body;
     if (!permissions || typeof permissions !== 'object') return res.status(400).json({success:false,message:'Permissions object required'});
@@ -4211,7 +4218,7 @@ app.put('/api/admin/admins/:id/permissions', adminAuth, requireRole('Super Admin
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
-app.post('/api/admin/admins', adminAuth, requireRole('Super Admin'), async (req,res) => {
+app.post('/api/admin/admins', adminAuth, requirePermission('admins'), async (req,res) => {
   try {
     const {email, role} = req.body;
     if (!email) return res.status(400).json({success:false,message:'Email is required'});
@@ -4230,7 +4237,7 @@ app.post('/api/admin/admins', adminAuth, requireRole('Super Admin'), async (req,
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
-app.put('/api/admin/admins/:id/approve', adminAuth, requireRole('Super Admin'), async (req,res) => {
+app.put('/api/admin/admins/:id/approve', adminAuth, requirePermission('admins'), async (req,res) => {
   try {
     const {rows} = await db(
       `UPDATE admins SET status='active' WHERE id=$1 AND status='pending' RETURNING id,user_id,role,status`,[req.params.id]);
@@ -4241,7 +4248,7 @@ app.put('/api/admin/admins/:id/approve', adminAuth, requireRole('Super Admin'), 
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
-app.put('/api/admin/admins/:id', adminAuth, requireRole('Super Admin'), async (req,res) => {
+app.put('/api/admin/admins/:id', adminAuth, requirePermission('admins'), async (req,res) => {
   try {
     const {role, status} = req.body;
     if (role === 'Owner') return res.status(400).json({success:false,message:'There can only be one Owner account — it cannot be assigned here.'});
@@ -4258,7 +4265,7 @@ app.put('/api/admin/admins/:id', adminAuth, requireRole('Super Admin'), async (r
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
-app.delete('/api/admin/admins/:id', adminAuth, requireRole('Super Admin'), async (req,res) => {
+app.delete('/api/admin/admins/:id', adminAuth, requirePermission('admins'), async (req,res) => {
   try {
     if (req.params.id === req.admin.id) return res.status(400).json({success:false,message:'You cannot remove your own account'});
     const {rows:[target]} = await db('SELECT role FROM admins WHERE id=$1',[req.params.id]);
