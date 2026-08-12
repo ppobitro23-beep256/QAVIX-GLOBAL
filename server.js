@@ -1106,15 +1106,15 @@ const sendEmail = async (toEmail, toName, subject, htmlBody) => {
 
 // ── OTP Config ───────────────────────────────────────────────────────────
 const OTP_CONFIG = {
-  register          : { expiry: 5,  subject: '📧 Verify Your QAVIX Account',       action: 'verify your registration'     },
-  login             : { expiry: 5,  subject: '🔑 QAVIX Login Verification',         action: 'complete your login'           },
-  withdraw          : { expiry: 3,  subject: '💸 QAVIX Withdrawal Confirmation',    action: 'confirm your withdrawal'       },
-  password_reset    : { expiry: 10, subject: '🔓 QAVIX Password Reset',             action: 'reset your password'           },
-  withdraw_password : { expiry: 5,  subject: '🔐 QAVIX Withdrawal Password Change', action: 'change your withdrawal password'},
-  change_email      : { expiry: 5,  subject: '📧 QAVIX Email Change Verification',  action: 'change your email'             },
-  change_password   : { expiry: 5,  subject: '🔑 QAVIX Password Change',            action: 'change your login password'    },
-  admin_login       : { expiry: 5,  subject: '🛡️ QAVIX Admin Panel — New Sign-in',  action: 'verify this admin sign-in'     },
-  wallet_address_change : { expiry: 5, subject: '💳 QAVIX Withdrawal Wallet Change', action: 'change your withdrawal wallet address' },
+  register          : { expiry: 5,  subject: 'Verify your QAVIX GLOBAL account',        action: 'verify your registration'     },
+  login             : { expiry: 5,  subject: 'Your QAVIX GLOBAL login code',             action: 'complete your login'           },
+  withdraw          : { expiry: 3,  subject: 'Confirm your QAVIX GLOBAL withdrawal',     action: 'confirm your withdrawal'       },
+  password_reset    : { expiry: 10, subject: 'Reset your QAVIX GLOBAL password',         action: 'reset your password'           },
+  withdraw_password : { expiry: 5,  subject: 'QAVIX GLOBAL withdrawal password change',  action: 'change your withdrawal password'},
+  change_email      : { expiry: 5,  subject: 'Verify your new QAVIX GLOBAL email',       action: 'change your email'             },
+  change_password   : { expiry: 5,  subject: 'QAVIX GLOBAL password change code',        action: 'change your login password'    },
+  admin_login       : { expiry: 5,  subject: 'QAVIX GLOBAL admin panel sign-in code',    action: 'verify this admin sign-in'     },
+  wallet_address_change : { expiry: 5, subject: 'QAVIX GLOBAL withdrawal wallet change', action: 'change your withdrawal wallet address' },
 };
 
 const MAX_RESENDS   = 3;   // max resend attempts in 10 minutes
@@ -1252,7 +1252,7 @@ const verifyOTP = async (email, code, purpose) => {
 
 // Send OTP email via Brevo HTTP API
 const sendOTPMail = async (toEmail, otp, purpose) => {
-  const cfg = OTP_CONFIG[purpose] || { subject:'🔐 QAVIX Verification', expiry:5 };
+  const cfg = OTP_CONFIG[purpose] || { subject:'Your QAVIX GLOBAL verification code', expiry:5 };
   await sendEmail(toEmail, toEmail, cfg.subject, buildOTPEmail(otp, purpose, cfg.expiry));
   console.log(`✅ OTP sent [${purpose}] → ${toEmail}`);
 };
@@ -4037,7 +4037,13 @@ app.get('/api/admin/withdrawals/export', adminAuth, requirePermission('withdrawa
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
-app.put('/api/admin/withdrawals/:id/approve', adminAuth, requirePermission('withdrawals'), async (req,res) => {
+// approve/paid/bulk-approve are money-moving actions (auto-payout sends real
+// USDT, or records a manual send as confirmed) — locked to Owner only via
+// requireRole() with no arguments, which is NOT overridable through the
+// Permissions Matrix (unlike requirePermission). reject and force-reset don't
+// move funds out, and list/export stay on requirePermission('withdrawals') so
+// any admin with that module enabled can still see the withdrawals page.
+app.put('/api/admin/withdrawals/:id/approve', adminAuth, requireRole(), async (req,res) => {
   try {
     // Atomically claim it first — 'processing' is a brief transitional state
     // that closes the double-click/two-admin race: only one request can flip
@@ -4110,7 +4116,7 @@ app.put('/api/admin/withdrawals/:id/reject', adminAuth, requirePermission('withd
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
-app.put('/api/admin/withdrawals/:id/paid', adminAuth, requirePermission('withdrawals'), async (req,res) => {
+app.put('/api/admin/withdrawals/:id/paid', adminAuth, requireRole(), async (req,res) => {
   try {
     const {payoutTxnId} = req.body;
     if (!payoutTxnId) return res.status(400).json({success:false,message:'Payout transaction ID required'});
@@ -4159,7 +4165,7 @@ app.put('/api/admin/withdrawals/:id/force-reset', adminAuth, requirePermission('
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
-app.post('/api/admin/withdrawals/bulk-approve', adminAuth, requirePermission('withdrawals'), async (req,res) => {
+app.post('/api/admin/withdrawals/bulk-approve', adminAuth, requireRole(), async (req,res) => {
   try {
     const { ids } = req.body;
     if (!Array.isArray(ids) || !ids.length) return res.status(400).json({success:false,message:'No withdrawals selected'});
