@@ -1124,12 +1124,21 @@ const MAX_ATTEMPTS  = 5;   // max wrong OTP attempts before invalidation
 const buildOTPEmail = (otp, purpose, expiryMin) => `
 <!DOCTYPE html>
 <html>
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"></head>
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<!-- Tells Gmail/Outlook/Apple Mail "this email is intentionally dark-themed" so
+     their automatic dark-mode color inversion doesn't touch it. Without this,
+     some clients invert the background to white while leaving the light-gold
+     text color unchanged, making the whole email look blank/unreadable —
+     exactly the "blank page" symptom reported by users, and not a network issue. -->
+<meta name="color-scheme" content="dark">
+<meta name="supported-color-schemes" content="dark">
+</head>
 <body style="margin:0;padding:16px 10px;background:#0a0a0a;font-family:Arial,sans-serif">
   <div style="max-width:480px;margin:0 auto;background:#111;border-radius:20px;overflow:hidden;border:1px solid rgba(201,162,39,0.25);box-shadow:0 0 50px rgba(201,162,39,0.08)">
 
     <!-- Gold accent bar -->
     <div style="height:3px;background:linear-gradient(90deg,#9B7A10,#E8C84A 25%,#C9A227 50%,#E8C84A 75%,#9B7A10)"></div>
+
 
     <!-- Header -->
     <div style="background:radial-gradient(ellipse at 50% -20%,rgba(201,162,39,0.16),transparent 60%),linear-gradient(135deg,#0d0d0d 0%,#1a1208 100%);padding:26px 20px;text-align:center;border-bottom:1px solid rgba(201,162,39,0.2)">
