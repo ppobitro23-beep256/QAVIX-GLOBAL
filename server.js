@@ -4472,6 +4472,54 @@ app.get('/api/admin/referrals/network', adminAuth, requirePermission('referral')
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
+// ── Transfer downline — move a user under a new upline/referrer ────────────
+// Only future commissions are affected; past commission transactions are
+// never rewritten. Blocks self-reference and circular loops (moving a user
+// underneath someone who is already in that user's own downline).
+app.put('/api/admin/referrals/transfer', adminAuth, requirePermission('referral'), async (req,res) => {
+  try {
+    const userQ    = (req.body.user||'').trim();
+    const uplineQ  = (req.body.newUpline||'').trim();
+    if(!userQ || !uplineQ) return res.status(400).json({success:false,message:'Both user and new upline are required'});
+
+    const {rows:userRows} = await db(
+      `SELECT id,name,email,uid,referred_by FROM users WHERE email ILIKE $1 OR uid ILIKE $1 LIMIT 1`,[userQ]);
+    if(!userRows.length) return res.status(404).json({success:false,message:`User not found: "${userQ}"`});
+    const user = userRows[0];
+
+    const {rows:upRows} = await db(
+      `SELECT id,name,email,uid FROM users WHERE email ILIKE $1 OR uid ILIKE $1 LIMIT 1`,[uplineQ]);
+    if(!upRows.length) return res.status(404).json({success:false,message:`New upline not found: "${uplineQ}"`});
+    const newUpline = upRows[0];
+
+    if(newUpline.id === user.id)
+      return res.status(400).json({success:false,message:'A user cannot be their own upline'});
+    if(newUpline.id === user.referred_by)
+      return res.status(400).json({success:false,message:`${user.name} is already under ${newUpline.name}`});
+
+    // Circular-loop guard — walk newUpline's own upline chain; if `user` shows
+    // up in it, moving would create a loop (user would end up upline of themself).
+    // Cap is generous (500) since referral depth itself is unlimited — only
+    // commission payouts stop at L10, the tree can still run much deeper.
+    let curId = newUpline.id, hops=0;
+    while(curId && hops<500){
+      if(curId === user.id)
+        return res.status(400).json({success:false,message:`Cannot move — ${newUpline.name} is currently in ${user.name}'s downline. That would create a circular referral loop.`});
+      const {rows:cur} = await db(`SELECT referred_by FROM users WHERE id=$1`,[curId]);
+      curId = cur.length ? cur[0].referred_by : null;
+      hops++;
+    }
+
+    await db(`UPDATE users SET referred_by=$1 WHERE id=$2`,[newUpline.id, user.id]);
+    await logAdmin(req.admin.id, 'Transferred downline', {
+      user: `${user.name} (${user.uid})`,
+      from: user.referred_by || 'none (was direct signup)',
+      to: `${newUpline.name} (${newUpline.uid})`
+    });
+
+    res.json({success:true, message:`${user.name} moved under ${newUpline.name}. Future commissions from ${user.name} now flow to the new upline chain.`});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
 
 // ── Reports (real SQL aggregation, no fabricated numbers) ──────────────────
 const fmtNum = (n) => parseFloat(n||0);
