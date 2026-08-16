@@ -890,6 +890,17 @@ const initDB = async () => {
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
 
+    -- Caches geo-IP lookups so the Multi-Account (IP) Checker never re-hits
+    -- the external lookup service for an IP it has already resolved.
+    CREATE TABLE IF NOT EXISTS ip_geo_cache (
+      ip_address VARCHAR(64) PRIMARY KEY,
+      country    VARCHAR(100),
+      region     VARCHAR(100),
+      city       VARCHAR(100),
+      isp        VARCHAR(150),
+      looked_up_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
     -- ── Phase 5: Announcements (popup/banner shown on index.html) ───────
     CREATE TABLE IF NOT EXISTS announcements (
       id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -1567,6 +1578,34 @@ let LIVE_SALARY_SETTINGS = {...DEFAULT_SALARY_SETTINGS};
 // Extract the real client IP, accounting for Render's reverse proxy.
 const getClientIp = (req) =>
   req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || req.connection?.remoteAddress || 'unknown';
+
+// Resolves an IP to city/region/country/ISP for the admin's Multi-Account
+// (IP) Checker. Cached in ip_geo_cache forever (an IP's approximate location
+// essentially never changes) so repeat lookups never re-hit the external
+// service — important since the checker may show the same shared IP across
+// many flagged accounts. Fails soft: a lookup error just means "location
+// unknown" for that IP, never blocks the checker itself.
+async function geoLookupIP(ip) {
+  if (!ip || ip === 'unknown' || ip === '::1' || ip === '127.0.0.1' || ip.startsWith('192.168.') || ip.startsWith('10.'))
+    return { country: null, region: null, city: null, isp: null };
+  try {
+    const { rows: cached } = await db('SELECT country,region,city,isp FROM ip_geo_cache WHERE ip_address=$1', [ip]);
+    if (cached.length) return cached[0];
+    const resp = await fetch(`https://ipwho.is/${encodeURIComponent(ip)}`);
+    const j = await resp.json();
+    const geo = j.success !== false
+      ? { country: j.country || null, region: j.region || null, city: j.city || null, isp: j.connection?.isp || null }
+      : { country: null, region: null, city: null, isp: null };
+    await db(
+      `INSERT INTO ip_geo_cache(ip_address,country,region,city,isp) VALUES($1,$2,$3,$4,$5)
+       ON CONFLICT (ip_address) DO UPDATE SET country=$2,region=$3,city=$4,isp=$5,looked_up_at=NOW()`,
+      [ip, geo.country, geo.region, geo.city, geo.isp]
+    ).catch(()=>{});
+    return geo;
+  } catch (e) {
+    return { country: null, region: null, city: null, isp: null };
+  }
+}
 
 const loadSettingsCache = async () => {
   try {
@@ -5236,6 +5275,52 @@ app.delete('/api/admin/security/failed-logins', adminAuth, requireRole('Super Ad
     await db('DELETE FROM admin_login_attempts');
     await logAdmin(req.admin.id, 'Cleared failed login log');
     res.json({success:true,message:'Failed login log cleared'});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── Multi-Account (IP) Checker ──────────────────────────────────────────────
+// Groups login_history by IP address to surface any IP that multiple distinct
+// user accounts have logged in from — the classic multi-accounting signal.
+// A single promoter genuinely working from their own phone/laptop only ever
+// shows up under one IP; someone running several "referral" accounts from the
+// same device/network shows up here immediately. Each flagged IP is resolved
+// to an approximate city/region/country (cached) so a shared IP a world apart
+// from a promoter's claimed location is easy to spot at a glance.
+app.get('/api/admin/security/ip-checker', adminAuth, requirePermission('security'), async (req,res) => {
+  try {
+    const { rows: groups } = await db(`
+      SELECT ip, array_agg(DISTINCT user_id) AS user_ids,
+             COUNT(DISTINCT user_id) AS account_count,
+             COUNT(*) AS login_count,
+             MIN(created_at) AS first_seen,
+             MAX(created_at) AS last_seen
+      FROM login_history
+      WHERE ip IS NOT NULL AND ip <> 'unknown' AND ip <> '' AND user_id IS NOT NULL
+      GROUP BY ip
+      HAVING COUNT(DISTINCT user_id) > 1
+      ORDER BY COUNT(DISTINCT user_id) DESC, MAX(created_at) DESC
+      LIMIT 100
+    `);
+
+    const results = [];
+    for (const g of groups) {
+      const ids = g.user_ids;
+      const ph = ids.map((_,i)=>`$${i+1}`).join(',');
+      const { rows: users } = await db(
+        `SELECT id,name,uid,email,admin_tag,status,created_at FROM users WHERE id IN (${ph}) ORDER BY created_at ASC`, ids);
+      const geo = await geoLookupIP(g.ip);
+      results.push({
+        ip: g.ip,
+        accountCount: parseInt(g.account_count,10),
+        loginCount: parseInt(g.login_count,10),
+        firstSeen: g.first_seen,
+        lastSeen: g.last_seen,
+        location: geo,
+        users: users.map(u=>({ id:u.id, name:u.name, uid:u.uid, email:u.email, adminTag:u.admin_tag, status:u.status, joinedAt:u.created_at })),
+      });
+    }
+
+    res.json({success:true, data:{ ipGroups: results, totalFlaggedIps: results.length }});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
