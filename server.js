@@ -3643,14 +3643,14 @@ app.get('/api/admin/users', adminAuth, requirePermission('users'), async (req,re
     const plan = (req.query.plan||'').toLowerCase();
     const dateRange = req.query.dateRange||'';
     let where = [], params = [];
-    if (search) { params.push(`%${search}%`); where.push(`(name ILIKE $${params.length} OR email ILIKE $${params.length} OR uid ILIKE $${params.length})`); }
-    if (status) { params.push(status); where.push(`status=$${params.length}`); }
-    if (plan) { params.push(plan); where.push(`membership_level=$${params.length}`); }
-    if (dateRange === '7d') where.push(`created_at > NOW() - INTERVAL '7 days'`);
-    if (dateRange === '30d') where.push(`created_at > NOW() - INTERVAL '30 days'`);
-    if (dateRange === 'year') where.push(`created_at > date_trunc('year', NOW())`);
+    if (search) { params.push(`%${search}%`); where.push(`(u.name ILIKE $${params.length} OR u.email ILIKE $${params.length} OR u.uid ILIKE $${params.length})`); }
+    if (status) { params.push(status); where.push(`u.status=$${params.length}`); }
+    if (plan) { params.push(plan); where.push(`u.membership_level=$${params.length}`); }
+    if (dateRange === '7d') where.push(`u.created_at > NOW() - INTERVAL '7 days'`);
+    if (dateRange === '30d') where.push(`u.created_at > NOW() - INTERVAL '30 days'`);
+    if (dateRange === 'year') where.push(`u.created_at > date_trunc('year', NOW())`);
     const whereSql = where.length ? 'WHERE '+where.join(' AND ') : '';
-    const {rows:countRows} = await db(`SELECT COUNT(*) FROM users ${whereSql}`, params);
+    const {rows:countRows} = await db(`SELECT COUNT(*) FROM users u ${whereSql}`, params);
     params.push(limit, (page-1)*limit);
     const {rows} = await db(
       `SELECT u.id, u.name, u.email, u.uid, u.balance, u.total_deposited, u.total_withdrawn,
@@ -3752,19 +3752,29 @@ app.get('/api/admin/users/:id/team', adminAuth, requirePermission('users'), asyn
       ) SELECT * FROM t ORDER BY lvl,created_at
     `,[req.params.id]);
     let activeSet = new Set();
+    let depositMap = {}; // user_id -> total approved deposit amount
     if(rows.length){
       const ids = rows.map(r=>r.id);
       const ph = ids.map((_,i)=>`$${i+1}`).join(',');
       const {rows:ar} = await db(`SELECT DISTINCT user_id FROM investments WHERE status='active' AND user_id IN (${ph})`,ids);
       ar.forEach(r=>activeSet.add(r.user_id));
+      const {rows:dr} = await db(`SELECT user_id, COALESCE(SUM(amount),0) AS total FROM transactions WHERE type='deposit' AND status='approved' AND user_id IN (${ph}) GROUP BY user_id`,ids);
+      dr.forEach(r=>{ depositMap[r.user_id] = parseFloat(r.total)||0; });
     }
     const byLvl={};
     rows.forEach(r=>{
       if(!byLvl[r.lvl]) byLvl[r.lvl]=[];
-      byLvl[r.lvl].push({id:r.id,name:r.name,uid:r.uid,level:r.membership_level,status:activeSet.has(r.id)?'active':'inactive',joinDate:r.created_at});
+      byLvl[r.lvl].push({id:r.id,name:r.name,uid:r.uid,level:r.membership_level,status:activeSet.has(r.id)?'active':'inactive',joinDate:r.created_at,totalDeposited:depositMap[r.id]||0});
     });
-    const levels = Object.entries(byLvl).map(([l,m])=>({level:parseInt(l),count:m.length,commission:LIVE_COMM[l]||0,members:m}));
-    res.json({success:true,data:{totalMembers:rows.length,levels,commissionRates:LIVE_COMM}});
+    const levels = Object.entries(byLvl).map(([l,m])=>({
+      level:parseInt(l),
+      count:m.length,
+      commission:LIVE_COMM[l]||0,
+      totalDeposited: m.reduce((s,x)=>s+x.totalDeposited,0),
+      members:m
+    }));
+    const teamTotalDeposited = levels.reduce((s,l)=>s+l.totalDeposited,0);
+    res.json({success:true,data:{totalMembers:rows.length,teamTotalDeposited,levels,commissionRates:LIVE_COMM}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
@@ -4518,6 +4528,64 @@ app.put('/api/admin/referrals/transfer', adminAuth, requirePermission('referral'
     });
 
     res.json({success:true, message:`${user.name} moved under ${newUpline.name}. Future commissions from ${user.name} now flow to the new upline chain.`});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── Promoter performance — are the users tagged "Promoters" actually driving
+// deposits, or just adding names with no follow-through? Ranked by their
+// team's total approved deposits, with a flag for anyone underperforming
+// relative to the average $-per-referral across all tagged promoters.
+app.get('/api/admin/promoters', adminAuth, requirePermission('referral'), async (req,res) => {
+  try {
+    const {rows: promoters} = await db(
+      `SELECT id,name,uid,email,created_at FROM users WHERE admin_tag='Promoters' ORDER BY created_at DESC`);
+
+    const results = [];
+    for (const p of promoters) {
+      const {rows: team} = await db(`
+        WITH RECURSIVE t AS (
+          SELECT id, created_at, 1 AS lvl FROM users WHERE referred_by=$1
+          UNION ALL
+          SELECT u.id, u.created_at, t.lvl+1
+          FROM users u JOIN t ON u.referred_by=t.id WHERE t.lvl<10
+        ) SELECT * FROM t
+      `, [p.id]);
+
+      let teamDeposit = 0, lastReferralJoin = null;
+      if (team.length) {
+        const ids = team.map(r=>r.id);
+        const ph = ids.map((_,i)=>`$${i+1}`).join(',');
+        const {rows: dep} = await db(
+          `SELECT COALESCE(SUM(amount),0) AS total FROM transactions WHERE type='deposit' AND status='approved' AND user_id IN (${ph})`, ids);
+        teamDeposit = parseFloat(dep[0].total) || 0;
+        lastReferralJoin = team.reduce((max,r)=> (!max || r.created_at > max) ? r.created_at : max, null);
+      }
+
+      results.push({
+        id: p.id, name: p.name, uid: p.uid, email: p.email, promoterSince: p.created_at,
+        teamSize: team.length, teamDeposit, lastReferralJoin
+      });
+    }
+
+    // Flag baseline: average $-per-referral among promoters who actually have
+    // a team. Anyone at $0 gets flagged outright; anyone well under half the
+    // average gets flagged too — a promoter can't fake this number since it's
+    // pulled straight from approved on-chain deposits, not self-reported.
+    const withTeam = results.filter(r=>r.teamSize>0);
+    const avgDepositPerReferral = withTeam.length
+      ? withTeam.reduce((s,r)=>s+(r.teamDeposit/r.teamSize),0)/withTeam.length
+      : 0;
+
+    const ranked = results.map(r=>{
+      const depositPerReferral = r.teamSize ? r.teamDeposit/r.teamSize : 0;
+      let flag = 'none';
+      if (r.teamSize===0) flag = 'no-activity';
+      else if (r.teamDeposit===0) flag = 'zero-deposit';
+      else if (avgDepositPerReferral>0 && depositPerReferral < avgDepositPerReferral*0.5) flag = 'below-average';
+      return { ...r, depositPerReferral, flag };
+    }).sort((a,b)=> b.teamDeposit - a.teamDeposit);
+
+    res.json({success:true, data:{promoters: ranked, avgDepositPerReferral}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
