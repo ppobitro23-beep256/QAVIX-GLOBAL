@@ -1641,6 +1641,12 @@ const REWARDS = [
 // deposit — never on later deposits and never on investment/plan purchases.
 const payComm = async (investorId, amount) => {
   if (!LIVE_REFERRAL.enabled) return;
+  // Users tagged "Promoters" are staff/marketing accounts, not genuine
+  // referred users — paying their upline a commission on a Promoter's own
+  // deposit would let someone farm free commission simply by depositing
+  // through a tagged account. Skip commission entirely for these deposits.
+  const {rows:[investor]} = await db('SELECT admin_tag FROM users WHERE id=$1',[investorId]);
+  if (investor?.admin_tag === 'Promoters') return;
   let cur = investorId;
   for (let lvl=1; lvl<=10; lvl++) {
     const {rows} = await db('SELECT id,name,referred_by FROM users WHERE id=$1',[cur]);
@@ -3567,16 +3573,24 @@ app.get('/api/admin/me', adminAuth, (req,res) => res.json({success:true,data:{ad
 // ── Dashboard stats ───────────────────────────────────────────────────────
 app.get('/api/admin/stats', adminAuth, async (_,res) => {
   try {
-    const [users, deposits, withdrawals, investments, today, managerDep, promoterDep] = await Promise.all([
+    const [users, deposits, withdrawals, investments, today, managerDep, promoterDep, promoterOwnDep] = await Promise.all([
       db(`SELECT COUNT(*) total, COUNT(*) FILTER (WHERE status='active') active, COUNT(*) FILTER (WHERE status='banned') banned, COUNT(*) FILTER (WHERE created_at::date=CURRENT_DATE) today FROM users`),
-      db(`SELECT COALESCE(SUM(amount) FILTER (WHERE status='approved'),0) total, COUNT(*) FILTER (WHERE status='pending') pending, COALESCE(SUM(amount) FILTER (WHERE created_at::date=CURRENT_DATE AND status='approved'),0) today FROM transactions WHERE type='deposit'`),
+      // Real USDT deposits, excluding anyone tagged "Promoters" — their own
+      // deposits are tracked separately below so they never inflate the
+      // platform-wide "Total Deposits" figure.
+      db(`SELECT COALESCE(SUM(t.amount) FILTER (WHERE t.status='approved'),0) total, COUNT(*) FILTER (WHERE t.status='pending') pending, COALESCE(SUM(t.amount) FILTER (WHERE t.created_at::date=CURRENT_DATE AND t.status='approved'),0) today
+            FROM transactions t JOIN users u ON u.id=t.user_id
+            WHERE t.type='deposit' AND u.admin_tag IS DISTINCT FROM 'Promoters'`),
       db(`SELECT COALESCE(SUM(amount) FILTER (WHERE status='approved'),0) total, COUNT(*) FILTER (WHERE status='pending') pending, COALESCE(SUM(amount) FILTER (WHERE created_at::date=CURRENT_DATE AND status='approved'),0) today FROM transactions WHERE type='withdrawal'`),
       db(`SELECT COUNT(*) FILTER (WHERE status='active') active, COALESCE(SUM(amount) FILTER (WHERE status='active'),0) capital FROM investments`),
-      db(`SELECT COALESCE(SUM(amount),0) profit FROM transactions WHERE type='deposit' AND status='approved' AND created_at::date=CURRENT_DATE`),
+      db(`SELECT COALESCE(SUM(t.amount),0) profit FROM transactions t JOIN users u ON u.id=t.user_id WHERE t.type='deposit' AND t.status='approved' AND t.created_at::date=CURRENT_DATE AND u.admin_tag IS DISTINCT FROM 'Promoters'`),
       // Manual admin-panel credits tagged 'Manager' — separate from normal on-chain/user deposits.
       db(`SELECT COALESCE(SUM(amount),0) total FROM transactions WHERE type='admin_adjustment' AND status='approved' AND amount>0 AND meta->>'tag'='Manager'`),
       // Manual admin-panel credits tagged 'Promoters' — separate from normal on-chain/user deposits.
       db(`SELECT COALESCE(SUM(amount),0) total FROM transactions WHERE type='admin_adjustment' AND status='approved' AND amount>0 AND meta->>'tag'='Promoters'`),
+      // Real USDT deposits made BY accounts tagged "Promoters" themselves —
+      // shown as its own figure instead of folded into Total Deposits.
+      db(`SELECT COALESCE(SUM(t.amount),0) total FROM transactions t JOIN users u ON u.id=t.user_id WHERE t.type='deposit' AND t.status='approved' AND u.admin_tag='Promoters'`),
     ]);
     res.json({success:true,data:{
       totalUsers: parseInt(users.rows[0].total), activeUsers: parseInt(users.rows[0].active), bannedUsers: parseInt(users.rows[0].banned), newUsersToday: parseInt(users.rows[0].today),
@@ -3584,7 +3598,8 @@ app.get('/api/admin/stats', adminAuth, async (_,res) => {
       totalWithdrawals: parseFloat(withdrawals.rows[0].total), pendingWithdrawals: parseInt(withdrawals.rows[0].pending), withdrawalsToday: parseFloat(withdrawals.rows[0].today),
       activeInvestments: parseInt(investments.rows[0].active), capitalDeployed: parseFloat(investments.rows[0].capital),
       revenueToday: parseFloat(today.rows[0].profit),
-      managerDeposits: parseFloat(managerDep.rows[0].total), promoterDeposits: parseFloat(promoterDep.rows[0].total)
+      managerDeposits: parseFloat(managerDep.rows[0].total), promoterDeposits: parseFloat(promoterDep.rows[0].total),
+      promoterOwnDeposits: parseFloat(promoterOwnDep.rows[0].total)
     }});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
@@ -3936,15 +3951,16 @@ app.get('/api/admin/deposits', adminAuth, requirePermission('deposits'), async (
     const {rows:countRows} = await db(`SELECT COUNT(*) FROM transactions t WHERE t.type=$1 ${extra}`, params);
     params.push(limit, (page-1)*limit);
     const {rows} = await db(
-      `SELECT t.*, u.name, u.uid, u.email FROM transactions t JOIN users u ON u.id=t.user_id
+      `SELECT t.*, u.name, u.uid, u.email, u.admin_tag FROM transactions t JOIN users u ON u.id=t.user_id
        WHERE t.type=$1 ${extra} ORDER BY t.created_at DESC LIMIT $${params.length-1} OFFSET $${params.length}`, params);
     const {rows:kpi} = await db(`
       SELECT
-        COALESCE(SUM(amount) FILTER (WHERE created_at > NOW() - INTERVAL '30 days' AND status='approved'),0) total_30d,
-        COUNT(*) FILTER (WHERE status='pending') pending,
-        COUNT(*) FILTER (WHERE status='approved' AND reviewed_at::date=CURRENT_DATE) approved_today,
-        COUNT(*) FILTER (WHERE status='rejected' AND created_at > NOW() - INTERVAL '30 days') rejected_30d
-      FROM transactions WHERE type='deposit'`);
+        COALESCE(SUM(t.amount) FILTER (WHERE t.created_at > NOW() - INTERVAL '30 days' AND t.status='approved' AND u.admin_tag IS DISTINCT FROM 'Promoters'),0) total_30d,
+        COALESCE(SUM(t.amount) FILTER (WHERE t.created_at > NOW() - INTERVAL '30 days' AND t.status='approved' AND u.admin_tag='Promoters'),0) promoter_total_30d,
+        COUNT(*) FILTER (WHERE t.status='pending') pending,
+        COUNT(*) FILTER (WHERE t.status='approved' AND t.reviewed_at::date=CURRENT_DATE) approved_today,
+        COUNT(*) FILTER (WHERE t.status='rejected' AND t.created_at > NOW() - INTERVAL '30 days') rejected_30d
+      FROM transactions t JOIN users u ON u.id=t.user_id WHERE t.type='deposit'`);
     res.json({success:true,data:{deposits:ccAll(rows), total:parseInt(countRows[0].count), page, limit, kpis:cc(kpi[0])}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
