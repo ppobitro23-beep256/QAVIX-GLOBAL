@@ -3575,21 +3575,22 @@ app.get('/api/admin/stats', adminAuth, async (_,res) => {
   try {
     const [users, deposits, withdrawals, investments, today, managerDep, promoterDep, promoterOwnDep] = await Promise.all([
       db(`SELECT COUNT(*) total, COUNT(*) FILTER (WHERE status='active') active, COUNT(*) FILTER (WHERE status='banned') banned, COUNT(*) FILTER (WHERE created_at::date=CURRENT_DATE) today FROM users`),
-      // Real USDT deposits, excluding anyone tagged "Promoters" — their own
-      // deposits are tracked separately below so they never inflate the
-      // platform-wide "Total Deposits" figure.
-      db(`SELECT COALESCE(SUM(t.amount) FILTER (WHERE t.status='approved'),0) total, COUNT(*) FILTER (WHERE t.status='pending') pending, COALESCE(SUM(t.amount) FILTER (WHERE t.created_at::date=CURRENT_DATE AND t.status='approved'),0) today
-            FROM transactions t JOIN users u ON u.id=t.user_id
-            WHERE t.type='deposit' AND u.admin_tag IS DISTINCT FROM 'Promoters'`),
+      // Total Deposits counts every real USDT deposit, including ones made by
+      // accounts tagged "Promoters" — a promoter depositing their own money
+      // is a genuine deposit like anyone else's. What's tracked separately
+      // below is manual admin-panel credits tagged Manager/Promoters (a
+      // different kind of transaction entirely — not an on-chain deposit).
+      db(`SELECT COALESCE(SUM(amount) FILTER (WHERE status='approved'),0) total, COUNT(*) FILTER (WHERE status='pending') pending, COALESCE(SUM(amount) FILTER (WHERE created_at::date=CURRENT_DATE AND status='approved'),0) today FROM transactions WHERE type='deposit'`),
       db(`SELECT COALESCE(SUM(amount) FILTER (WHERE status='approved'),0) total, COUNT(*) FILTER (WHERE status='pending') pending, COALESCE(SUM(amount) FILTER (WHERE created_at::date=CURRENT_DATE AND status='approved'),0) today FROM transactions WHERE type='withdrawal'`),
       db(`SELECT COUNT(*) FILTER (WHERE status='active') active, COALESCE(SUM(amount) FILTER (WHERE status='active'),0) capital FROM investments`),
-      db(`SELECT COALESCE(SUM(t.amount),0) profit FROM transactions t JOIN users u ON u.id=t.user_id WHERE t.type='deposit' AND t.status='approved' AND t.created_at::date=CURRENT_DATE AND u.admin_tag IS DISTINCT FROM 'Promoters'`),
+      db(`SELECT COALESCE(SUM(amount),0) profit FROM transactions WHERE type='deposit' AND status='approved' AND created_at::date=CURRENT_DATE`),
       // Manual admin-panel credits tagged 'Manager' — separate from normal on-chain/user deposits.
       db(`SELECT COALESCE(SUM(amount),0) total FROM transactions WHERE type='admin_adjustment' AND status='approved' AND amount>0 AND meta->>'tag'='Manager'`),
       // Manual admin-panel credits tagged 'Promoters' — separate from normal on-chain/user deposits.
       db(`SELECT COALESCE(SUM(amount),0) total FROM transactions WHERE type='admin_adjustment' AND status='approved' AND amount>0 AND meta->>'tag'='Promoters'`),
-      // Real USDT deposits made BY accounts tagged "Promoters" themselves —
-      // shown as its own figure instead of folded into Total Deposits.
+      // Informational breakdown only — how much of Total Deposits above came
+      // from accounts tagged "Promoters" themselves. Already included in the
+      // main total; this is just a visibility subtotal, not an exclusion.
       db(`SELECT COALESCE(SUM(t.amount),0) total FROM transactions t JOIN users u ON u.id=t.user_id WHERE t.type='deposit' AND t.status='approved' AND u.admin_tag='Promoters'`),
     ]);
     res.json({success:true,data:{
@@ -3955,7 +3956,7 @@ app.get('/api/admin/deposits', adminAuth, requirePermission('deposits'), async (
        WHERE t.type=$1 ${extra} ORDER BY t.created_at DESC LIMIT $${params.length-1} OFFSET $${params.length}`, params);
     const {rows:kpi} = await db(`
       SELECT
-        COALESCE(SUM(t.amount) FILTER (WHERE t.created_at > NOW() - INTERVAL '30 days' AND t.status='approved' AND u.admin_tag IS DISTINCT FROM 'Promoters'),0) total_30d,
+        COALESCE(SUM(t.amount) FILTER (WHERE t.created_at > NOW() - INTERVAL '30 days' AND t.status='approved'),0) total_30d,
         COALESCE(SUM(t.amount) FILTER (WHERE t.created_at > NOW() - INTERVAL '30 days' AND t.status='approved' AND u.admin_tag='Promoters'),0) promoter_total_30d,
         COUNT(*) FILTER (WHERE t.status='pending') pending,
         COUNT(*) FILTER (WHERE t.status='approved' AND t.reviewed_at::date=CURRENT_DATE) approved_today,
