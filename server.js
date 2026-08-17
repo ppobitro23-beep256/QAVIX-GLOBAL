@@ -2281,8 +2281,10 @@ app.post('/api/plans/purchase', auth, async (req,res) => {
        VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
       [req.user.id, planId, plan.name, amt, daily, totalProfit, plan.days, end]
     );
-    // Deduct from balance — capital is locked permanently
-    await db('UPDATE users SET balance=balance-$1,total_deposited=total_deposited+$1 WHERE id=$2',[amt,req.user.id]);
+    // Deduct from balance — capital is locked permanently. This is NOT a new
+    // deposit (the money was already counted as deposited when it first came
+    // in), so total_deposited must stay untouched here — only balance moves.
+    await db('UPDATE users SET balance=balance-$1 WHERE id=$2',[amt,req.user.id]);
     // Reflect the highest plan tier ever reached as the user's membership level
     // (e.g. team tree badges, admin Users list "Plan" column, leaderboards).
     if (getTierRank(planId) > getTierRank(u.membership_level)) {
@@ -3626,6 +3628,31 @@ app.get('/api/admin/tag-deposits', adminAuth, async (req,res) => {
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
+// ── Active Investments drill-down (from the Dashboard tile) ────────────────
+// Two clearly separated lists: who actually has money working right now
+// (active investment, amount, plan), and who is just sitting on balance with
+// nothing invested — shown for visibility only, never folded into the
+// "Active Investments" count itself.
+app.get('/api/admin/investments/active-breakdown', adminAuth, requirePermission('investments'), async (req,res) => {
+  try {
+    const { rows: active } = await db(`
+      SELECT i.id, i.amount, i.plan_name, i.daily_income, i.days_total, i.days_elapsed, i.start_date,
+             u.id AS user_id, u.name, u.email, u.uid
+      FROM investments i JOIN users u ON u.id = i.user_id
+      WHERE i.status='active'
+      ORDER BY i.amount DESC
+    `);
+    const { rows: idle } = await db(`
+      SELECT u.id AS user_id, u.name, u.email, u.uid, u.balance
+      FROM users u
+      WHERE u.balance > 0
+        AND NOT EXISTS (SELECT 1 FROM investments i WHERE i.user_id = u.id AND i.status='active')
+      ORDER BY u.balance DESC
+    `);
+    res.json({success:true,data:{active:ccAll(active), idle:ccAll(idle)}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
 // ── Global search ─────────────────────────────────────────────────────────
 app.get('/api/admin/search', adminAuth, async (req, res) => {
   try {
@@ -4419,6 +4446,47 @@ app.get('/api/admin/investments/export', adminAuth, requirePermission('investmen
     ]);
     await logAdmin(req.admin.id, 'Exported investments CSV', {count:rows.length});
     sendCsv(res, `qavix-investments-${new Date().toISOString().slice(0,10)}.csv`, csv);
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── Cancel an investment — admin choice of whether to refund the principal.
+// Restricted to Super Admin+ since a refund moves real money. Cancelling
+// simply stops the plan (it's excluded from every 'active' query and the
+// daily-profit cron, which both filter on status='active'), leaving any
+// already-credited pending_profit untouched — only the locked capital is
+// optionally returned.
+app.put('/api/admin/investments/:id/cancel', adminAuth, requireRole('Super Admin'), async (req,res) => {
+  try {
+    const refund = !!req.body.refund;
+    const {rows:invRows} = await db('SELECT * FROM investments WHERE id=$1',[req.params.id]);
+    if (!invRows.length) return res.status(404).json({success:false,message:'Investment not found'});
+    const inv = invRows[0];
+    if (inv.status !== 'active') return res.status(400).json({success:false,message:`This plan is already ${inv.status}, nothing to cancel.`});
+
+    await db('UPDATE investments SET status=$1 WHERE id=$2',['cancelled', inv.id]);
+
+    if (refund) {
+      await db('UPDATE users SET balance=balance+$1 WHERE id=$2',[inv.amount, inv.user_id]);
+      await db(
+        `INSERT INTO transactions(user_id,type,amount,status,description,reviewed_by,reviewed_at,meta)
+         VALUES($1,'admin_adjustment',$2,'approved',$3,$4,NOW(),$5)`,
+        [inv.user_id, inv.amount, `Refund — ${inv.plan_name} cancelled by admin`, req.admin.id, JSON.stringify({reason:'investment_cancelled_refund', investmentId: inv.id})]
+      );
+    }
+
+    const {rows:u} = await db('SELECT name,email FROM users WHERE id=$1',[inv.user_id]);
+    await notif(inv.user_id, 'investment', `${inv.plan_name} cancelled`,
+      refund
+        ? `Your admin cancelled this plan and refunded $${parseFloat(inv.amount).toFixed(2)} to your balance.`
+        : `Your admin cancelled this plan. The invested amount was not refunded — contact support if you believe this is a mistake.`);
+
+    await logAdmin(req.admin.id, `Cancelled investment (${refund?'refunded':'no refund'})`, {
+      userId: inv.user_id, user: u[0]?.email, plan: inv.plan_name, amount: parseFloat(inv.amount), refund
+    });
+
+    res.json({success:true, message: refund
+      ? `Plan cancelled and $${parseFloat(inv.amount).toFixed(2)} refunded to the user's balance.`
+      : `Plan cancelled — no refund issued.`});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
