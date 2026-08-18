@@ -2049,6 +2049,23 @@ app.get('/api/auth/me', auth, (req,res) => res.json({success:true,data:{user:req
 // ── User ──────────────────────────────────────────────────────────────────
 app.get('/api/user/dashboard', auth, async (req,res) => {
   try {
+    // On-demand accrual before reading: bring this user's own investments
+    // current right now rather than waiting for the periodic cron. This is
+    // what makes the "Collect" button appear the instant 24h passes, since
+    // the dashboard is what renders that button. Safe to call every load —
+    // the WHERE clause only ever matches rows genuinely 24h+ overdue, and
+    // last_credit_at advances by exact 24h multiples, so it can't run twice
+    // for the same window even if this endpoint is hit repeatedly.
+    await db(
+      `UPDATE investments
+       SET pending_profit  = pending_profit + daily_income,
+           days_elapsed    = days_elapsed + 1,
+           earned_so_far   = earned_so_far + daily_income,
+           last_credit_at  = last_credit_at + INTERVAL '24 hours'
+       WHERE user_id=$1 AND status='active' AND end_date > NOW()
+         AND last_credit_at <= NOW() - INTERVAL '24 hours'`,
+      [req.user.id]
+    );
     const [{rows:[u]},{rows:inv},{rows:tx}] = await Promise.all([
       db('SELECT * FROM users WHERE id=$1',[req.user.id]),
       db("SELECT * FROM investments WHERE user_id=$1 AND status='active'",[req.user.id]),
@@ -2576,6 +2593,26 @@ app.post('/api/investments/:id/collect-profit', auth, async (req,res) => {
     // server dies or the DB blips partway through, everything rolls back and the
     // user's pending profit is still there to claim again. Nothing can vanish.
     const out = await withTx(async (q) => {
+      // On-demand accrual: don't wait for the periodic runDailyProfits cron to
+      // get around to this row. If this specific investment's own 24h window
+      // has already elapsed, credit it right here, right now, before the claim
+      // check below runs — so the button is claimable the instant 24h passes,
+      // not up to N minutes later. The cron still runs separately as a backup
+      // (e.g. to accrue profit and send notifications for plans nobody has
+      // opened the app to check), so this does not create double-credits: the
+      // cron's own WHERE last_credit_at <= NOW()-24h simply won't match rows
+      // already brought current here, since last_credit_at is advanced by
+      // exactly one 24h-multiple below, never further.
+      await q(
+        `UPDATE investments
+         SET pending_profit  = pending_profit + daily_income,
+             days_elapsed    = days_elapsed + 1,
+             earned_so_far   = earned_so_far + daily_income,
+             last_credit_at  = last_credit_at + INTERVAL '24 hours'
+         WHERE id=$1 AND user_id=$2 AND status='active' AND end_date > NOW()
+           AND last_credit_at <= NOW() - INTERVAL '24 hours'`,
+        [req.params.id, req.user.id]
+      );
       // Atomic claim: the `sel` CTE locks the row (FOR UPDATE) and reads the
       // current pending_profit; `upd` zeroes it only if it's still > 0 AND resets
       // last_credit_at = NOW() so the next accrual (and the UI countdown) is
@@ -5948,13 +5985,14 @@ initDB().then(async ()=>{
     registerTgWebhook(appUrl);
   });
 
-  // Check for due profit credits every hour. The query inside runDailyProfits
+  // Check for due profit credits every 2 minutes. The query inside runDailyProfits
   // only credits an investment once its OWN 24h window has elapsed (see
-  // last_credit_at check above), so running this hourly just means each
-  // investment gets paid within an hour of its true 24h mark — it does NOT
-  // cause extra/duplicate payouts, and it's safe across server restarts.
+  // last_credit_at check above), so running this frequently just means each
+  // investment gets paid within ~2 minutes of its true 24h mark instead of up
+  // to an hour — it does NOT cause extra/duplicate payouts (last_credit_at is
+  // reset on each credit), and it's safe across server restarts.
   setTimeout(runDailyProfits, 10_000);
-  setInterval(runDailyProfits, 60 * 60 * 1000);
+  setInterval(runDailyProfits, 2 * 60 * 1000);
 
   // Daily automatic backup → sent to admin Telegram (no persistent disk needed on Render)
   const runDailyBackup = async () => {
