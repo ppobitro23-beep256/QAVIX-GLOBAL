@@ -4871,8 +4871,13 @@ app.get('/api/admin/promoters', adminAuth, requirePermission('referral'), async 
     const {rows: promoters} = await db(
       `SELECT id,name,uid,email,created_at FROM users WHERE admin_tag='Promoters' ORDER BY created_at DESC`);
 
-    const results = [];
-    for (const p of promoters) {
+    // Parallelized: this used to loop through each promoter one at a time,
+    // awaiting a recursive CTE + a deposit-sum query before moving to the
+    // next — with dozens of promoters that's dozens of sequential round
+    // trips, which is exactly why this page's auto-refresh took so long.
+    // Running them concurrently cuts total wait time from "N × one round
+    // trip" down to roughly "one round trip", bounded by the DB pool.
+    const results = await Promise.all(promoters.map(async (p) => {
       const {rows: team} = await db(`
         WITH RECURSIVE t AS (
           SELECT id, created_at, 1 AS lvl FROM users WHERE referred_by=$1
@@ -4892,11 +4897,11 @@ app.get('/api/admin/promoters', adminAuth, requirePermission('referral'), async 
         lastReferralJoin = team.reduce((max,r)=> (!max || r.created_at > max) ? r.created_at : max, null);
       }
 
-      results.push({
+      return {
         id: p.id, name: p.name, uid: p.uid, email: p.email, promoterSince: p.created_at,
         teamSize: team.length, teamDeposit, lastReferralJoin
-      });
-    }
+      };
+    }));
 
     // Flag baseline: average $-per-referral among promoters who actually have
     // a team. Anyone at $0 gets flagged outright; anyone well under half the
@@ -5295,16 +5300,25 @@ app.put('/api/admin/settings/salary', adminAuth, requireRole('Super Admin'), asy
 app.get('/api/admin/salary/candidates', adminAuth, requirePermission('salary'), async (req,res) => {
   try {
     const { rows: referrers } = await db(`SELECT DISTINCT referred_by AS id FROM users WHERE referred_by IS NOT NULL`);
+    // Parallelized: this used to await computeSalaryProgress() one referrer at
+    // a time in a for-loop — each call does 4-5 sequential DB round trips, so
+    // with 100+ referrers that was 400-500+ round trips back-to-back. On a
+    // pooled/serverless DB (Neon) that easily blew past Render's request
+    // timeout, which is exactly what made this page hang on "loading" forever.
+    // Running them concurrently (bounded by the DB pool, not by this loop)
+    // turns total wait time from "N × one round trip" into roughly "one
+    // round trip", since Postgres itself services the parallel connections.
+    const allProgress = await Promise.all(referrers.map(r => computeSalaryProgress(r.id)));
     const results = [];
-    for (const r of referrers) {
-      const progress = await computeSalaryProgress(r.id);
+    referrers.forEach((r, i) => {
+      const progress = allProgress[i];
       // Anyone who already got paid or already has a pending application this
       // month belongs in the Applications tab / is done for the month, not here.
-      if (!progress || !progress.evaluation || progress.alreadyClaimedThisPeriod || progress.alreadyAppliedThisPeriod) continue;
+      if (!progress || !progress.evaluation || progress.alreadyClaimedThisPeriod || progress.alreadyAppliedThisPeriod) return;
       const { evaluation } = progress;
       const pct = evaluation.l1Min ? Math.round((Math.min(evaluation.l1Have, evaluation.l1Min) / evaluation.l1Min) * 100) : 0;
       results.push({ userId:r.id, evaluation, eligible:progress.canApply, personalPlanOk:progress.personalPlanOk, completionPct:pct, lastOrder:progress.lastOrder });
-    }
+    });
     const ids = results.map(r=>r.userId);
     let userMap = {};
     if (ids.length){
