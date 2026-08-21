@@ -1307,6 +1307,14 @@ const auth = async (req, res, next) => {
     const d = jwt.verify(h.split(' ')[1], process.env.JWT_SECRET);
     const {rows} = await db('SELECT * FROM users WHERE id=$1',[d.id]);
     if (!rows[0]) return res.status(401).json({success:false,message:'User not found'});
+    // Re-check ban/suspend status on EVERY request, not just at login. A JWT
+    // issued before a ban stays cryptographically valid until it expires —
+    // without this check, an admin banning a user who is already logged in
+    // does nothing: the user keeps a fully working session (deposit,
+    // withdraw, invest — everything) until their token happens to expire.
+    // This is what let a banned user submit a withdrawal request.
+    if (rows[0].status === 'banned')    return res.status(403).json({success:false,message:'Your account has been banned.'});
+    if (rows[0].status === 'suspended') return res.status(403).json({success:false,message:'Your account has been suspended. Contact support for help.'});
     req.user = safe(cc(rows[0]));
     next();
   } catch(e) {
@@ -2369,6 +2377,19 @@ app.post('/api/wallet/deposit', auth, async (req,res) => {
     const MIN=LIVE_PAYMENT.depositMin, amt=parseFloat(amount);
     if (!amt||amt<MIN) return res.status(400).json({success:false,message:`Min deposit $${MIN}`});
     if (!txHash||!txHash.trim()) return res.status(400).json({success:false,message:'Transaction hash required'});
+    // A real BEP20/Ethereum-style transaction hash is always exactly 66
+    // characters: "0x" followed by 64 hex digits (0-9, a-f). Rejecting
+    // anything that doesn't match this shape at submission time — before it
+    // ever reaches the admin queue — blocks the obvious-fake-hash trick
+    // (e.g. "0xaaaaaa...", or strings containing non-hex letters like
+    // "0xwwn2kvelyek...") that relies on a busy admin approving without
+    // checking on-chain. It does NOT verify the transaction actually
+    // happened on-chain or moved the right amount — that still requires
+    // manual review (or a future Moralis on-chain check) — it only screens
+    // out hashes that couldn't possibly be real.
+    if (!/^0x[a-fA-F0-9]{64}$/.test(txHash.trim())) {
+      return res.status(400).json({success:false,message:'Invalid transaction hash format'});
+    }
     // A transaction hash is a one-time reference to a real on-chain transfer —
     // block resubmitting the same hash (whether by the same user or a
     // different one) so it can never be counted/approved twice.
@@ -2833,6 +2854,27 @@ app.post('/api/rewards/claim', auth, (req,res) => claimReward(req,res,req.body.r
 
 app.post('/api/rewards/lucky', auth, async (req,res) => {
   try {
+    // Once-per-24h cooldown — reuses the same reward_claims table/pattern as
+    // claimReward() above. Before this check existed, this endpoint credited
+    // balance on EVERY call with no limit at all: nothing stopped a user from
+    // calling it in a loop hundreds of times to farm free money with zero
+    // deposit. This is what let one account build up $50+ in a single day
+    // purely from repeated spins (see the "Bonus" entries in their History).
+    const COOLDOWN_HOURS = 24;
+    const {rows:[existing]} = await db(
+      `SELECT claimed_at FROM reward_claims WHERE user_id=$1 AND reward_id='lucky_draw'`,
+      [req.user.id]
+    );
+    if (existing) {
+      const elapsedH = (Date.now() - new Date(existing.claimed_at)) / 3600000;
+      if (elapsedH < COOLDOWN_HOURS) {
+        return res.status(400).json({success:false,message:`Come back in ${Math.ceil(COOLDOWN_HOURS - elapsedH)}h for your next spin!`});
+      }
+      await db(`UPDATE reward_claims SET claimed_at=NOW() WHERE user_id=$1 AND reward_id='lucky_draw'`,[req.user.id]);
+    } else {
+      await db(`INSERT INTO reward_claims(user_id,reward_id,claimed_at) VALUES($1,'lucky_draw',NOW())`,[req.user.id]);
+    }
+
     const prizes=[{l:'🎉 $1.00 USDT',a:1},{l:'🎊 $0.50 USDT',a:0.5},{l:'😢 Try Again',a:0},{l:'💰 $2.00 USDT',a:2},{l:'✨ $0.25 USDT',a:0.25}];
     const p=prizes[Math.floor(Math.random()*prizes.length)];
     if (p.a>0) {
@@ -3612,7 +3654,7 @@ app.get('/api/admin/me', adminAuth, (req,res) => res.json({success:true,data:{ad
 // ── Dashboard stats ───────────────────────────────────────────────────────
 app.get('/api/admin/stats', adminAuth, async (_,res) => {
   try {
-    const [users, deposits, withdrawals, investments, today, managerDep, promoterDep, promoterOwnDep] = await Promise.all([
+    const [users, deposits, withdrawals, investments, today, managerDep, promoterDep, promoterDepCurrent, promoterOwnDep] = await Promise.all([
       db(`SELECT COUNT(*) total, COUNT(*) FILTER (WHERE status='active') active, COUNT(*) FILTER (WHERE status='banned') banned, COUNT(*) FILTER (WHERE created_at::date=CURRENT_DATE) today FROM users`),
       // Total Deposits counts every real USDT deposit, including ones made by
       // accounts tagged "Promoters" — a promoter depositing their own money
@@ -3620,13 +3662,31 @@ app.get('/api/admin/stats', adminAuth, async (_,res) => {
       // below is manual admin-panel credits tagged Manager/Promoters (a
       // different kind of transaction entirely — not an on-chain deposit).
       db(`SELECT COALESCE(SUM(amount) FILTER (WHERE status='approved'),0) total, COUNT(*) FILTER (WHERE status='pending') pending, COALESCE(SUM(amount) FILTER (WHERE created_at::date=CURRENT_DATE AND status='approved'),0) today FROM transactions WHERE type='deposit'`),
-      db(`SELECT COALESCE(SUM(amount) FILTER (WHERE status='approved'),0) total, COUNT(*) FILTER (WHERE status='pending') pending, COALESCE(SUM(amount) FILTER (WHERE created_at::date=CURRENT_DATE AND status='approved'),0) today FROM transactions WHERE type='withdrawal'`),
+      // Withdrawals never reach status='approved' — the approve action moves
+      // them straight to status='paid' (see /withdrawals/:id/approve below),
+      // 'approved' is not a state this row type ever holds. Filtering on
+      // 'approved' here silently matched zero rows, making Total/Today's
+      // Withdrawals always show $0 on the dashboard even after real payouts.
+      db(`SELECT COALESCE(SUM(amount) FILTER (WHERE status='paid'),0) total, COUNT(*) FILTER (WHERE status='pending') pending, COALESCE(SUM(amount) FILTER (WHERE created_at::date=CURRENT_DATE AND status='paid'),0) today FROM transactions WHERE type='withdrawal'`),
       db(`SELECT COUNT(*) FILTER (WHERE status='active') active, COALESCE(SUM(amount) FILTER (WHERE status='active'),0) capital FROM investments`),
       db(`SELECT COALESCE(SUM(amount),0) profit FROM transactions WHERE type='deposit' AND status='approved' AND created_at::date=CURRENT_DATE`),
       // Manual admin-panel credits tagged 'Manager' — separate from normal on-chain/user deposits.
-      db(`SELECT COALESCE(SUM(amount),0) total FROM transactions WHERE type='admin_adjustment' AND status='approved' AND amount>0 AND meta->>'tag'='Manager'`),
-      // Manual admin-panel credits tagged 'Promoters' — separate from normal on-chain/user deposits.
-      db(`SELECT COALESCE(SUM(amount),0) total FROM transactions WHERE type='admin_adjustment' AND status='approved' AND amount>0 AND meta->>'tag'='Promoters'`),
+      // Netted (no amount>0 filter): a debit transaction under the same tag —
+      // e.g. correcting an accidental double-credit — has a negative amount,
+      // so summing everything gives the true net total actually given rather
+      // than freezing at the highest credit ever made before a correction.
+      db(`SELECT COALESCE(SUM(amount),0) total FROM transactions WHERE type='admin_adjustment' AND status='approved' AND meta->>'tag'='Manager'`),
+      // "Total Promoter Deposit" — lifetime net total ever given under the
+      // Promoters tag (credits minus corrections), regardless of whether the
+      // recipient is still tagged Promoters today. A permanent audit figure.
+      db(`SELECT COALESCE(SUM(amount),0) total FROM transactions WHERE type='admin_adjustment' AND status='approved' AND meta->>'tag'='Promoters'`),
+      // "Current Promoter Deposit" — same net total, but restricted to users
+      // who are STILL tagged Promoters right now. Terminating a promoter
+      // (which demotes their admin_tag back to 'User') automatically drops
+      // their historical credits out of this figure without touching any
+      // transaction record — Total stays as the permanent audit trail,
+      // Current reflects only the promoters actually active today.
+      db(`SELECT COALESCE(SUM(t.amount),0) total FROM transactions t JOIN users u ON u.id=t.user_id WHERE t.type='admin_adjustment' AND t.status='approved' AND t.meta->>'tag'='Promoters' AND u.admin_tag='Promoters'`),
       // Informational breakdown only — how much of Total Deposits above came
       // from accounts tagged "Promoters" themselves. Already included in the
       // main total; this is just a visibility subtotal, not an exclusion.
@@ -3638,7 +3698,8 @@ app.get('/api/admin/stats', adminAuth, async (_,res) => {
       totalWithdrawals: parseFloat(withdrawals.rows[0].total), pendingWithdrawals: parseInt(withdrawals.rows[0].pending), withdrawalsToday: parseFloat(withdrawals.rows[0].today),
       activeInvestments: parseInt(investments.rows[0].active), capitalDeployed: parseFloat(investments.rows[0].capital),
       revenueToday: parseFloat(today.rows[0].profit),
-      managerDeposits: parseFloat(managerDep.rows[0].total), promoterDeposits: parseFloat(promoterDep.rows[0].total),
+      managerDeposits: parseFloat(managerDep.rows[0].total),
+      promoterDepositsTotal: parseFloat(promoterDep.rows[0].total), promoterDepositsCurrent: parseFloat(promoterDepCurrent.rows[0].total),
       promoterOwnDeposits: parseFloat(promoterOwnDep.rows[0].total)
     }});
   } catch(e){res.status(500).json({success:false,message:e.message});}
@@ -3651,13 +3712,22 @@ app.get('/api/admin/tag-deposits', adminAuth, async (req,res) => {
   try {
     const tag = req.query.tag;
     if (!['Manager','Promoters'].includes(tag)) return res.status(400).json({success:false,message:'Invalid tag'});
+    // Netted (no amount>0 filter): each user's total_given is credits MINUS
+    // any corrections/debits made under the same tag, so a mistaken $60
+    // credit later corrected with a $30 debit nets to $30 here, not $60.
+    // ?current=1 additionally restricts to users still tagged this way right
+    // now (so a terminated/re-tagged promoter drops out of the "Current"
+    // drill-down while remaining visible under the lifetime "Total" one).
+    const currentOnly = req.query.current === '1';
     const { rows } = await db(
       `SELECT u.id AS user_id, u.name, u.email, u.uid,
               SUM(t.amount) AS total_given, COUNT(t.id)::int AS times_given, MAX(t.created_at) AS last_given_at
        FROM transactions t
        JOIN users u ON u.id = t.user_id
-       WHERE t.type='admin_adjustment' AND t.status='approved' AND t.amount>0 AND t.meta->>'tag'=$1
+       WHERE t.type='admin_adjustment' AND t.status='approved' AND t.meta->>'tag'=$1
+         ${currentOnly ? `AND u.admin_tag=$1` : ''}
        GROUP BY u.id, u.name, u.email, u.uid
+       HAVING SUM(t.amount) <> 0
        ORDER BY total_given DESC`,
       [tag]
     );
@@ -4527,7 +4597,56 @@ app.put('/api/admin/investments/:id/cancel', adminAuth, requireRole('Super Admin
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
-// ── Referral system (real commission data from transactions) ───────────────
+// Terminate a Promoter: cancels ALL their active investment plans WITHOUT
+// refund (the invested capital — e.g. an admin-credited $30 — does not come
+// back to their balance), then demotes admin_tag back to 'User' so they drop
+// off the Promoter Performance list entirely and become a normal user. This
+// is deliberately a single atomic action (not "cancel plan" + "edit tag"
+// done separately) so a Super Admin can't accidentally leave a promoter
+// half-terminated — still tagged but with no plan, or de-tagged but still
+// earning daily profit on the plan they were given.
+app.post('/api/admin/promoters/:id/terminate', adminAuth, requireRole('Super Admin'), async (req,res) => {
+  try {
+    const { rows:[user] } = await db('SELECT id,name,email,admin_tag FROM users WHERE id=$1',[req.params.id]);
+    if (!user) return res.status(404).json({success:false,message:'User not found'});
+    // Defensive guard: only ever act on someone currently tagged Promoters.
+    // The button only appears on the Promoters page, but this blocks a
+    // mistaken or forged call (e.g. wrong :id typed directly against the
+    // API) from cancelling a normal user's plan and touching their tag.
+    if (user.admin_tag !== 'Promoters') {
+      return res.status(400).json({success:false,message:`${user.name} is not currently tagged as a Promoter — nothing to terminate.`});
+    }
+
+    const { rows: activeInv } = await db(
+      `SELECT id, plan_name, amount FROM investments WHERE user_id=$1 AND status='active'`,
+      [req.params.id]
+    );
+    for (const inv of activeInv) {
+      await db('UPDATE investments SET status=$1 WHERE id=$2', ['cancelled', inv.id]);
+      await db(
+        `INSERT INTO transactions(user_id,type,amount,status,description,reviewed_by,reviewed_at,meta)
+         VALUES($1,'admin_adjustment',0,'approved',$2,$3,NOW(),$4)`,
+        [req.params.id, `${inv.plan_name} cancelled — promoter terminated (no refund)`, req.admin.id,
+         JSON.stringify({reason:'promoter_terminated', investmentId: inv.id, originalAmount: inv.amount})]
+      );
+    }
+
+    await db(`UPDATE users SET admin_tag='User' WHERE id=$1`, [req.params.id]);
+
+    await notif(req.params.id, 'system', 'Account status updated',
+      activeInv.length
+        ? `Your promoter status has been removed and your active plan${activeInv.length>1?'s were':' was'} cancelled by an admin.`
+        : `Your promoter status has been removed by an admin.`);
+
+    await logAdmin(req.admin.id, `Terminated promoter ${user.email} — cancelled ${activeInv.length} plan(s), demoted to User`, {
+      userId: req.params.id, cancelledInvestments: activeInv.map(i=>({id:i.id, plan:i.plan_name, amount:parseFloat(i.amount)}))
+    });
+
+    res.json({success:true, message: `Promoter terminated — ${activeInv.length} plan(s) cancelled (no refund), tag removed.`});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+
 app.get('/api/admin/referrals/stats', adminAuth, async (_,res) => {
   try {
     const [refRow, networkRow, paidRow, topRow] = await Promise.all([
@@ -4689,6 +4808,57 @@ app.put('/api/admin/referrals/transfer', adminAuth, requirePermission('referral'
     });
 
     res.json({success:true, message:`${user.name} moved under ${newUpline.name}. Future commissions from ${user.name} now flow to the new upline chain.`});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── Suspicious Accounts — flags users whose balance is built mostly (or
+// entirely) from farmable 'bonus' transactions (Lucky Spin, check-in, tasks)
+// rather than real deposits. The specific pattern this exists to catch: the
+// Lucky Spin endpoint had no cooldown for a period and could be spammed for
+// free money — an account showing many same-day bonus credits and little/no
+// real deposit is the signature of that. Two tiers:
+//  - 'no_deposit': total bonus income above the threshold with $0 ever
+//    deposited — the clearest signal, basically guaranteed abuse.
+//  - 'high_ratio': has deposited something, but bonus income still dwarfs it
+//    (ratio-based) — worth a look, less certain than the first tier.
+app.get('/api/admin/suspicious-accounts', adminAuth, requirePermission('users'), async (req,res) => {
+  try {
+    const MIN_BONUS_TOTAL = 3;      // ignore trivial amounts (a couple of legit daily check-ins)
+    const MIN_BONUS_COUNT = 4;      // ignore one-off legitimate bonus claims
+    const { rows } = await db(
+      `SELECT u.id, u.name, u.email, u.uid, u.status, u.balance, u.total_deposited, u.created_at,
+              COUNT(t.id)::int AS bonus_count,
+              COALESCE(SUM(t.amount),0) AS bonus_total,
+              MAX(t.created_at) AS last_bonus_at,
+              MIN(t.created_at) AS first_bonus_at
+       FROM users u
+       JOIN transactions t ON t.user_id = u.id AND t.type='bonus' AND t.amount > 0
+       GROUP BY u.id
+       HAVING COALESCE(SUM(t.amount),0) >= $1 AND COUNT(t.id) >= $2
+       ORDER BY bonus_total DESC`,
+      [MIN_BONUS_TOTAL, MIN_BONUS_COUNT]
+    );
+    const flagged = rows.map(r => {
+      const bonusTotal = parseFloat(r.bonus_total);
+      const deposited  = parseFloat(r.total_deposited || 0);
+      const flag = deposited === 0 ? 'no_deposit'
+                 : bonusTotal > deposited * 3 ? 'high_ratio'
+                 : null;
+      // Farming shows up as many claims clustered in a short window (minutes
+      // apart, spammed) rather than spread out (one per real cooldown cycle).
+      const spanHours = (new Date(r.last_bonus_at) - new Date(r.first_bonus_at)) / 3600000;
+      const claimsPerHour = spanHours > 0 ? r.bonus_count / spanHours : r.bonus_count;
+      return { ...r, bonusTotal, deposited, flag, claimsPerHour: +claimsPerHour.toFixed(1) };
+    }).filter(r => r.flag);
+
+    res.json({success:true, data:{
+      accounts: ccAll(flagged),
+      summary: {
+        totalFlagged: flagged.length,
+        noDepositCount: flagged.filter(f=>f.flag==='no_deposit').length,
+        totalBonusAtRisk: +flagged.reduce((s,f)=>s+f.bonusTotal,0).toFixed(2),
+      }
+    }});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
