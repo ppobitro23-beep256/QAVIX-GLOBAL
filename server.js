@@ -1735,9 +1735,14 @@ const limitSecret = rateLimit({
 
 // Withdrawal submissions themselves — generous enough for real use, tight
 // enough to stop scripted abuse / accidental double-submit storms.
+// Tightened from 10/15min: withdrawals move real money, so this should be
+// hard to brute-force/spam in the first place — the DB-level checks below
+// (no stacking a second pending request, 24h cooldown after a rejection) are
+// the real protection, but the rate limit itself should never have allowed
+// 10 attempts in 15 minutes for something this sensitive.
 const limitWithdraw = rateLimit({
-  windowMs: 15*60000, max: 10, keyGenerator: byUser,
-  message: {success:false, message:'Too many withdrawal requests. Please wait a few minutes.'},
+  windowMs: 60*60000, max: 4, keyGenerator: byUser,
+  message: {success:false, message:'Too many withdrawal requests. Please wait before trying again.'},
 });
 
 // OTP issuance — stops someone spamming a user's inbox or burning our email quota.
@@ -2419,6 +2424,31 @@ app.post('/api/wallet/withdraw', auth, limitWithdraw, async (req,res) => {
     const {rows:[u]}=await db('SELECT balance,email,withdrawal_pass,wallet_address FROM users WHERE id=$1',[req.user.id]);
     if (parseFloat(u.balance)<amt) return res.status(400).json({success:false,message:'Insufficient balance'});
 
+    // ── No stacking multiple withdrawal requests ──
+    // A user can only have ONE withdrawal in flight (pending/processing/
+    // approved — anything not yet finished) at a time. Without this, nothing
+    // stopped someone from submitting several requests back to back while
+    // earlier ones were still awaiting review.
+    const {rows:[inFlight]} = await db(
+      `SELECT id FROM transactions WHERE user_id=$1 AND type='withdrawal' AND status IN ('pending','processing','approved') LIMIT 1`,
+      [req.user.id]);
+    if (inFlight) return res.status(400).json({success:false,message:'You already have a withdrawal request in review. Please wait for it to be processed before submitting another.'});
+
+    // ── Cooldown after a rejected withdrawal ──
+    // Stops immediate resubmission right after a rejection (which is exactly
+    // what let requests get spammed back-to-back). 24h gives admins a real
+    // review window instead of the same request just reappearing minutes later.
+    const REJECT_COOLDOWN_HOURS = 24;
+    const {rows:[lastRejected]} = await db(
+      `SELECT reviewed_at FROM transactions WHERE user_id=$1 AND type='withdrawal' AND status='rejected' ORDER BY reviewed_at DESC LIMIT 1`,
+      [req.user.id]);
+    if (lastRejected?.reviewed_at) {
+      const hoursSince = (Date.now() - new Date(lastRejected.reviewed_at)) / 3600000;
+      if (hoursSince < REJECT_COOLDOWN_HOURS) {
+        return res.status(400).json({success:false,message:`Your last withdrawal was rejected. Please wait ${Math.ceil(REJECT_COOLDOWN_HOURS - hoursSince)}h before submitting a new request.`});
+      }
+    }
+
     // ── Must have at least one active investment plan to withdraw ──
     const {rows:activePlans}=await db("SELECT id FROM investments WHERE user_id=$1 AND status='active' LIMIT 1",[req.user.id]);
     if (!activePlans.length) return res.status(400).json({success:false,message:'You must have an active investment plan to withdraw. Please purchase a plan first.'});
@@ -2444,10 +2474,16 @@ app.post('/api/wallet/withdraw', auth, limitWithdraw, async (req,res) => {
     const created = await withTx(async (q) => {
       // Atomic check-and-deduct: the WHERE re-checks balance at the moment of
       // the UPDATE (not from the earlier SELECT), so a double-submit race can
-      // only succeed once.
+      // only succeed once. total_withdrawn is deliberately NOT touched here —
+      // it's only incremented once a withdrawal actually reaches 'paid' (see
+      // the approve/mark-paid endpoints below). Incrementing it at request
+      // time made "Total Withdrawn" count money that hadn't left the platform
+      // yet — including withdrawals still pending review, and even rejected
+      // ones that weren't refunded — which is what made the profile's total
+      // look inflated and disconnected from the visible transaction history.
       const { rowCount } = await q(
-        'UPDATE users SET balance=balance-$1,total_withdrawn=total_withdrawn+$2 WHERE id=$3 AND balance>=$1',
-        [amt,net,req.user.id]);
+        'UPDATE users SET balance=balance-$1 WHERE id=$2 AND balance>=$1',
+        [amt,req.user.id]);
       if (rowCount === 0) return null;
       const {rows} = await q(
         `INSERT INTO transactions(user_id,type,amount,status,description,meta)
@@ -4284,6 +4320,10 @@ app.put('/api/admin/withdrawals/:id/approve', adminAuth, requireRole(), async (r
       await db(
         `UPDATE transactions SET status='paid', meta=$1, reviewed_by=$2, reviewed_at=NOW() WHERE id=$3`,
         [JSON.stringify({...meta, payoutTxHash:txHash, autoSent:true}), req.admin.id, req.params.id]);
+      // total_withdrawn only counts money that has actually left the platform
+      // — incremented here at the 'paid' moment, not back when the user first
+      // submitted the request (see /wallet/withdraw for why that changed).
+      await db(`UPDATE users SET total_withdrawn=total_withdrawn+$1 WHERE id=$2`, [tx.amount, tx.user_id]);
       await notif(tx.user_id,'withdrawal','Withdrawal Paid',`$${tx.amount} USDT (BEP20) has been sent. TX: ${txHash}`);
       await logAdmin(req.admin.id, `Approved + auto-paid withdrawal $${tx.amount}`, {withdrawalId:req.params.id,userId:tx.user_id,txHash});
       res.json({success:true,message:`Approved and sent automatically! $${tx.amount} USDT paid out.`,data:{txHash}});
@@ -4317,7 +4357,10 @@ app.put('/api/admin/withdrawals/:id/reject', adminAuth, requirePermission('withd
     if (refund) {
       const meta = tx.meta || {};
       const gross = parseFloat(tx.amount) + parseFloat(meta.fee||0);
-      await db('UPDATE users SET balance=balance+$1, total_withdrawn=total_withdrawn-$2 WHERE id=$3',[gross,tx.amount,tx.user_id]);
+      // total_withdrawn is untouched here — it was never incremented at
+      // request time (see /wallet/withdraw), so there's nothing to reverse.
+      // Only the balance itself needs restoring.
+      await db('UPDATE users SET balance=balance+$1 WHERE id=$2',[gross,tx.user_id]);
     }
     await notif(tx.user_id,'withdrawal','Withdrawal Rejected',(reason||'Your withdrawal request was rejected.') + (refund?' The amount has been refunded to your balance.':''));
     await logAdmin(req.admin.id, `Rejected withdrawal $${tx.amount}`, {withdrawalId:req.params.id,userId:tx.user_id,reason,refund:!!refund});
@@ -4344,6 +4387,9 @@ app.put('/api/admin/withdrawals/:id/paid', adminAuth, requireRole(), async (req,
        WHERE id=$3 AND status IN ('approved','processing') RETURNING *`,
       [JSON.stringify(meta), req.admin.id, req.params.id]);
     if (!tx) return res.status(400).json({success:false,message:'Only approved or stuck-processing withdrawals can be marked paid'});
+    // total_withdrawn only counts money that has actually left the platform —
+    // incremented here at the 'paid' moment, matching the auto-payout path.
+    await db(`UPDATE users SET total_withdrawn=total_withdrawn+$1 WHERE id=$2`, [tx.amount, tx.user_id]);
     await notif(tx.user_id,'withdrawal','Withdrawal Paid',`$${tx.amount} USDT (BEP20) has been sent. TX: ${payoutTxnId}`);
     await logAdmin(req.admin.id, `Marked withdrawal paid $${tx.amount}`, {withdrawalId:req.params.id,userId:tx.user_id,payoutTxHash:payoutTxnId});
     res.json({success:true,message:'Withdrawal marked as paid'});
@@ -5565,6 +5611,60 @@ app.get('/api/admin/logs', adminAuth, requirePermission('logs'), async (req,res)
 });
 
 // ── Phase 3: Security — Failed login attempts ─────────────────────────────
+// ── Data integrity: total_withdrawn audit/fix ───────────────────────────────
+// total_withdrawn used to be incremented the moment a withdrawal was
+// SUBMITTED, not when it actually got paid out — so any withdrawal that was
+// still pending, or was rejected without a refund, left this counter
+// permanently overstated for that user. The fix (see /api/wallet/withdraw
+// and the approve/mark-paid endpoints) stops new corruption going forward;
+// this pair of endpoints finds and repairs accounts still carrying the old
+// wrong number. The correct value is always: SUM of amounts on that user's
+// 'paid' withdrawal transactions — nothing else should ever count.
+app.get('/api/admin/data-fixes/withdrawn-audit', adminAuth, requireRole('Super Admin'), async (req,res) => {
+  try {
+    const { rows } = await db(`
+      SELECT u.id, u.name, u.uid, u.email, u.total_withdrawn AS stored,
+             COALESCE(SUM(t.amount) FILTER (WHERE t.type='withdrawal' AND t.status='paid'), 0) AS actual
+      FROM users u
+      LEFT JOIN transactions t ON t.user_id = u.id
+      GROUP BY u.id
+      HAVING u.total_withdrawn <> COALESCE(SUM(t.amount) FILTER (WHERE t.type='withdrawal' AND t.status='paid'), 0)
+      ORDER BY (u.total_withdrawn - COALESCE(SUM(t.amount) FILTER (WHERE t.type='withdrawal' AND t.status='paid'), 0)) DESC
+    `);
+    const affected = rows.map(r => ({
+      id: r.id, name: r.name, uid: r.uid, email: r.email,
+      stored: parseFloat(r.stored), actual: parseFloat(r.actual),
+      diff: +(parseFloat(r.stored) - parseFloat(r.actual)).toFixed(2),
+    }));
+    res.json({success:true, data:{
+      affected,
+      summary: { count: affected.length, totalOverstated: +affected.reduce((s,a)=>s+Math.max(a.diff,0),0).toFixed(2) }
+    }});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.post('/api/admin/data-fixes/withdrawn-audit/fix', adminAuth, requireRole('Super Admin'), async (req,res) => {
+  try {
+    const { userId } = req.body; // optional — omit to fix everyone at once
+    const { rows } = await db(`
+      SELECT u.id, u.total_withdrawn AS stored,
+             COALESCE(SUM(t.amount) FILTER (WHERE t.type='withdrawal' AND t.status='paid'), 0) AS actual
+      FROM users u
+      LEFT JOIN transactions t ON t.user_id = u.id
+      ${userId ? 'WHERE u.id=$1' : ''}
+      GROUP BY u.id
+      HAVING u.total_withdrawn <> COALESCE(SUM(t.amount) FILTER (WHERE t.type='withdrawal' AND t.status='paid'), 0)
+    `, userId ? [userId] : []);
+    for (const r of rows) {
+      await db(`UPDATE users SET total_withdrawn=$1 WHERE id=$2`, [parseFloat(r.actual), r.id]);
+    }
+    await logAdmin(req.admin.id, `Fixed total_withdrawn for ${rows.length} account(s)`, {
+      corrected: rows.map(r=>({userId:r.id, from:parseFloat(r.stored), to:parseFloat(r.actual)}))
+    });
+    res.json({success:true, message:`Corrected total_withdrawn for ${rows.length} account(s).`});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
 app.get('/api/admin/security/failed-logins', adminAuth, requirePermission('security'), async (req,res) => {
   try {
     const {rows} = await db(
