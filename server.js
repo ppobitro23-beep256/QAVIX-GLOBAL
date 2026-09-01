@@ -85,6 +85,30 @@ const GAS_RESERVE_INDEX      = 0;
 const GAS_RESERVE_LOW_THRESHOLD = parseFloat(process.env.GAS_RESERVE_LOW_THRESHOLD) || 0.01; // BNB — below this, alert admin
 const GAS_ALERT_COOLDOWN_HOURS  = 6; // don't re-alert more often than this while still low
 
+// ── Wrong-token deposits — a user sending USDC, BNB, or any other token to
+// their USDT deposit address instead of USDT. Before this existed, that
+// money just sat there permanently invisible: the main scanner only watches
+// for USDT Transfer events, and any stray native BNB above a few cents was
+// silently swept into the Gas Reserve by reclaimStrayGas() with no record at
+// all — meaning a user's real deposit could quietly become "free gas" for
+// the platform. This system instead sweeps ANY token/BNB found to the SAME
+// main collection wallet as normal deposits, and creates a 'pending' deposit
+// transaction so an admin sees exactly what arrived and decides the correct
+// USD credit — nothing here auto-credits a user's balance.
+// Amount is only ever pre-filled for known 1:1 USD stablecoins (still
+// requires admin review before approving); for anything else (BNB, an
+// unrecognized token) it's left at $0 so it's impossible to accidentally
+// approve a wrong dollar amount for an asset whose USD value isn't 1:1.
+const STABLECOIN_CONTRACTS = {
+  '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d': { symbol:'USDC', decimals:18 },
+  '0xe9e7cea3dedca5984780bafc599bd69add087d56': { symbol:'BUSD', decimals:18 },
+  '0x1af3f329e8be154074d8769d1ffa4ee058b1dbc3': { symbol:'DAI',  decimals:18 },
+};
+// Real gas top-ups are tiny (GAS_TOPUP_BNB, ~0.0008 BNB) and get reclaimed
+// right after each USDT sweep — anything at/above this is too large to be
+// our own leftover change, so it's treated as a genuine stray deposit.
+const STRAY_BNB_DEPOSIT_THRESHOLD_BNB = 0.003;
+
 // ── Withdrawal Wallet — a single, separate wallet admin tops up manually
 // (with USDT for payouts + a bit of BNB for gas). When configured, approving
 // a withdrawal in the admin panel automatically sends the USDT on-chain —
@@ -349,12 +373,251 @@ async function attemptSweep(depositId, index, childAddress) {
   }
 }
 
+// Sweeps a NON-USDT ERC20 token (e.g. USDC sent by mistake) out of a child
+// address into MAIN_COLLECTION_WALLET. Same pattern as attemptSweep (gas
+// top-up estimation, exact wei amount, gas reclaim after) but generalized to
+// any token contract instead of hardcoding USDT.
+async function attemptSweepOtherToken(depositId, index, childAddress, tokenContract) {
+  if (!MAIN_COLLECTION_WALLET || index==null) return;
+  try {
+    const { rows:[dep] } = await db(`SELECT amount_wei, swept FROM other_token_deposits WHERE id=$1`, [depositId]);
+    if (!dep || dep.swept || !dep.amount_wei) return;
+    const amountWei = BigInt(dep.amount_wei);
+    if (amountWei <= 0n) return;
+
+    const gasReserve  = deriveDepositWallet(GAS_RESERVE_INDEX).connect(bscProvider);
+    const childWallet = deriveDepositWallet(index).connect(bscProvider);
+    const token = new ethers.Contract(tokenContract, ['function transfer(address,uint256) returns (bool)'], childWallet);
+
+    let requiredWei;
+    try {
+      const feeData = await bscProvider.getFeeData();
+      const gasPrice = feeData.gasPrice || ethers.parseUnits('3', 'gwei');
+      let gasLimit;
+      try { gasLimit = await token.transfer.estimateGas(MAIN_COLLECTION_WALLET, amountWei); }
+      catch(e) { gasLimit = 80000n; } // slightly higher fallback than USDT — unknown tokens' transfer cost is less predictable
+      requiredWei = (gasPrice * gasLimit * 130n) / 100n;
+    } catch(e) {
+      requiredWei = ethers.parseEther(GAS_TOPUP_BNB);
+    }
+    const floorWei = ethers.parseEther(GAS_TOPUP_BNB);
+    if (requiredWei < floorWei) requiredWei = floorWei;
+
+    const childBnbBalance = await bscProvider.getBalance(childAddress);
+    if (childBnbBalance < requiredWei) {
+      const shortfall = requiredWei - childBnbBalance;
+      const topupTx = await gasReserve.sendTransaction({ to: childAddress, value: shortfall + (shortfall / 10n) });
+      await topupTx.wait(1);
+    }
+
+    const sweepTx = await token.transfer(MAIN_COLLECTION_WALLET, amountWei);
+    await sweepTx.wait(1);
+    await db(`UPDATE other_token_deposits SET swept=TRUE, sweep_tx_hash=$1, sweep_error=NULL WHERE id=$2`, [sweepTx.hash, depositId]);
+
+    try {
+      const leftover = await bscProvider.getBalance(childAddress);
+      const feeData2 = await bscProvider.getFeeData();
+      const nativeGasPrice = feeData2.gasPrice || ethers.parseUnits('3', 'gwei');
+      const reclaimTxCost = nativeGasPrice * 21000n;
+      if (leftover > reclaimTxCost * 2n) {
+        const gasReserveAddress = deriveDepositAddress(GAS_RESERVE_INDEX);
+        const reclaimTx = await childWallet.sendTransaction({ to: gasReserveAddress, value: leftover - reclaimTxCost, gasLimit: 21000n, gasPrice: nativeGasPrice });
+        await reclaimTx.wait(1);
+      }
+    } catch(e) { console.error(`Gas reclaim failed for other-token deposit ${depositId} (non-fatal):`, e.message); }
+  } catch (e) {
+    console.error(`Other-token sweep failed for deposit ${depositId}:`, e.message);
+    await db(`UPDATE other_token_deposits SET sweep_error=$1 WHERE id=$2`, [String(e.message||'').slice(0,500), depositId]).catch(()=>{});
+  }
+}
+
+// Sweeps native BNB found sitting in a child address (a user sent BNB by
+// mistake instead of USDT) straight to MAIN_COLLECTION_WALLET. Simpler than
+// the token sweeps — no gas top-up needed, the balance itself already covers
+// its own send cost — just reserve the gas cost out of the amount swept.
+async function attemptSweepNativeBnb(depositId, index, childAddress) {
+  if (!MAIN_COLLECTION_WALLET || index==null) return;
+  try {
+    const { rows:[dep] } = await db(`SELECT swept FROM other_token_deposits WHERE id=$1`, [depositId]);
+    if (!dep || dep.swept) return;
+    const childWallet = deriveDepositWallet(index).connect(bscProvider);
+    const balance = await bscProvider.getBalance(childAddress);
+    const feeData = await bscProvider.getFeeData();
+    const gasPrice = feeData.gasPrice || ethers.parseUnits('3', 'gwei');
+    const gasCost = gasPrice * 21000n;
+    if (balance <= gasCost * 2n) return; // not enough to be worth sweeping (right now — will retry next cycle)
+    const sendAmount = balance - gasCost;
+    const sweepTx = await childWallet.sendTransaction({ to: MAIN_COLLECTION_WALLET, value: sendAmount, gasLimit: 21000n, gasPrice });
+    await sweepTx.wait(1);
+    await db(`UPDATE other_token_deposits SET swept=TRUE, sweep_tx_hash=$1, sweep_error=NULL WHERE id=$2`, [sweepTx.hash, depositId]);
+  } catch (e) {
+    console.error(`Native BNB sweep failed for deposit ${depositId}:`, e.message);
+    await db(`UPDATE other_token_deposits SET sweep_error=$1 WHERE id=$2`, [String(e.message||'').slice(0,500), depositId]).catch(()=>{});
+  }
+}
+
+// Creates the 'pending' deposit transaction an admin reviews and approves —
+// shared by both the ERC20 scanner and the native-BNB scanner below.
+// amount is 0 unless the token is a known 1:1 stablecoin, specifically so a
+// volatile asset (BNB, an unrecognized token) can never be one-click
+// "Approved" for the wrong dollar amount — the admin must use "Set Amount"
+// (or Adjust Balance) after checking what it's actually worth.
+async function createForeignDepositRecord({ userId, tokenSymbol, tokenAmount, isStablecoin, txHash, fromAddress }) {
+  const creditAmount = isStablecoin ? tokenAmount : 0;
+  const { rows:[t] } = await db(
+    `INSERT INTO transactions(user_id,type,amount,status,description,meta) VALUES($1,'deposit',$2,'pending',$3,$4) RETURNING id`,
+    [userId, creditAmount,
+     `⚠ Wrong-token deposit: ${tokenAmount} ${tokenSymbol} detected` + (isStablecoin ? ' (stablecoin, ~1:1 USD — verify then approve)' : ' — needs manual USD valuation before crediting, use "Set Amount"'),
+     JSON.stringify({ network:'BEP20', txHash, isForeignToken:true, tokenSymbol, tokenAmount, isStablecoin, fromAddress })]
+  );
+  await notif(userId, 'deposit', 'Deposit Received (Under Review)',
+    `We detected ${tokenAmount} ${tokenSymbol} sent to your deposit address. This isn't USDT, so our team will verify and credit it manually — you'll be notified once approved.`);
+  return t.id;
+}
+
+let _otherTokenScannerRunning = false;
+// Scans confirmed blocks for ERC20 Transfer events landing in any known
+// deposit address, from ANY token contract EXCEPT USDT (which the main
+// scanner already handles). Uses its own block cursor so it never
+// interferes with scanOnchainDeposits's progress.
+async function scanOtherTokenDeposits() {
+  if (!hdMaster || !bscProvider || _otherTokenScannerRunning) return;
+  _otherTokenScannerRunning = true;
+  try {
+    const { rows: addrRows } = await db(`SELECT id, deposit_address, deposit_address_index FROM users WHERE deposit_address IS NOT NULL`);
+    if (!addrRows.length) return;
+    const addrToUser = {};
+    addrRows.forEach(r => { addrToUser[r.deposit_address.toLowerCase()] = { userId: r.id, index: r.deposit_address_index }; });
+    const knownAddresses = addrRows.map(r => r.deposit_address);
+
+    const { rows: settingsRows } = await db(`SELECT value FROM settings WHERE key='other_token_scanner'`);
+    let lastCheckedBlock = settingsRows[0]?.value?.lastCheckedBlock;
+    const latestBlock = await bscProvider.getBlockNumber();
+    const toBlock = latestBlock - DEPOSIT_CONFIRMATIONS;
+    if (!lastCheckedBlock) lastCheckedBlock = toBlock - 1;
+    if (toBlock <= lastCheckedBlock) return;
+
+    // Transfer(address,address,uint256) topic — same signature for every
+    // standard ERC20, so filtering by topic alone (no contract address)
+    // catches a transfer from ANY token contract, not just one we know about.
+    const TRANSFER_TOPIC = ethers.id('Transfer(address,address,uint256)');
+    const paddedAddrs = knownAddresses.map(a => ethers.zeroPadValue(a, 32));
+    const iface = new ethers.Interface(['event Transfer(address indexed from, address indexed to, uint256 value)']);
+    const CHUNK = 3000; // smaller than the USDT scanner's since this has no contract filter — broader match set per call
+    let cursor = lastCheckedBlock + 1;
+    while (cursor <= toBlock) {
+      const end = Math.min(cursor + CHUNK - 1, toBlock);
+      const logs = await bscProvider.getLogs({ fromBlock:cursor, toBlock:end, topics:[TRANSFER_TOPIC, null, paddedAddrs] });
+      for (const log of logs) {
+        const tokenContract = log.address.toLowerCase();
+        if (tokenContract === USDT_BEP20_CONTRACT.toLowerCase()) continue; // main scanner's territory
+        let parsed;
+        try { parsed = iface.parseLog(log); } catch(e) { continue; } // not a standard Transfer — skip silently
+        const toAddr = (parsed.args.to || '').toLowerCase();
+        const match = addrToUser[toAddr];
+        if (!match) continue;
+        const known = STABLECOIN_CONTRACTS[tokenContract];
+        let decimals = known?.decimals;
+        let tokenSymbol = known?.symbol;
+        if (known === undefined) {
+          // Unrecognized token — fetch its REAL decimals from the contract
+          // instead of assuming 18. Getting this wrong would make the
+          // displayed/credited amount wildly incorrect for any token that
+          // isn't 18-decimal (6 and 8 are both common on BSC/BEP20).
+          try {
+            const c = new ethers.Contract(tokenContract, [
+              'function symbol() view returns (string)',
+              'function decimals() view returns (uint8)',
+            ], bscProvider);
+            const [sym, dec] = await Promise.all([
+              c.symbol().catch(()=>'UNKNOWN TOKEN'),
+              c.decimals().catch(()=>18),
+            ]);
+            tokenSymbol = sym; decimals = Number(dec);
+          } catch(e) { tokenSymbol = 'UNKNOWN TOKEN'; decimals = 18; }
+        }
+        const amount = parseFloat(ethers.formatUnits(parsed.args.value, decimals));
+        if (!amount || amount <= 0) continue;
+        const logIndex = log.index ?? log.logIndex ?? 0;
+        try {
+          const { rows: inserted } = await db(
+            `INSERT INTO other_token_deposits(user_id, tx_hash, log_index, token_contract, token_symbol, from_address, to_address, amount, block_number, amount_wei)
+             VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (tx_hash, log_index) DO NOTHING RETURNING id`,
+            [match.userId, log.transactionHash, logIndex, tokenContract, tokenSymbol, parsed.args.from, toAddr, amount, log.blockNumber, parsed.args.value.toString()]);
+          if (!inserted.length) continue;
+          const txId = await createForeignDepositRecord({
+            userId: match.userId, tokenSymbol, tokenAmount: amount, isStablecoin: !!known,
+            txHash: log.transactionHash, fromAddress: parsed.args.from,
+          });
+          await db(`UPDATE other_token_deposits SET transaction_id=$1 WHERE id=$2`, [txId, inserted[0].id]);
+          await attemptSweepOtherToken(inserted[0].id, match.index, toAddr, tokenContract);
+        } catch (e) {
+          console.error('Other-token deposit credit error:', e.message);
+        }
+      }
+      cursor = end + 1;
+    }
+    await saveSetting('other_token_scanner', { lastCheckedBlock: toBlock }, null);
+    await retryStuckForeignDeposits();
+  } catch (e) {
+    console.error('Other-token scanner error:', e.message);
+  } finally {
+    _otherTokenScannerRunning = false;
+  }
+}
+
+// Recovery pass for the same reason retryFailedSweeps() exists for USDT:
+// if the process died/errored between inserting the other_token_deposits
+// dedup row and finishing the transaction-record + sweep steps, that row
+// would otherwise be permanently skipped (its dedup key already exists, so
+// the scanner's ON CONFLICT would never see it as new again). This catches
+// both halves: no linked pending-deposit record yet, or not swept yet.
+async function retryStuckForeignDeposits() {
+  try {
+    const { rows: missingTx } = await db(
+      `SELECT * FROM other_token_deposits WHERE transaction_id IS NULL ORDER BY created_at ASC LIMIT 20`);
+    for (const d of missingTx) {
+      try {
+        const known = d.token_contract ? STABLECOIN_CONTRACTS[d.token_contract] : null;
+        const txId = await createForeignDepositRecord({
+          userId: d.user_id, tokenSymbol: d.token_symbol, tokenAmount: parseFloat(d.amount), isStablecoin: !!known,
+          txHash: d.tx_hash.startsWith('stray-bnb-') ? null : d.tx_hash, fromAddress: d.from_address,
+        });
+        await db(`UPDATE other_token_deposits SET transaction_id=$1 WHERE id=$2`, [txId, d.id]);
+      } catch(e) { console.error(`Retry createForeignDepositRecord failed for ${d.id}:`, e.message); }
+    }
+    const { rows: unswept } = await db(
+      `SELECT id, token_contract, token_symbol, to_address, user_id FROM other_token_deposits WHERE swept=FALSE AND transaction_id IS NOT NULL ORDER BY created_at ASC LIMIT 20`);
+    for (const d of unswept) {
+      const { rows:[u] } = await db(`SELECT deposit_address_index FROM users WHERE id=$1`, [d.user_id]);
+      if (u?.deposit_address_index == null) continue;
+      if (d.token_symbol === 'BNB' && !d.token_contract) {
+        await attemptSweepNativeBnb(d.id, u.deposit_address_index, d.to_address);
+      } else if (d.token_contract) {
+        await attemptSweepOtherToken(d.id, u.deposit_address_index, d.to_address, d.token_contract);
+      }
+    }
+  } catch(e) {
+    console.error('retryStuckForeignDeposits error:', e.message);
+  }
+}
+
 // Sweeping already returns unused gas right after each transfer (see above),
 // but this catches any older/leftover BNB sitting in addresses from before
 // that existed (e.g. the $0.45 top-up sent under the old fixed-amount logic)
 // — runs periodically and reclaims anything above a worthwhile threshold.
+// IMPORTANT: only small leftover amounts (genuinely our own unused gas) get
+// reclaimed to the Gas Reserve here. Anything at/above
+// STRAY_BNB_DEPOSIT_THRESHOLD_BNB is too large to be leftover change — it's
+// treated as a real user deposit instead: swept to MAIN_COLLECTION_WALLET
+// and logged as a pending deposit for admin review, exactly like a wrong
+// ERC20 token. Before this distinction existed, ANY stray BNB — including a
+// genuine accidental deposit — was silently absorbed into the Gas Reserve
+// with no record at all.
+let _reclaimStrayGasRunning = false;
 async function reclaimStrayGas() {
-  if (!hdMaster || !bscProvider) return;
+  if (!hdMaster || !bscProvider || _reclaimStrayGasRunning) return;
+  _reclaimStrayGasRunning = true;
   try {
     const { rows } = await db(`SELECT id, deposit_address, deposit_address_index FROM users WHERE deposit_address IS NOT NULL AND deposit_address_index IS NOT NULL AND deposit_address_index != $1`, [GAS_RESERVE_INDEX]);
     if (!rows.length) return;
@@ -362,10 +625,42 @@ async function reclaimStrayGas() {
     const nativeGasPrice = feeData.gasPrice || ethers.parseUnits('3', 'gwei');
     const reclaimTxCost = nativeGasPrice * 21000n;
     const gasReserveAddress = deriveDepositAddress(GAS_RESERVE_INDEX);
+    const depositThresholdWei = ethers.parseEther(String(STRAY_BNB_DEPOSIT_THRESHOLD_BNB));
     for (const r of rows) {
       try {
         const bal = await bscProvider.getBalance(r.deposit_address);
         if (bal <= reclaimTxCost * 2n) continue; // not worth it
+
+        if (bal >= depositThresholdWei) {
+          // Large enough to be a real (mistaken) deposit — route to the
+          // wrong-token pending-deposit flow instead of the gas reserve.
+          // No tx hash to key dedup off (this is a balance snapshot, not a
+          // specific event), so dedup on the address + swept=FALSE instead:
+          // once swept the balance naturally returns to ~0, so it won't be
+          // re-flagged next cycle unless genuinely new BNB arrives.
+          const { rows: existing } = await db(
+            `SELECT id FROM other_token_deposits WHERE to_address=$1 AND token_symbol='BNB' AND swept=FALSE LIMIT 1`,
+            [r.deposit_address.toLowerCase()]);
+          let depositId;
+          if (existing.length) {
+            depositId = existing[0].id;
+          } else {
+            const amountBnb = parseFloat(ethers.formatEther(bal));
+            const { rows: inserted } = await db(
+              `INSERT INTO other_token_deposits(user_id, tx_hash, log_index, token_contract, token_symbol, to_address, amount, amount_wei)
+               VALUES($1,$2,-1,NULL,'BNB',$3,$4,$5) RETURNING id`,
+              [r.id, `stray-bnb-${r.deposit_address.toLowerCase()}-${Date.now()}`, r.deposit_address.toLowerCase(), amountBnb, bal.toString()]);
+            depositId = inserted[0].id;
+            const txId = await createForeignDepositRecord({
+              userId: r.id, tokenSymbol:'BNB', tokenAmount: amountBnb, isStablecoin:false,
+              txHash: null, fromAddress: null,
+            });
+            await db(`UPDATE other_token_deposits SET transaction_id=$1 WHERE id=$2`, [txId, depositId]);
+          }
+          await attemptSweepNativeBnb(depositId, r.deposit_address_index, r.deposit_address);
+          continue;
+        }
+
         const wallet = deriveDepositWallet(r.deposit_address_index).connect(bscProvider);
         const tx = await wallet.sendTransaction({ to: gasReserveAddress, value: bal - reclaimTxCost, gasLimit: 21000n, gasPrice: nativeGasPrice });
         await tx.wait(1);
@@ -377,6 +672,8 @@ async function reclaimStrayGas() {
     }
   } catch(e) {
     console.error('reclaimStrayGas error:', e.message);
+  } finally {
+    _reclaimStrayGasRunning = false;
   }
 }
 
@@ -781,6 +1078,31 @@ const initDB = async () => {
     ALTER TABLE onchain_deposits ADD COLUMN IF NOT EXISTS amount_wei TEXT;
     CREATE INDEX IF NOT EXISTS idx_onchain_deposits_user ON onchain_deposits(user_id);
     CREATE INDEX IF NOT EXISTS idx_onchain_deposits_unswept ON onchain_deposits(swept) WHERE swept=FALSE;
+
+    -- Wrong-token deposits (any token that isn't USDT, or native BNB) sent to
+    -- a user's deposit address. Dedup + sweep-tracking, mirroring
+    -- onchain_deposits — token_contract is NULL for native BNB.
+    CREATE TABLE IF NOT EXISTS other_token_deposits (
+      id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id       UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      tx_hash       VARCHAR(80) NOT NULL,
+      log_index     INT NOT NULL DEFAULT -1,   -- -1 for native BNB (balance-based, no log to index)
+      token_contract VARCHAR(42),               -- NULL = native BNB
+      token_symbol  VARCHAR(20) NOT NULL,
+      from_address  VARCHAR(42),
+      to_address    VARCHAR(42) NOT NULL,
+      amount        NUMERIC(30,10) NOT NULL,    -- human-readable token amount (NOT USD)
+      amount_wei    TEXT,
+      block_number  BIGINT,
+      swept         BOOLEAN DEFAULT FALSE,
+      sweep_tx_hash VARCHAR(80),
+      sweep_error   TEXT,
+      transaction_id UUID REFERENCES transactions(id) ON DELETE SET NULL,
+      created_at    TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(tx_hash, log_index)
+    );
+    CREATE INDEX IF NOT EXISTS idx_other_token_deposits_user ON other_token_deposits(user_id);
+    CREATE INDEX IF NOT EXISTS idx_other_token_deposits_unswept ON other_token_deposits(swept) WHERE swept=FALSE;
 
     CREATE TABLE IF NOT EXISTS login_history (
       id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -4153,6 +4475,24 @@ app.get('/api/admin/deposits/export', adminAuth, requirePermission('deposits'), 
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
+// Lets an admin correct a pending deposit's credited amount before approving
+// — needed for wrong-token deposits (see createForeignDepositRecord above),
+// where the correct USD value isn't known automatically for anything except
+// a recognized stablecoin. Only works while still 'pending', so it can never
+// silently change an amount after money has already been credited.
+app.put('/api/admin/deposits/:id/set-amount', adminAuth, requirePermission('deposits'), async (req,res) => {
+  try {
+    const amount = parseFloat(req.body.amount);
+    if (!amount || amount <= 0) return res.status(400).json({success:false,message:'Enter a valid positive amount'});
+    const { rows:[tx] } = await db(
+      `UPDATE transactions SET amount=$1 WHERE id=$2 AND type='deposit' AND status='pending' RETURNING id`,
+      [amount, req.params.id]);
+    if (!tx) return res.status(400).json({success:false,message:'Only a still-pending deposit\'s amount can be changed'});
+    await logAdmin(req.admin.id, `Set deposit amount to $${amount}`, {depositId:req.params.id});
+    res.json({success:true,message:`Amount set to $${amount} — you can now approve it.`});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
 app.put('/api/admin/deposits/:id/approve', adminAuth, requirePermission('deposits'), async (req,res) => {
   try {
     // Atomically claim the pending deposit first. Only one concurrent request
@@ -6299,12 +6639,19 @@ initDB().then(async ()=>{
   if (hdMaster && bscProvider) {
     setTimeout(scanOnchainDeposits, 20_000);
     setInterval(scanOnchainDeposits, 30_000);
+    // Wrong-token (non-USDT ERC20) deposit scanner — same cadence as the
+    // main USDT scanner but on its own block cursor, so a slow response from
+    // one never blocks the other.
+    setTimeout(scanOtherTokenDeposits, 25_000);
+    setInterval(scanOtherTokenDeposits, 30_000);
     // Gas reserve balance check — independent, lighter-weight, every 10 min.
     setTimeout(checkGasReserveAlert, 25_000);
     setInterval(checkGasReserveAlert, 10 * 60 * 1000);
     // Reclaims stray/leftover BNB from user deposit addresses back to the
     // Gas Reserve — catches both future overshoot and old leftovers from
-    // before this logic existed. Every 15 min.
+    // before this logic existed. Anything large enough to be a real deposit
+    // (not just leftover gas) is routed to the wrong-token deposit flow
+    // instead — see reclaimStrayGas(). Every 15 min.
     setTimeout(reclaimStrayGas, 40_000);
     setInterval(reclaimStrayGas, 15 * 60 * 1000);
   }
