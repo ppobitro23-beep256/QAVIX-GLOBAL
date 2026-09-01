@@ -2097,15 +2097,27 @@ const limitSecret = rateLimit({
 
 // Withdrawal submissions themselves — generous enough for real use, tight
 // enough to stop scripted abuse / accidental double-submit storms.
-// Tightened from 10/15min: withdrawals move real money, so this should be
-// hard to brute-force/spam in the first place — the DB-level checks below
-// (no stacking a second pending request, 24h cooldown after a rejection) are
-// the real protection, but the rate limit itself should never have allowed
-// 10 attempts in 15 minutes for something this sensitive.
-const limitWithdraw = rateLimit({
+const limitWithdrawSubmit = rateLimit({
   windowMs: 60*60000, max: 4, keyGenerator: byUser,
   message: {success:false, message:'Too many withdrawal requests. Please wait before trying again.'},
 });
+// The SAME endpoint also handles the earlier "send me an OTP" step (called
+// with no otp code yet) — that step needs its own, more forgiving limit,
+// matching limitOtp below. A user needing to resend the OTP a couple of
+// times (email delay, spam folder, a typo) was otherwise burning through
+// the strict 4/hour submission budget before ever reaching a real attempt,
+// getting blocked from a legitimate withdrawal entirely.
+const limitWithdrawOtp = rateLimit({
+  windowMs: 15*60000, max: 8, keyGenerator: byUser,
+  message: {success:false, message:'Too many OTP requests. Please wait before requesting another code.'},
+});
+// Picks the right limiter for this specific call based on whether it's the
+// OTP-request step or the final OTP-included submission — same route, two
+// different sensitivities.
+const limitWithdraw = (req, res, next) => {
+  const limiter = req.body?.otp ? limitWithdrawSubmit : limitWithdrawOtp;
+  limiter(req, res, next);
+};
 
 // OTP issuance — stops someone spamming a user's inbox or burning our email quota.
 const limitOtp = rateLimit({
@@ -4052,7 +4064,7 @@ app.get('/api/admin/me', adminAuth, (req,res) => res.json({success:true,data:{ad
 // ── Dashboard stats ───────────────────────────────────────────────────────
 app.get('/api/admin/stats', adminAuth, async (_,res) => {
   try {
-    const [users, deposits, withdrawals, investments, today, managerDep, promoterDep, promoterDepCurrent, promoterOwnDep] = await Promise.all([
+    const [users, deposits, withdrawals, investments, today, managerDep, managerDepCurrent, promoterDep, promoterDepCurrent, promoterOwnDep] = await Promise.all([
       db(`SELECT COUNT(*) total, COUNT(*) FILTER (WHERE status='active') active, COUNT(*) FILTER (WHERE status='banned') banned, COUNT(*) FILTER (WHERE created_at::date=CURRENT_DATE) today FROM users`),
       // Total Deposits counts every real USDT deposit, including ones made by
       // accounts tagged "Promoters" — a promoter depositing their own money
@@ -4068,12 +4080,14 @@ app.get('/api/admin/stats', adminAuth, async (_,res) => {
       db(`SELECT COALESCE(SUM(amount) FILTER (WHERE status='paid'),0) total, COUNT(*) FILTER (WHERE status='pending') pending, COALESCE(SUM(amount) FILTER (WHERE created_at::date=CURRENT_DATE AND status='paid'),0) today FROM transactions WHERE type='withdrawal'`),
       db(`SELECT COUNT(*) FILTER (WHERE status='active') active, COALESCE(SUM(amount) FILTER (WHERE status='active'),0) capital FROM investments`),
       db(`SELECT COALESCE(SUM(amount),0) profit FROM transactions WHERE type='deposit' AND status='approved' AND created_at::date=CURRENT_DATE`),
-      // Manual admin-panel credits tagged 'Manager' — separate from normal on-chain/user deposits.
-      // Netted (no amount>0 filter): a debit transaction under the same tag —
-      // e.g. correcting an accidental double-credit — has a negative amount,
-      // so summing everything gives the true net total actually given rather
-      // than freezing at the highest credit ever made before a correction.
+      // "Total Manager Deposit" — lifetime net total ever given under the
+      // Manager tag, regardless of whether the recipient is still tagged
+      // Manager today. A permanent audit figure, same pattern as Promoters.
       db(`SELECT COALESCE(SUM(amount),0) total FROM transactions WHERE type='admin_adjustment' AND status='approved' AND meta->>'tag'='Manager'`),
+      // "Current Manager Deposit" — same net total, but restricted to users
+      // who are STILL tagged Manager right now. Removing someone's Manager
+      // tag automatically drops their historical credits out of this figure.
+      db(`SELECT COALESCE(SUM(t.amount),0) total FROM transactions t JOIN users u ON u.id=t.user_id WHERE t.type='admin_adjustment' AND t.status='approved' AND t.meta->>'tag'='Manager' AND u.admin_tag='Manager'`),
       // "Total Promoter Deposit" — lifetime net total ever given under the
       // Promoters tag (credits minus corrections), regardless of whether the
       // recipient is still tagged Promoters today. A permanent audit figure.
@@ -4096,7 +4110,7 @@ app.get('/api/admin/stats', adminAuth, async (_,res) => {
       totalWithdrawals: parseFloat(withdrawals.rows[0].total), pendingWithdrawals: parseInt(withdrawals.rows[0].pending), withdrawalsToday: parseFloat(withdrawals.rows[0].today),
       activeInvestments: parseInt(investments.rows[0].active), capitalDeployed: parseFloat(investments.rows[0].capital),
       revenueToday: parseFloat(today.rows[0].profit),
-      managerDeposits: parseFloat(managerDep.rows[0].total),
+      managerDepositsTotal: parseFloat(managerDep.rows[0].total), managerDepositsCurrent: parseFloat(managerDepCurrent.rows[0].total),
       promoterDepositsTotal: parseFloat(promoterDep.rows[0].total), promoterDepositsCurrent: parseFloat(promoterDepCurrent.rows[0].total),
       promoterOwnDeposits: parseFloat(promoterOwnDep.rows[0].total)
     }});
@@ -5189,6 +5203,27 @@ app.put('/api/admin/investments/:id/cancel', adminAuth, requireRole('Super Admin
     res.json({success:true, message: refund
       ? `Plan cancelled and $${parseFloat(inv.amount).toFixed(2)} refunded to the user's balance.`
       : `Plan cancelled — no refund issued.`});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// Lightweight tag change — sets admin_tag to User/Manager/Promoters WITHOUT
+// touching balance or investments. This is what "un-Manager" or "un-Promoter"
+// a user who was tagged by mistake, or demote/promote someone, without the
+// heavier consequences of Terminate (which also cancels active plans with no
+// refund — appropriate for actually removing a promoter, not for undoing a
+// mistaken tag click). Once demoted, they immediately drop out of the
+// "Current" Manager/Promoter Deposit KPIs (those filter on current admin_tag)
+// even though their credit history stays in the "Total" figure for audit.
+app.put('/api/admin/users/:id/tag', adminAuth, requireRole('Super Admin'), async (req,res) => {
+  try {
+    const tag = ['User','Manager','Promoters'].includes(req.body.tag) ? req.body.tag : null;
+    if (!tag) return res.status(400).json({success:false,message:"tag must be one of 'User', 'Manager', 'Promoters'"});
+    const { rows:[user] } = await db('SELECT id,name,email,admin_tag FROM users WHERE id=$1',[req.params.id]);
+    if (!user) return res.status(404).json({success:false,message:'User not found'});
+    const oldTag = user.admin_tag || 'User';
+    await db('UPDATE users SET admin_tag=$1 WHERE id=$2', [tag, req.params.id]);
+    await logAdmin(req.admin.id, `Changed ${user.email}'s tag: ${oldTag} → ${tag}`, {userId:req.params.id});
+    res.json({success:true, message:`${user.name} is now tagged '${tag}'.`});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
