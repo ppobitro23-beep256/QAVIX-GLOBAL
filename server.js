@@ -2078,7 +2078,13 @@ app.use(async (req,res,next) => {
   } catch(e){ next(); } // fail open on DB errors so a transient issue doesn't lock everyone out
 });
 
-const limit10 = rateLimit({windowMs:15*60000, max:10});
+// Explicit JSON handler on every limiter, not just the withdrawal ones — the
+// same non-JSON-429 failure mode can happen on any rate-limited endpoint,
+// not just withdrawals; this closes it everywhere at once.
+const limit10 = rateLimit({
+  windowMs:15*60000, max:10,
+  handler: (req, res) => res.status(429).json({success:false, message:'Too many requests. Please wait a moment and try again.'}),
+});
 
 // ── Rate limits for endpoints that verify a secret or move money ───────────
 // These are keyed by USER ID rather than IP: the endpoints all sit behind
@@ -2092,14 +2098,27 @@ const byUser = (req,res) => req.user?.id || req.ip;
 // brute-forceable in minutes. 5 tries / 15 min per user.
 const limitSecret = rateLimit({
   windowMs: 15*60000, max: 5, keyGenerator: byUser,
-  message: {success:false, message:'Too many attempts. Please wait 15 minutes and try again.'},
+  handler: (req, res) => res.status(429).json({success:false, message:'Too many attempts. Please wait 15 minutes and try again.'}),
 });
 
 // Withdrawal submissions themselves — generous enough for real use, tight
 // enough to stop scripted abuse / accidental double-submit storms.
+// The real protection against actual withdrawal SPAM/fraud is the DB-level
+// checks (no stacking a second pending request, 24h cooldown after a
+// rejection) — this HTTP-level limit is only a blunt backstop against
+// scripted brute-forcing, so it doesn't need to be razor-tight. Bumped from
+// 4/hour: that was tight enough that a few genuine retries during a real
+// troubleshooting session (password typo, a confusing UI moment, support
+// asking to try again) could burn through it, compounding with outer
+// request-volume limits (e.g. the hosting platform's own) and producing a
+// non-JSON response that used to crash the frontend outright.
 const limitWithdrawSubmit = rateLimit({
-  windowMs: 60*60000, max: 4, keyGenerator: byUser,
-  message: {success:false, message:'Too many withdrawal requests. Please wait before trying again.'},
+  windowMs: 60*60000, max: 10, keyGenerator: byUser,
+  // Explicit handler (rather than relying on the library's default behavior
+  // for an object `message`) guarantees this ALWAYS sends valid JSON — this
+  // is what a real withdrawal attempt hit: a non-JSON 429 response crashed
+  // the frontend's JSON parser outright instead of showing "please wait".
+  handler: (req, res) => res.status(429).json({success:false, message:'Too many withdrawal requests. Please wait before trying again.'}),
 });
 // The SAME endpoint also handles the earlier "send me an OTP" step (called
 // with no otp code yet) — that step needs its own, more forgiving limit,
@@ -2109,7 +2128,7 @@ const limitWithdrawSubmit = rateLimit({
 // getting blocked from a legitimate withdrawal entirely.
 const limitWithdrawOtp = rateLimit({
   windowMs: 15*60000, max: 8, keyGenerator: byUser,
-  message: {success:false, message:'Too many OTP requests. Please wait before requesting another code.'},
+  handler: (req, res) => res.status(429).json({success:false, message:'Too many OTP requests. Please wait before requesting another code.'}),
 });
 // Picks the right limiter for this specific call based on whether it's the
 // OTP-request step or the final OTP-included submission — same route, two
@@ -2122,7 +2141,7 @@ const limitWithdraw = (req, res, next) => {
 // OTP issuance — stops someone spamming a user's inbox or burning our email quota.
 const limitOtp = rateLimit({
   windowMs: 15*60000, max: 8, keyGenerator: byUser,
-  message: {success:false, message:'Too many OTP requests. Please wait before requesting another code.'},
+  handler: (req, res) => res.status(429).json({success:false, message:'Too many OTP requests. Please wait before requesting another code.'}),
 });
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -3993,7 +4012,10 @@ app.get('/api/support/webhook-info', async (req,res) => {
 // ═══════════════════════════════════════════════════════════════════════
 //  ADMIN PANEL API — powers admin.html
 // ═══════════════════════════════════════════════════════════════════════
-const adminLimit = rateLimit({windowMs:15*60000, max:30});
+const adminLimit = rateLimit({
+  windowMs:15*60000, max:30,
+  handler: (req, res) => res.status(429).json({success:false, message:'Too many requests. Please wait a moment and try again.'}),
+});
 
 // ── Admin auth ──────────────────────────────────────────────────────────
 app.post('/api/admin/login', adminLimit, async (req,res) => {
@@ -6841,6 +6863,32 @@ initDB().then(async ()=>{
          WHERE role='Owner' AND user_id<>(SELECT id FROM users WHERE email='rafishasan273@gmail.com')`);
     } catch(e) { console.error('Owner migration error:', e.message); }
   }
+
+  // Global JSON error handler — MUST be registered after every other
+  // app.use()/route (Express only routes to a 4-argument middleware for
+  // errors, and only if it's last). Without this, ANY uncaught exception in
+  // a route — a bug that slips past that route's own try/catch, a thrown
+  // error in synchronous code, whatever — falls through to Express's BUILT-IN
+  // default handler, which sends an HTML error page, not JSON. The frontend
+  // always does `res.json()`/`JSON.parse()` on responses, so an HTML page
+  // there crashes with a raw "Unexpected token '<'... is not valid JSON"
+  // error shown straight to the user — exactly the failure mode reported
+  // during a live withdrawal. This guarantees every response, even from a
+  // bug nobody anticipated, is valid JSON the frontend can actually read.
+  app.use((err, req, res, next) => {
+    console.error('Unhandled error:', err?.stack || err);
+    if (res.headersSent) return next(err);
+    res.status(err?.status || 500).json({
+      success: false,
+      message: 'Something went wrong on our end — please try again in a moment.'
+    });
+  });
+
+  // Catches routes/paths that don't exist at all (also HTML by default in
+  // Express) — same reasoning as above, keeps every response JSON.
+  app.use((req, res) => {
+    res.status(404).json({ success:false, message: 'Not found' });
+  });
 
   app.listen(PORT,()=>{
     console.log(`
