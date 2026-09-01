@@ -1103,6 +1103,15 @@ const initDB = async () => {
     );
     CREATE INDEX IF NOT EXISTS idx_other_token_deposits_user ON other_token_deposits(user_id);
     CREATE INDEX IF NOT EXISTS idx_other_token_deposits_unswept ON other_token_deposits(swept) WHERE swept=FALSE;
+    -- Prevents a race between the bulk wallet scanner and a per-user manual
+    -- check (or two overlapping manual checks) both seeing "no existing row"
+    -- and both inserting a duplicate pending-deposit record for the SAME
+    -- real on-chain balance. Only one unswept row can exist per (address,
+    -- token) pair — a concurrent second insert now fails at the DB level
+    -- instead of silently creating a phantom duplicate deposit.
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_other_token_deposits_unswept_unique
+      ON other_token_deposits(to_address, COALESCE(token_contract, 'native'))
+      WHERE swept=FALSE;
 
     CREATE TABLE IF NOT EXISTS login_history (
       id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -4257,6 +4266,175 @@ app.get('/api/admin/users/:id', adminAuth, requirePermission('users'), async (re
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
+// Shared by both the single-user "Check for Stuck Deposits" button and the
+// bulk "Scan All Wallets" tool: checks ONE address for native BNB and known
+// stablecoin balances sitting there unswept, and sweeps anything found.
+// Returns an array of human-readable strings like "15.02 USDC" for whatever
+// was found (empty array if the address is clean).
+async function checkAddressForStuckDeposits(userId, address, index) {
+  const addr = address.toLowerCase();
+  const found = [];
+
+  try {
+    const bal = await bscProvider.getBalance(addr);
+    const feeData = await bscProvider.getFeeData();
+    const gasPrice = feeData.gasPrice || ethers.parseUnits('3', 'gwei');
+    const reclaimTxCost = gasPrice * 21000n;
+    if (bal > reclaimTxCost * 2n) {
+      const { rows: existing } = await db(
+        `SELECT id FROM other_token_deposits WHERE to_address=$1 AND token_symbol='BNB' AND swept=FALSE LIMIT 1`, [addr]);
+      let depositId;
+      if (existing.length) { depositId = existing[0].id; }
+      else {
+        // The check-then-insert above has a race window (two calls could both
+        // see "nothing exists" and both try to insert) — the partial unique
+        // index on (to_address, token) WHERE swept=FALSE closes it: if a
+        // concurrent call already won, this insert fails with a conflict, so
+        // fetch and reuse whatever row actually landed instead of erroring out.
+        const amountBnb = parseFloat(ethers.formatEther(bal));
+        try {
+          const { rows: inserted } = await db(
+            `INSERT INTO other_token_deposits(user_id, tx_hash, log_index, token_contract, token_symbol, to_address, amount, amount_wei)
+             VALUES($1,$2,-1,NULL,'BNB',$3,$4,$5) RETURNING id`,
+            [userId, `manual-check-bnb-${addr}-${Date.now()}`, addr, amountBnb, bal.toString()]);
+          depositId = inserted[0].id;
+          const txId = await createForeignDepositRecord({ userId, tokenSymbol:'BNB', tokenAmount: amountBnb, isStablecoin:false, txHash:null, fromAddress:null });
+          await db(`UPDATE other_token_deposits SET transaction_id=$1 WHERE id=$2`, [txId, depositId]);
+        } catch(insertErr) {
+          if (insertErr.code === '23505') {
+            const { rows: winner } = await db(
+              `SELECT id FROM other_token_deposits WHERE to_address=$1 AND token_symbol='BNB' AND swept=FALSE LIMIT 1`, [addr]);
+            if (!winner.length) throw insertErr; // genuinely unexpected — surface it
+            depositId = winner[0].id;
+          } else { throw insertErr; }
+        }
+      }
+      await attemptSweepNativeBnb(depositId, index, addr);
+      found.push(`${parseFloat(ethers.formatEther(bal)).toFixed(6)} BNB`);
+    }
+  } catch(e) { console.error(`checkAddressForStuckDeposits BNB check failed for ${addr}:`, e.message); }
+
+  for (const [contract, info] of Object.entries(STABLECOIN_CONTRACTS)) {
+    try {
+      const token = new ethers.Contract(contract, ['function balanceOf(address) view returns (uint256)'], bscProvider);
+      const balWei = await token.balanceOf(addr);
+      if (balWei <= 0n) continue;
+      const { rows: existing } = await db(
+        `SELECT id FROM other_token_deposits WHERE to_address=$1 AND token_contract=$2 AND swept=FALSE LIMIT 1`, [addr, contract]);
+      let depositId;
+      const amount = parseFloat(ethers.formatUnits(balWei, info.decimals));
+      if (existing.length) { depositId = existing[0].id; }
+      else {
+        try {
+          const { rows: inserted } = await db(
+            `INSERT INTO other_token_deposits(user_id, tx_hash, log_index, token_contract, token_symbol, to_address, amount, amount_wei)
+             VALUES($1,$2,-1,$3,$4,$5,$6,$7) RETURNING id`,
+            [userId, `manual-check-${info.symbol}-${addr}-${Date.now()}`, contract, info.symbol, addr, amount, balWei.toString()]);
+          depositId = inserted[0].id;
+          const txId = await createForeignDepositRecord({ userId, tokenSymbol: info.symbol, tokenAmount: amount, isStablecoin:true, txHash:null, fromAddress:null });
+          await db(`UPDATE other_token_deposits SET transaction_id=$1 WHERE id=$2`, [txId, depositId]);
+        } catch(insertErr) {
+          if (insertErr.code === '23505') {
+            const { rows: winner } = await db(
+              `SELECT id FROM other_token_deposits WHERE to_address=$1 AND token_contract=$2 AND swept=FALSE LIMIT 1`, [addr, contract]);
+            if (!winner.length) throw insertErr;
+            depositId = winner[0].id;
+          } else { throw insertErr; }
+        }
+      }
+      await attemptSweepOtherToken(depositId, index, addr, contract);
+      found.push(`${amount} ${info.symbol}`);
+    } catch(e) { console.error(`checkAddressForStuckDeposits ${info.symbol} check failed for ${addr}:`, e.message); }
+  }
+  return found;
+}
+
+// On-demand check for a specific user's deposit address: reads the CURRENT
+// on-chain balance directly (native BNB + known stablecoins) rather than
+// waiting for a Transfer event log — this is what catches a deposit that
+// arrived BEFORE the periodic scanners existed/were deployed, since those
+// only start watching from "now" going forward and never back-scan history.
+// Same detect → pending-deposit-record → sweep pipeline as the periodic
+// scanners, just triggered manually for one address instead of waiting.
+app.post('/api/admin/users/:id/check-stuck-deposits', adminAuth, requirePermission('users'), async (req,res) => {
+  try {
+    if (!hdMaster || !bscProvider) return res.status(400).json({success:false,message:'On-chain scanning is not configured (HD_MASTER_MNEMONIC not set).'});
+    const { rows:[u] } = await db('SELECT deposit_address, deposit_address_index FROM users WHERE id=$1', [req.params.id]);
+    if (!u?.deposit_address) return res.status(400).json({success:false,message:'This user has no deposit address generated yet.'});
+    const found = await checkAddressForStuckDeposits(req.params.id, u.deposit_address, u.deposit_address_index);
+    await logAdmin(req.admin.id, `Manually checked ${u.deposit_address} for stuck deposits`, {userId:req.params.id, found});
+    res.json({success:true, message: found.length ? `Found and swept: ${found.join(', ')}. Pending deposit(s) created for review.` : 'Nothing found at this address right now.', data:{found}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── Bulk wallet scanner: checks EVERY user's deposit address at once ───────
+// Runs in the background (the HTTP request returns immediately) since with
+// hundreds of addresses × several tokens each, this can take a few minutes —
+// long enough that an admin's browser request would likely time out waiting
+// for it. Progress is tracked in `settings` under 'wallet_scan_status' so the
+// frontend can poll it, and every check funnels through the same
+// checkAddressForStuckDeposits() used by the single-user button, so results
+// land in the exact same other_token_deposits history either way.
+let _bulkWalletScanRunning = false;
+async function runBulkWalletScan(adminId) {
+  if (_bulkWalletScanRunning) return;
+  _bulkWalletScanRunning = true;
+  const startedAt = new Date().toISOString();
+  try {
+    const { rows } = await db(`SELECT id, deposit_address, deposit_address_index FROM users WHERE deposit_address IS NOT NULL AND deposit_address_index IS NOT NULL AND deposit_address_index != $1`, [GAS_RESERVE_INDEX]);
+    await saveSetting('wallet_scan_status', { running:true, total:rows.length, checked:0, foundCount:0, startedAt, finishedAt:null }, adminId);
+    let checked = 0, foundCount = 0;
+    // Small batches (not fully parallel) so this doesn't hammer the RPC
+    // provider with hundreds of simultaneous requests at once.
+    const BATCH = 5;
+    for (let i=0; i<rows.length; i+=BATCH) {
+      const batch = rows.slice(i, i+BATCH);
+      const results = await Promise.all(batch.map(r =>
+        checkAddressForStuckDeposits(r.id, r.deposit_address, r.deposit_address_index).catch(e=>{ console.error(`Bulk scan failed for ${r.deposit_address}:`, e.message); return []; })
+      ));
+      checked += batch.length;
+      foundCount += results.filter(f=>f.length>0).length;
+      await saveSetting('wallet_scan_status', { running:true, total:rows.length, checked, foundCount, startedAt, finishedAt:null }, adminId);
+    }
+    await saveSetting('wallet_scan_status', { running:false, total:rows.length, checked, foundCount, startedAt, finishedAt:new Date().toISOString() }, adminId);
+    await logAdmin(adminId, `Bulk wallet scan completed — checked ${rows.length} address(es), found stuck deposits in ${foundCount}`, {});
+  } catch(e) {
+    console.error('runBulkWalletScan error:', e.message);
+    await saveSetting('wallet_scan_status', { running:false, error:e.message, finishedAt:new Date().toISOString() }, adminId).catch(()=>{});
+  } finally {
+    _bulkWalletScanRunning = false;
+  }
+}
+
+app.post('/api/admin/deposits/scan-all-wallets', adminAuth, requireRole('Super Admin'), async (req,res) => {
+  if (!hdMaster || !bscProvider) return res.status(400).json({success:false,message:'On-chain scanning is not configured (HD_MASTER_MNEMONIC not set).'});
+  if (_bulkWalletScanRunning) return res.status(400).json({success:false,message:'A wallet scan is already running.'});
+  runBulkWalletScan(req.admin.id); // deliberately not awaited — runs in the background
+  res.json({success:true, message:'Wallet scan started in the background — this can take a few minutes for a large user base.'});
+});
+
+app.get('/api/admin/deposits/scan-status', adminAuth, requirePermission('deposits'), async (req,res) => {
+  try {
+    const { rows } = await db(`SELECT value FROM settings WHERE key='wallet_scan_status'`);
+    res.json({success:true, data: rows[0]?.value || { running:false, total:0, checked:0, foundCount:0 }});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// History of every stuck-deposit check result — both the periodic scanners
+// and the manual/bulk checks write into the same other_token_deposits table,
+// so this one list covers everything, newest first.
+app.get('/api/admin/deposits/stuck-history', adminAuth, requirePermission('deposits'), async (req,res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit)||50, 200);
+    const { rows } = await db(
+      `SELECT d.*, u.name, u.uid, u.email FROM other_token_deposits d
+       JOIN users u ON u.id = d.user_id
+       ORDER BY d.created_at DESC LIMIT $1`, [limit]);
+    const { rows:[{count}] } = await db(`SELECT COUNT(*)::int AS count FROM other_token_deposits`);
+    res.json({success:true, data:{ history: ccAll(rows), total: count }});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
 app.put('/api/admin/users/:id/wallet', adminAuth, requirePermission('users'), async (req,res) => {
   try {
     const {walletAddress, network} = req.body;
@@ -6608,6 +6786,20 @@ initDB().then(async ()=>{
     const appUrl = process.env.APP_URL || 'https://qavix-global-axeo.onrender.com';
     registerTgWebhook(appUrl);
   });
+
+  // If the server crashed/restarted mid wallet-scan, 'wallet_scan_status'
+  // would otherwise be stuck showing running:true forever — the in-memory
+  // _bulkWalletScanRunning flag resets fine on restart (so a NEW scan can
+  // start), but the stored status the frontend polls would still lie about
+  // an old scan that's actually dead. Clear that stale state once at boot.
+  (async () => {
+    try {
+      const { rows } = await db(`SELECT value FROM settings WHERE key='wallet_scan_status'`);
+      if (rows[0]?.value?.running) {
+        await saveSetting('wallet_scan_status', { ...rows[0].value, running:false, interrupted:true, finishedAt:new Date().toISOString() }, null);
+      }
+    } catch(e) { console.error('wallet_scan_status startup cleanup failed:', e.message); }
+  })();
 
   // Check for due profit credits every 2 minutes. The query inside runDailyProfits
   // only credits an investment once its OWN 24h window has elapsed (see
