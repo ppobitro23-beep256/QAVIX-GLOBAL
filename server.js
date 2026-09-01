@@ -306,12 +306,27 @@ async function attemptSweep(depositId, index, childAddress) {
   try {
     const { rows:[dep] } = await db(`SELECT amount_wei, swept FROM onchain_deposits WHERE id=$1`, [depositId]);
     if (!dep || dep.swept || !dep.amount_wei) return;
-    const amountWei = BigInt(dep.amount_wei);
-    if (amountWei <= 0n) return;
+    const storedAmountWei = BigInt(dep.amount_wei);
+    if (storedAmountWei <= 0n) return;
 
     const gasReserve  = deriveDepositWallet(GAS_RESERVE_INDEX).connect(bscProvider);
     const childWallet = deriveDepositWallet(index).connect(bscProvider);
-    const usdt = new ethers.Contract(USDT_BEP20_CONTRACT, ['function transfer(address,uint256) returns (bool)'], childWallet);
+    const usdt = new ethers.Contract(USDT_BEP20_CONTRACT, ['function transfer(address,uint256) returns (bool)', 'function balanceOf(address) view returns (uint256)'], childWallet);
+
+    // Re-check the LIVE balance rather than trusting the stored amount
+    // blindly — if an earlier attempt actually succeeded on-chain but the
+    // 'swept=TRUE' write failed right after (a DB blip immediately after
+    // sweepTx.wait(1) confirms), this row would otherwise retry forever with
+    // a stale amount against a now-empty wallet, reverting every time with
+    // "insufficient balance". Using the smaller of the two, and treating a
+    // zero live balance as "already swept, just never recorded", closes that.
+    const liveBalanceWei = await usdt.balanceOf(childAddress);
+    if (liveBalanceWei <= 0n) {
+      await db(`UPDATE onchain_deposits SET swept=TRUE, sweep_error=$1 WHERE id=$2`,
+        ['Balance was already 0 on-chain — likely swept by an earlier attempt whose DB update failed to record it.', depositId]);
+      return;
+    }
+    const amountWei = liveBalanceWei < storedAmountWei ? liveBalanceWei : storedAmountWei;
 
     // Estimate the ACTUAL gas needed right now (current gas price × real gas
     // limit for this exact transfer) instead of sending a fixed guessed
@@ -382,12 +397,28 @@ async function attemptSweepOtherToken(depositId, index, childAddress, tokenContr
   try {
     const { rows:[dep] } = await db(`SELECT amount_wei, swept FROM other_token_deposits WHERE id=$1`, [depositId]);
     if (!dep || dep.swept || !dep.amount_wei) return;
-    const amountWei = BigInt(dep.amount_wei);
-    if (amountWei <= 0n) return;
+    const storedAmountWei = BigInt(dep.amount_wei);
+    if (storedAmountWei <= 0n) return;
 
     const gasReserve  = deriveDepositWallet(GAS_RESERVE_INDEX).connect(bscProvider);
     const childWallet = deriveDepositWallet(index).connect(bscProvider);
-    const token = new ethers.Contract(tokenContract, ['function transfer(address,uint256) returns (bool)'], childWallet);
+    const token = new ethers.Contract(tokenContract, ['function transfer(address,uint256) returns (bool)', 'function balanceOf(address) view returns (uint256)'], childWallet);
+
+    // Always re-check the LIVE balance instead of trusting the stored amount
+    // blindly. If an earlier attempt actually succeeded on-chain but the
+    // 'swept=TRUE' write failed right after (a DB blip immediately after
+    // sweepTx.wait(1) confirms), this row would otherwise retry forever with
+    // a stale amount against a now-empty wallet — which reverts every time
+    // ("insufficient balance") since the tokens are already gone. Using the
+    // smaller of the two, and treating a zero live balance as "already
+    // swept, just never recorded", closes that failure loop.
+    const liveBalanceWei = await token.balanceOf(childAddress);
+    if (liveBalanceWei <= 0n) {
+      await db(`UPDATE other_token_deposits SET swept=TRUE, sweep_error=$1 WHERE id=$2`,
+        ['Balance was already 0 on-chain — likely swept by an earlier attempt whose DB update failed to record it.', depositId]);
+      return;
+    }
+    const amountWei = liveBalanceWei < storedAmountWei ? liveBalanceWei : storedAmountWei;
 
     let requiredWei;
     try {
