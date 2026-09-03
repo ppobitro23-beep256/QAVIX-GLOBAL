@@ -176,6 +176,29 @@ function deriveDepositWallet(index) {
 // user's address. Throws (never silently fails) if balance/gas is short or
 // the send errors — the caller is responsible for reverting the withdrawal's
 // status back to 'pending' on failure so it can be retried once funded.
+// Returns {txHash, gasBnb} — gasBnb is the actual BNB burned on this transfer
+// (receipt.gasUsed * effective gas price), used by recordGasExpense() below
+// so the Maintenance Cost report can account for it. gasBnb is best-effort:
+// if the receipt is missing fields for some reason the payout itself is
+// NOT rolled back over it — losing the expense log entry is fine, losing
+// the money isn't.
+//
+// IMPORTANT — the two failure modes below are NOT the same and callers must
+// treat them differently:
+//   1) Anything before usdt.transfer() throws a plain Error → the transfer was
+//      NEVER broadcast. No USDT left the wallet. Safe to revert to 'pending'
+//      and retry freely.
+//   2) tx.wait() throws AFTER transfer() succeeded (RPC drop, node timeout,
+//      etc.) → the transaction is already broadcast and may well confirm on
+//      its own moments later. We simply lost the ability to see that. This
+//      throws PayoutUnconfirmedError carrying the real txHash. Blindly
+//      reverting this case to 'pending' (as the code used to) risks a SECOND
+//      real payout on retry if the first one does land — this is the most
+//      likely explanation for USDT quietly leaving the wallet with no 'paid'
+//      transaction to show for it.
+class PayoutUnconfirmedError extends Error {
+  constructor(message, txHash) { super(message); this.name = 'PayoutUnconfirmedError'; this.txHash = txHash; }
+}
 async function sendWithdrawalPayout(toAddress, amountUsdt) {
   if (!withdrawalWallet) throw new Error('Withdrawal wallet is not configured');
   if (!toAddress || !ethers.isAddress(toAddress)) throw new Error(`Invalid destination address: ${toAddress}`);
@@ -190,9 +213,38 @@ async function sendWithdrawalPayout(toAddress, amountUsdt) {
   if (bal < amountWei) throw new Error(`Insufficient USDT in withdrawal wallet (has ${ethers.formatUnits(bal, USDT_DECIMALS)}, needs ${amountUsdt})`);
   const gasBal = await bscProvider.getBalance(withdrawalWallet.address);
   if (gasBal < ethers.parseEther(String(WITHDRAWAL_GAS_MIN_BNB))) throw new Error(`Insufficient BNB gas in withdrawal wallet (has ${ethers.formatEther(gasBal)} BNB)`);
-  const tx = await usdt.transfer(toAddress, amountWei);
-  await tx.wait(1);
-  return tx.hash;
+  const tx = await usdt.transfer(toAddress, amountWei); // broadcast — from this point on, funds may actually move
+  let receipt;
+  try {
+    receipt = await tx.wait(1);
+  } catch (waitErr) {
+    // Broadcast succeeded, confirmation didn't — outcome unknown. Surface the
+    // real hash so the caller can preserve it instead of discarding it.
+    throw new PayoutUnconfirmedError(`Payout broadcast (tx ${tx.hash}) but confirmation failed: ${waitErr.message}`, tx.hash);
+  }
+  let gasBnb = null;
+  try {
+    const effPrice = receipt.gasPrice ?? receipt.effectiveGasPrice ?? 0n;
+    if (receipt.gasUsed && effPrice) gasBnb = parseFloat(ethers.formatEther(receipt.gasUsed * effPrice));
+  } catch (e) { /* non-critical — expense logging only */ }
+  return { txHash: tx.hash, gasBnb };
+}
+
+// Logs the BNB gas actually spent on a withdrawal payout as an auto expense
+// entry, converted to USD at the current admin-set rate (Settings →
+// Expenses). Swallows its own errors — a logging failure must never affect
+// the withdrawal, which has already been paid out by the time this runs.
+async function recordGasExpense(gasBnb, withdrawalId, userId, txHash) {
+  try {
+    if (!gasBnb || gasBnb <= 0) return;
+    const rate = LIVE_EXPENSES.bnbUsdRate || DEFAULT_EXPENSES.bnbUsdRate;
+    const amountUsd = +(gasBnb * rate).toFixed(4);
+    await db(
+      `INSERT INTO expense_entries(type,category,amount_usd,amount_bnb,bnb_usd_rate,reason,meta)
+       VALUES('gas_auto','Withdrawal Gas',$1,$2,$3,$4,$5)`,
+      [amountUsd, gasBnb, rate, `BNB gas for withdrawal payout`, JSON.stringify({withdrawalId, userId, txHash})]
+    );
+  } catch (e) { console.error('recordGasExpense error (non-critical):', e.message); }
 }
 
 
@@ -1345,6 +1397,24 @@ const initDB = async () => {
       created_at  TIMESTAMPTZ   DEFAULT NOW()
     );
 
+    -- ── Maintenance / operating cost tracking (Reports → Maintenance) ──────
+    -- 'gas_auto' rows are inserted automatically after every successful
+    -- withdrawal auto-payout (BNB gas burned sending USDT) — see
+    -- recordGasExpense(). 'manual' rows are logged by an admin (server rent,
+    -- VPS, domain, manual gas top-ups, etc.) the same way loss_entries works.
+    CREATE TABLE IF NOT EXISTS expense_entries (
+      id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      type         VARCHAR(20)   NOT NULL DEFAULT 'manual', -- 'manual' | 'gas_auto'
+      category     VARCHAR(60)   DEFAULT 'Other',
+      amount_usd   NUMERIC(14,4) NOT NULL,
+      amount_bnb   NUMERIC(18,8),           -- populated for gas_auto rows only
+      bnb_usd_rate NUMERIC(14,4),           -- rate in effect at the time, for gas_auto rows
+      reason       TEXT          NOT NULL,
+      meta         JSONB         DEFAULT '{}',
+      created_by   UUID REFERENCES admins(id) ON DELETE SET NULL,
+      created_at   TIMESTAMPTZ   DEFAULT NOW()
+    );
+
     -- ── Admin 2FA / device verification ──────────────────────────────────
     CREATE TABLE IF NOT EXISTS admin_known_devices (
       id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -1902,6 +1972,12 @@ const DEFAULT_REFERRAL = { enabled: true };
 const DEFAULT_MAINTENANCE = { enabled: false, message: 'We are performing scheduled maintenance and will be back shortly.' };
 const DEFAULT_PRELAUNCH = { enabled: false, launchAt: null, title: '🚀 Launching Soon', subtitle: 'Launch হতে বাকি:' };
 const DEFAULT_SECURITY = { ipWhitelistEnabled: false, adminTwoFactorEnabled: false };
+// Manual BNB/USD rate used to convert auto-tracked withdrawal gas cost into a
+// dollar figure for the Maintenance Cost report. Kept as an admin-set value
+// (same pattern as withdrawalFeePercent) rather than a live price API call,
+// so the Maintenance report never depends on a third-party price feed being
+// up. Update it in Settings → Expenses whenever the real BNB price moves.
+const DEFAULT_EXPENSES = { bnbUsdRate: parseFloat(process.env.BNB_USD_RATE) || 600 };
 const DEFAULT_GENERAL = { siteName: 'QAVIX GLOBAL', supportEmail: 'support@qavixglobal.com', timezone: 'UTC', language: 'en' };
 // Email delivery actually runs on the Brevo HTTP API (see sendEmail) — there is no
 // raw SMTP host/port/user/password in this stack, so this only exposes the two
@@ -1939,6 +2015,7 @@ let LIVE_PRELAUNCH = {...DEFAULT_PRELAUNCH};
 // admin action needed.
 const isPrelaunchLocked = () => LIVE_PRELAUNCH.enabled && LIVE_PRELAUNCH.launchAt && new Date(LIVE_PRELAUNCH.launchAt) > new Date();
 let LIVE_SECURITY = {...DEFAULT_SECURITY};
+let LIVE_EXPENSES = {...DEFAULT_EXPENSES};
 let LIVE_GENERAL = {...DEFAULT_GENERAL};
 let LIVE_EMAIL_SENDER = {...DEFAULT_EMAIL_SENDER};
 let LIVE_OTP = {...DEFAULT_OTP};
@@ -1988,6 +2065,7 @@ const loadSettingsCache = async () => {
       if (r.key === 'maintenance') LIVE_MAINTENANCE = {...DEFAULT_MAINTENANCE, ...r.value};
       if (r.key === 'prelaunch') LIVE_PRELAUNCH = {...DEFAULT_PRELAUNCH, ...r.value};
       if (r.key === 'security') LIVE_SECURITY = {...DEFAULT_SECURITY, ...r.value};
+      if (r.key === 'expenses') LIVE_EXPENSES = {...DEFAULT_EXPENSES, ...r.value};
       if (r.key === 'general') LIVE_GENERAL = {...DEFAULT_GENERAL, ...r.value};
       if (r.key === 'smtp') LIVE_EMAIL_SENDER = {...DEFAULT_EMAIL_SENDER, ...r.value};
       if (r.key === 'otp') LIVE_OTP = {...DEFAULT_OTP, ...r.value};
@@ -4099,7 +4177,18 @@ app.get('/api/admin/stats', adminAuth, async (_,res) => {
       // 'approved' is not a state this row type ever holds. Filtering on
       // 'approved' here silently matched zero rows, making Total/Today's
       // Withdrawals always show $0 on the dashboard even after real payouts.
-      db(`SELECT COALESCE(SUM(amount) FILTER (WHERE status='paid'),0) total, COUNT(*) FILTER (WHERE status='pending') pending, COALESCE(SUM(amount) FILTER (WHERE created_at::date=CURRENT_DATE AND status='paid'),0) today FROM transactions WHERE type='withdrawal'`),
+      // amount is stored NET of the withdrawal fee (see /wallet/withdraw) —
+      // the fee itself lives in meta->>'fee'. gross = amount + fee = what the
+      // user actually requested, before the platform's cut. Both are exposed
+      // so the dashboard can show "net (sent to users)" and "with fee
+      // (requested)" side by side instead of just one ambiguous total.
+      db(`SELECT
+            COALESCE(SUM(amount) FILTER (WHERE status='paid'),0) total,
+            COALESCE(SUM(amount + COALESCE((meta->>'fee')::numeric,0)) FILTER (WHERE status='paid'),0) total_gross,
+            COUNT(*) FILTER (WHERE status='pending') pending,
+            COALESCE(SUM(amount) FILTER (WHERE created_at::date=CURRENT_DATE AND status='paid'),0) today,
+            COALESCE(SUM(amount + COALESCE((meta->>'fee')::numeric,0)) FILTER (WHERE created_at::date=CURRENT_DATE AND status='paid'),0) today_gross
+          FROM transactions WHERE type='withdrawal'`),
       db(`SELECT COUNT(*) FILTER (WHERE status='active') active, COALESCE(SUM(amount) FILTER (WHERE status='active'),0) capital FROM investments`),
       db(`SELECT COALESCE(SUM(amount),0) profit FROM transactions WHERE type='deposit' AND status='approved' AND created_at::date=CURRENT_DATE`),
       // "Total Manager Deposit" — lifetime net total ever given under the
@@ -4129,7 +4218,7 @@ app.get('/api/admin/stats', adminAuth, async (_,res) => {
     res.json({success:true,data:{
       totalUsers: parseInt(users.rows[0].total), activeUsers: parseInt(users.rows[0].active), bannedUsers: parseInt(users.rows[0].banned), newUsersToday: parseInt(users.rows[0].today),
       totalDeposits: parseFloat(deposits.rows[0].total), pendingDeposits: parseInt(deposits.rows[0].pending), depositsToday: parseFloat(deposits.rows[0].today),
-      totalWithdrawals: parseFloat(withdrawals.rows[0].total), pendingWithdrawals: parseInt(withdrawals.rows[0].pending), withdrawalsToday: parseFloat(withdrawals.rows[0].today),
+      totalWithdrawals: parseFloat(withdrawals.rows[0].total), totalWithdrawalsGross: parseFloat(withdrawals.rows[0].total_gross), pendingWithdrawals: parseInt(withdrawals.rows[0].pending), withdrawalsToday: parseFloat(withdrawals.rows[0].today), withdrawalsTodayGross: parseFloat(withdrawals.rows[0].today_gross),
       activeInvestments: parseInt(investments.rows[0].active), capitalDeployed: parseFloat(investments.rows[0].capital),
       revenueToday: parseFloat(today.rows[0].profit),
       managerDepositsTotal: parseFloat(managerDep.rows[0].total), managerDepositsCurrent: parseFloat(managerDepCurrent.rows[0].total),
@@ -4484,6 +4573,105 @@ app.get('/api/admin/deposits/scan-status', adminAuth, requirePermission('deposit
   try {
     const { rows } = await db(`SELECT value FROM settings WHERE key='wallet_scan_status'`);
     res.json({success:true, data: rows[0]?.value || { running:false, total:0, checked:0, foundCount:0 }});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// ── Withdrawal wallet reconciliation — matches every REAL on-chain outgoing
+// USDT transfer from the withdrawal wallet against the DB's 'paid' withdrawal
+// records. Anything on-chain with no matching payoutTxHash in the DB is a
+// real transfer with no accounting for it — exactly the kind of gap that
+// explains USDT quietly leaving the wallet with nothing to show for it
+// (e.g. from the PayoutUnconfirmedError case, or manual sends outside the
+// approve flow). Runs in the background like the deposit wallet scanner,
+// since scanning weeks of blocks can take a while — polled via
+// /reconcile-status. Uses the same bscProvider RPC the rest of the app
+// already relies on, no separate BscScan API key needed.
+let _reconcileRunning = false;
+const BSC_BLOCKS_PER_DAY = 28800; // ~3s block time
+async function runWithdrawalReconciliation(adminId, days) {
+  if (_reconcileRunning) return;
+  _reconcileRunning = true;
+  const startedAt = new Date().toISOString();
+  try {
+    if (!withdrawalWallet || !bscProvider) throw new Error('Withdrawal wallet is not configured');
+    await saveSetting('withdrawal_reconcile_status', { running:true, startedAt, finishedAt:null, progress:0 }, adminId);
+
+    const latestBlock = await bscProvider.getBlockNumber();
+    const fromBlock = Math.max(0, latestBlock - Math.round(BSC_BLOCKS_PER_DAY * days));
+    const contract = new ethers.Contract(USDT_BEP20_CONTRACT, USDT_ABI, bscProvider);
+    const filter = contract.filters.Transfer(withdrawalWallet.address, null); // outgoing only
+    const CHUNK = 4500;
+    const onchainTransfers = [];
+    let cursor = fromBlock;
+    const totalSpan = latestBlock - fromBlock || 1;
+    while (cursor <= latestBlock) {
+      const end = Math.min(cursor + CHUNK - 1, latestBlock);
+      const logs = await contract.queryFilter(filter, cursor, end);
+      for (const log of logs) {
+        onchainTransfers.push({
+          txHash: log.transactionHash,
+          to: (log.args.to || '').toLowerCase(),
+          amount: parseFloat(ethers.formatUnits(log.args.value, USDT_DECIMALS)),
+          blockNumber: log.blockNumber,
+        });
+      }
+      cursor = end + 1;
+      await saveSetting('withdrawal_reconcile_status', { running:true, startedAt, finishedAt:null, progress: Math.min(99, Math.round((end-fromBlock)/totalSpan*100)) }, adminId);
+    }
+
+    // Every DB record of a real payout, however it was marked paid — auto-sent
+    // (payoutTxHash) or manually confirmed by an admin (also stored under the
+    // same payoutTxHash key, see /withdrawals/:id/paid).
+    const { rows: paidRows } = await db(
+      `SELECT id, user_id, amount, meta->>'payoutTxHash' AS tx_hash FROM transactions
+       WHERE type='withdrawal' AND status='paid' AND meta->>'payoutTxHash' IS NOT NULL`);
+    const knownHashes = new Set(paidRows.map(r => (r.tx_hash||'').toLowerCase()));
+
+    const unmatched = onchainTransfers.filter(t => !knownHashes.has((t.txHash||'').toLowerCase()));
+
+    // Best-effort: identify which user a stray transfer's destination address
+    // belongs to, and fetch a block timestamp (only for the small unmatched
+    // set — not for every transfer, to keep this fast).
+    for (const u of unmatched) {
+      try {
+        const { rows } = await db('SELECT id,name,email,uid FROM users WHERE LOWER(wallet_address)=$1 LIMIT 1', [u.to]);
+        u.matchedUser = rows[0] || null;
+      } catch(e) { u.matchedUser = null; }
+      try {
+        const block = await bscProvider.getBlock(u.blockNumber);
+        u.timestamp = block ? new Date(block.timestamp*1000).toISOString() : null;
+      } catch(e) { u.timestamp = null; }
+    }
+
+    const totalUnmatchedUsd = +unmatched.reduce((s,u)=>s+u.amount,0).toFixed(4);
+    const result = {
+      running:false, startedAt, finishedAt:new Date().toISOString(), progress:100,
+      scannedFromBlock: fromBlock, scannedToBlock: latestBlock, days,
+      onchainTransferCount: onchainTransfers.length,
+      unmatchedCount: unmatched.length,
+      totalUnmatchedUsd,
+      unmatched: unmatched.map(u=>({txHash:u.txHash, to:u.to, amount:u.amount, timestamp:u.timestamp, matchedUser:u.matchedUser})),
+    };
+    await saveSetting('withdrawal_reconcile_status', result, adminId);
+    await logAdmin(adminId, `Withdrawal wallet reconciliation completed — ${onchainTransfers.length} on-chain transfer(s) checked, ${unmatched.length} unmatched (~$${totalUnmatchedUsd})`, {days});
+  } catch(e) {
+    console.error('runWithdrawalReconciliation error:', e.message);
+    await saveSetting('withdrawal_reconcile_status', { running:false, error:e.message, finishedAt:new Date().toISOString() }, adminId).catch(()=>{});
+  } finally {
+    _reconcileRunning = false;
+  }
+}
+app.post('/api/admin/withdrawals/reconcile', adminAuth, requireRole('Super Admin'), async (req,res) => {
+  if (!withdrawalWallet || !bscProvider) return res.status(400).json({success:false,message:'Withdrawal wallet is not configured'});
+  if (_reconcileRunning) return res.status(400).json({success:false,message:'A reconciliation scan is already running.'});
+  const days = Math.min(Math.max(parseInt(req.body.days)||30, 1), 180);
+  runWithdrawalReconciliation(req.admin.id, days); // deliberately not awaited — runs in the background
+  res.json({success:true, message:`Reconciliation started — scanning the last ${days} day(s) of on-chain activity. This can take a minute or two.`});
+});
+app.get('/api/admin/withdrawals/reconcile-status', adminAuth, requirePermission('withdrawals'), async (req,res) => {
+  try {
+    const { rows } = await db(`SELECT value FROM settings WHERE key='withdrawal_reconcile_status'`);
+    res.json({success:true, data: rows[0]?.value || { running:false }});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
@@ -4901,7 +5089,7 @@ app.put('/api/admin/withdrawals/:id/approve', adminAuth, requireRole(), async (r
 
     // Auto-payout path — sends the exact net amount the user was quoted, straight to their bound address.
     try {
-      const txHash = await sendWithdrawalPayout(meta.walletAddress, parseFloat(tx.amount));
+      const {txHash, gasBnb} = await sendWithdrawalPayout(meta.walletAddress, parseFloat(tx.amount));
       await db(
         `UPDATE transactions SET status='paid', meta=$1, reviewed_by=$2, reviewed_at=NOW() WHERE id=$3`,
         [JSON.stringify({...meta, payoutTxHash:txHash, autoSent:true}), req.admin.id, req.params.id]);
@@ -4909,10 +5097,24 @@ app.put('/api/admin/withdrawals/:id/approve', adminAuth, requireRole(), async (r
       // — incremented here at the 'paid' moment, not back when the user first
       // submitted the request (see /wallet/withdraw for why that changed).
       await db(`UPDATE users SET total_withdrawn=total_withdrawn+$1 WHERE id=$2`, [tx.amount, tx.user_id]);
+      await recordGasExpense(gasBnb, req.params.id, tx.user_id, txHash);
       await notif(tx.user_id,'withdrawal','Withdrawal Paid',`$${tx.amount} USDT (BEP20) has been sent. TX: ${txHash}`);
       await logAdmin(req.admin.id, `Approved + auto-paid withdrawal $${tx.amount}`, {withdrawalId:req.params.id,userId:tx.user_id,txHash});
       res.json({success:true,message:`Approved and sent automatically! $${tx.amount} USDT paid out.`,data:{txHash}});
     } catch (sendErr) {
+      if (sendErr instanceof PayoutUnconfirmedError) {
+        // Broadcast happened — outcome is unknown, NOT "nothing sent". Stay in
+        // 'processing' (never auto-retryable) and keep the real tx hash so an
+        // admin can check BscScan before deciding anything. This is the exact
+        // gap that used to make USDT leave the wallet with no 'paid' row to
+        // show for it — see PayoutUnconfirmedError's comment above.
+        await db(
+          `UPDATE transactions SET meta=$1 WHERE id=$2`,
+          [JSON.stringify({...meta, unconfirmedTxHash: sendErr.txHash, lastSendError: sendErr.message}), req.params.id]);
+        await logAdmin(req.admin.id, `⚠️ Withdrawal payout UNCONFIRMED $${tx.amount} — verify tx ${sendErr.txHash} on BscScan before retrying`, {withdrawalId:req.params.id,userId:tx.user_id,txHash:sendErr.txHash});
+        await tgSend(`⚠️ <b>Withdrawal payout unconfirmed</b>\n\n$${tx.amount} USDT to ${meta.walletAddress}\nTX: <code>${sendErr.txHash}</code>\n\nThe transfer was broadcast but the server couldn't confirm it landed. Check the tx hash on BscScan first — if it succeeded, use "Mark as Paid" with that hash; if it truly failed, use "Force Reset" then retry. Do NOT just retry blindly.`).catch(()=>{});
+        return res.status(400).json({success:false,message:`Payout broadcast but unconfirmed (tx ${sendErr.txHash}). Check BscScan before retrying — do not approve again blindly. This withdrawal is held in "processing" until you verify and use Mark as Paid or Force Reset.`});
+      }
       // Revert to pending (not stuck in 'processing') so it can simply be
       // retried once the withdrawal wallet is topped up — nothing was lost,
       // the user's balance was already debited at submission time and stays that way.
@@ -5009,7 +5211,7 @@ app.post('/api/admin/withdrawals/bulk-approve', adminAuth, requireRole(), async 
   try {
     const { ids } = req.body;
     if (!Array.isArray(ids) || !ids.length) return res.status(400).json({success:false,message:'No withdrawals selected'});
-    let approved = 0, skipped = 0, failed = 0;
+    let approved = 0, skipped = 0, failed = 0, unconfirmed = 0;
     for (const id of ids) {
       const {rows:[tx]} = await db(
         `UPDATE transactions SET status='processing', reviewed_by=$1, reviewed_at=NOW()
@@ -5024,18 +5226,36 @@ app.post('/api/admin/withdrawals/bulk-approve', adminAuth, requireRole(), async 
         continue;
       }
       try {
-        const txHash = await sendWithdrawalPayout(meta.walletAddress, parseFloat(tx.amount));
+        const {txHash, gasBnb} = await sendWithdrawalPayout(meta.walletAddress, parseFloat(tx.amount));
         await db(`UPDATE transactions SET status='paid', meta=$1, reviewed_by=$2, reviewed_at=NOW() WHERE id=$3`,
           [JSON.stringify({...meta, payoutTxHash:txHash, autoSent:true}), req.admin.id, id]);
+        // total_withdrawn only counts money that has actually left the platform
+        // — incremented here at the 'paid' moment, matching the single-approve
+        // endpoint above. Previously missing here, which meant a withdrawal
+        // paid via bulk-approve never counted toward the user's lifetime
+        // total_withdrawn stat (profile screen, team totals) even though the
+        // money genuinely left — real balances/payouts were never affected.
+        await db(`UPDATE users SET total_withdrawn=total_withdrawn+$1 WHERE id=$2`, [tx.amount, tx.user_id]);
+        await recordGasExpense(gasBnb, id, tx.user_id, txHash);
         await notif(tx.user_id,'withdrawal','Withdrawal Paid',`$${tx.amount} USDT (BEP20) has been sent. TX: ${txHash}`);
         approved++;
       } catch (sendErr) {
+        if (sendErr instanceof PayoutUnconfirmedError) {
+          // Same rule as single-approve: broadcast happened, outcome unknown —
+          // stay in 'processing' with the real hash, never auto-revert to
+          // 'pending' where a later blind retry could double-send.
+          await db(`UPDATE transactions SET meta=$1 WHERE id=$2`,
+            [JSON.stringify({...meta, unconfirmedTxHash: sendErr.txHash, lastSendError: sendErr.message}), id]);
+          await tgSend(`⚠️ <b>Withdrawal payout unconfirmed (bulk-approve)</b>\n\n$${tx.amount} USDT to ${meta.walletAddress}\nTX: <code>${sendErr.txHash}</code>\n\nVerify on BscScan before doing anything — Mark as Paid if it landed, Force Reset only if it truly failed.`).catch(()=>{});
+          unconfirmed++;
+          continue;
+        }
         await db(`UPDATE transactions SET status='pending', meta=$1 WHERE id=$2`, [JSON.stringify({...meta, lastSendError:sendErr.message}), id]);
         failed++;
       }
     }
-    await logAdmin(req.admin.id, `Bulk-approved ${approved} withdrawal(s)`, {ids, skipped, failed});
-    res.json({success:true,message:`${approved} paid out${failed?`, ${failed} failed (insufficient funds — check Withdrawal Wallet)`:''}${skipped?`, ${skipped} skipped (not pending)`:''}`,data:{approved,skipped,failed}});
+    await logAdmin(req.admin.id, `Bulk-approved ${approved} withdrawal(s)`, {ids, skipped, failed, unconfirmed});
+    res.json({success:true,message:`${approved} paid out${failed?`, ${failed} failed (insufficient funds — check Withdrawal Wallet)`:''}${unconfirmed?`, ${unconfirmed} UNCONFIRMED — check BscScan before retrying (see Withdrawals list)`:''}${skipped?`, ${skipped} skipped (not pending)`:''}`,data:{approved,skipped,failed,unconfirmed}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
@@ -5627,6 +5847,38 @@ app.delete('/api/admin/loss-entries/:id', adminAuth, requireRole('Super Admin'),
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
+// ── Maintenance/operating cost tracking (feeds the Maintenance Cost report) ─
+// 'gas_auto' entries are inserted by recordGasExpense() after every successful
+// withdrawal auto-payout. 'manual' entries are admin-logged the same way loss
+// entries are (server rent, VPS, domain renewal, manual BNB top-ups, etc.).
+app.get('/api/admin/expense-entries', adminAuth, requirePermission('reports'), async (req,res) => {
+  try {
+    const {rows} = await db(`SELECT e.*, u.name as created_by_name FROM expense_entries e
+      LEFT JOIN admins a ON a.id=e.created_by
+      LEFT JOIN users u ON u.id=a.user_id
+      ORDER BY e.created_at DESC LIMIT 100`);
+    res.json({success:true,data:{entries:ccAll(rows)}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.post('/api/admin/expense-entries', adminAuth, requireRole('Super Admin'), async (req,res) => {
+  try {
+    const { amount, category, reason } = req.body;
+    if (!amount||!reason) return res.status(400).json({success:false,message:'Amount and reason are required'});
+    const {rows:[en]} = await db(
+      `INSERT INTO expense_entries(type,amount_usd,category,reason,created_by) VALUES('manual',$1,$2,$3,$4) RETURNING *`,
+      [parseFloat(amount), category||'Other', reason.trim(), req.admin.id]);
+    await logAdmin(req.admin.id, 'Logged a maintenance/expense entry', {amount, category});
+    res.json({success:true,message:'Expense entry recorded',data:{entry:cc(en)}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.delete('/api/admin/expense-entries/:id', adminAuth, requireRole('Super Admin'), async (req,res) => {
+  try {
+    await db('DELETE FROM expense_entries WHERE id=$1',[req.params.id]);
+    await logAdmin(req.admin.id, 'Deleted a maintenance/expense entry', {id:req.params.id});
+    res.json({success:true,message:'Expense entry deleted'});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
 app.get('/api/admin/reports/:type', adminAuth, requirePermission('reports'), async (req,res) => {
   try {
     const type = req.params.type;
@@ -5803,6 +6055,29 @@ app.get('/api/admin/reports/:type', adminAuth, requirePermission('reports'), asy
         rows: levelRows,
       };
 
+    } else if (type === 'maintenance') {
+      const {rows} = await db(`
+        WITH days AS (SELECT generate_series(CURRENT_DATE - INTERVAL '6 days', CURRENT_DATE, INTERVAL '1 day')::date AS d)
+        SELECT to_char(d.d,'YYYY-MM-DD') AS day,
+          COALESCE((SELECT SUM(amount_usd) FROM expense_entries WHERE type='gas_auto' AND created_at::date=d.d),0) AS gas_usd,
+          COALESCE((SELECT SUM(amount_bnb) FROM expense_entries WHERE type='gas_auto' AND created_at::date=d.d),0) AS gas_bnb,
+          COALESCE((SELECT SUM(amount_usd) FROM expense_entries WHERE type='manual' AND created_at::date=d.d),0) AS manual_usd
+        FROM days d ORDER BY d.d`);
+      const gasUsd = rows.reduce((a,r)=>a+fmtNum(r.gas_usd),0);
+      const gasBnb = rows.reduce((a,r)=>a+fmtNum(r.gas_bnb),0);
+      const manualUsd = rows.reduce((a,r)=>a+fmtNum(r.manual_usd),0);
+      result = {
+        kpis: [
+          {label:'Withdrawal Gas Cost (7d)', value:`$${gasUsd.toLocaleString(undefined,{maximumFractionDigits:2})}`, color:'red'},
+          {label:'Gas Spent (7d, BNB)', value:gasBnb.toFixed(6)},
+          {label:'Manual Expenses (7d)', value:`$${manualUsd.toLocaleString()}`, color:'red'},
+          {label:'Total Maintenance Cost (7d)', value:`$${(gasUsd+manualUsd).toLocaleString(undefined,{maximumFractionDigits:2})}`, color:'red'},
+        ],
+        columns:['Date','Gas Cost (USD)','Gas Spent (BNB)','Manual Expenses'],
+        rows: rows.map(r=>[r.day, `$${fmtNum(r.gas_usd).toFixed(4)}`, fmtNum(r.gas_bnb).toFixed(6), `$${fmtNum(r.manual_usd).toLocaleString()}`]),
+        note: `Gas cost is tracked automatically from every withdrawal auto-payout (BNB actually burned), converted to USD at the rate set in Settings → Expenses (currently $${LIVE_EXPENSES.bnbUsdRate}/BNB — update it there when the real price moves). Manual entries below are admin-logged operating costs (server, VPS, domain, manual gas top-ups, etc.).`,
+      };
+
     } else {
       return res.status(404).json({success:false,message:'Unknown report type'});
     }
@@ -5827,6 +6102,7 @@ app.get('/api/admin/settings', adminAuth, requirePermission('settings'), async (
     otp: LIVE_OTP,
     salaryRanks: LIVE_SALARY_RANKS,
     salarySettings: LIVE_SALARY_SETTINGS,
+    expenses: LIVE_EXPENSES,
   }});
 });
 
@@ -6118,6 +6394,20 @@ app.put('/api/admin/settings/payment', adminAuth, requireRole('Super Admin'), as
     await saveSetting('payment', LIVE_PAYMENT, req.admin.id);
     await logAdmin(req.admin.id, 'Updated payment settings', req.body);
     res.json({success:true,message:'Payment settings updated',data:{payment:LIVE_PAYMENT}});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.put('/api/admin/settings/expenses', adminAuth, requireRole('Super Admin'), async (req,res) => {
+  try {
+    const { bnbUsdRate } = req.body;
+    if (bnbUsdRate!==undefined) {
+      const r = parseFloat(bnbUsdRate);
+      if (!r || r<=0) return res.status(400).json({success:false,message:'BNB/USD rate must be a positive number'});
+      LIVE_EXPENSES.bnbUsdRate = r;
+    }
+    await saveSetting('expenses', LIVE_EXPENSES, req.admin.id);
+    await logAdmin(req.admin.id, 'Updated expense settings (BNB/USD rate)', {bnbUsdRate: LIVE_EXPENSES.bnbUsdRate});
+    res.json({success:true,message:'Expense settings updated',data:{expenses:LIVE_EXPENSES}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
