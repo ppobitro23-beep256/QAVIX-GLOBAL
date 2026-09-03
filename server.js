@@ -353,8 +353,14 @@ async function scanOnchainDeposits() {
 // overshoot the child address's real token balance. Tops up gas (BNB) from the
 // reserved index-0 wallet first if the child address doesn't already have
 // enough. Never throws — failures are recorded on the row and retried next cycle.
+// Same same-process concurrent-callers race as the other sweep functions
+// (scanOnchainDeposits sweeps right after crediting, retryFailedSweeps() also
+// picks up anything still unswept every cycle) — same in-memory lock.
+const _sweepingUsdtIds = new Set();
 async function attemptSweep(depositId, index, childAddress) {
   if (!MAIN_COLLECTION_WALLET || index==null) return;
+  if (_sweepingUsdtIds.has(depositId)) return; // another caller is already sweeping this exact row
+  _sweepingUsdtIds.add(depositId);
   try {
     const { rows:[dep] } = await db(`SELECT amount_wei, swept FROM onchain_deposits WHERE id=$1`, [depositId]);
     if (!dep || dep.swept || !dep.amount_wei) return;
@@ -437,6 +443,8 @@ async function attemptSweep(depositId, index, childAddress) {
   } catch (e) {
     console.error(`Sweep failed for deposit ${depositId}:`, e.message);
     await db(`UPDATE onchain_deposits SET sweep_error=$1 WHERE id=$2`, [String(e.message||'').slice(0,500), depositId]).catch(()=>{});
+  } finally {
+    _sweepingUsdtIds.delete(depositId);
   }
 }
 
@@ -444,8 +452,25 @@ async function attemptSweep(depositId, index, childAddress) {
 // address into MAIN_COLLECTION_WALLET. Same pattern as attemptSweep (gas
 // top-up estimation, exact wei amount, gas reclaim after) but generalized to
 // any token contract instead of hardcoding USDT.
+//
+// This same depositId can legitimately be reached from more than one caller
+// in the same process — the 30s scanOtherTokenDeposits cycle sweeps it right
+// after crediting it, retryStuckForeignDeposits() picks up anything still
+// unswept, AND an admin-triggered wallet check (single or bulk — the bulk
+// scanner runs batches of 5 addresses in parallel) can hit the very same row
+// if it lands on the same address at the same moment. WEB_CONCURRENCY=1
+// means this is all one Node process, so a simple in-memory lock per
+// depositId is enough: without it, two concurrent calls can both read the
+// same on-chain balance as available, both build a transfer for it, and the
+// second one reverts on-chain with "transfer amount exceeds balance" once
+// the first has already moved the tokens — wasted gas, no funds lost, but a
+// misleading-looking error. The lock makes the second caller skip instead of
+// racing.
+const _sweepingOtherTokenIds = new Set();
 async function attemptSweepOtherToken(depositId, index, childAddress, tokenContract) {
   if (!MAIN_COLLECTION_WALLET || index==null) return;
+  if (_sweepingOtherTokenIds.has(depositId)) return; // another caller is already sweeping this exact row
+  _sweepingOtherTokenIds.add(depositId);
   try {
     const { rows:[dep] } = await db(`SELECT amount_wei, swept FROM other_token_deposits WHERE id=$1`, [depositId]);
     if (!dep || dep.swept || !dep.amount_wei) return;
@@ -511,6 +536,8 @@ async function attemptSweepOtherToken(depositId, index, childAddress, tokenContr
   } catch (e) {
     console.error(`Other-token sweep failed for deposit ${depositId}:`, e.message);
     await db(`UPDATE other_token_deposits SET sweep_error=$1 WHERE id=$2`, [String(e.message||'').slice(0,500), depositId]).catch(()=>{});
+  } finally {
+    _sweepingOtherTokenIds.delete(depositId);
   }
 }
 
@@ -518,8 +545,14 @@ async function attemptSweepOtherToken(depositId, index, childAddress, tokenContr
 // mistake instead of USDT) straight to MAIN_COLLECTION_WALLET. Simpler than
 // the token sweeps — no gas top-up needed, the balance itself already covers
 // its own send cost — just reserve the gas cost out of the amount swept.
+// Same same-process concurrent-callers race as attemptSweepOtherToken above
+// (see its comment) — same in-memory per-depositId lock, separate Set since
+// these are two different code paths that could otherwise still overlap.
+const _sweepingNativeBnbIds = new Set();
 async function attemptSweepNativeBnb(depositId, index, childAddress) {
   if (!MAIN_COLLECTION_WALLET || index==null) return;
+  if (_sweepingNativeBnbIds.has(depositId)) return; // another caller is already sweeping this exact row
+  _sweepingNativeBnbIds.add(depositId);
   try {
     const { rows:[dep] } = await db(`SELECT swept FROM other_token_deposits WHERE id=$1`, [depositId]);
     if (!dep || dep.swept) return;
@@ -536,6 +569,8 @@ async function attemptSweepNativeBnb(depositId, index, childAddress) {
   } catch (e) {
     console.error(`Native BNB sweep failed for deposit ${depositId}:`, e.message);
     await db(`UPDATE other_token_deposits SET sweep_error=$1 WHERE id=$2`, [String(e.message||'').slice(0,500), depositId]).catch(()=>{});
+  } finally {
+    _sweepingNativeBnbIds.delete(depositId);
   }
 }
 
@@ -594,31 +629,29 @@ async function scanOtherTokenDeposits() {
       for (const log of logs) {
         const tokenContract = log.address.toLowerCase();
         if (tokenContract === USDT_BEP20_CONTRACT.toLowerCase()) continue; // main scanner's territory
+        // Anything not on the known-stablecoin allowlist is skipped outright —
+        // NOT logged, NOT turned into a "needs valuation" deposit. This is
+        // deliberate: BSC gets constant airdrop-spam tokens sent to random
+        // addresses (scam names, fake "$" tickers, promotional junk) with zero
+        // real value and no user action behind them. Treating every arbitrary
+        // token transfer as a reviewable deposit — like this used to — floods
+        // the Deposits queue with dozens of worthless "needs valuation" rows
+        // per day that admin has to individually reject, and burns RPC calls
+        // fetching symbol()/decimals() for tokens nobody will ever credit.
+        // A real accidental send of an unlisted token is still recoverable —
+        // that's what the Wallet Scanner's manual per-address check is for —
+        // this only stops the automatic scanner from treating spam as if it
+        // were a legitimate deposit worth an admin's attention. Checked before
+        // even parsing the log, so spam costs nothing beyond the address check.
+        const known = STABLECOIN_CONTRACTS[tokenContract];
+        if (!known) continue;
         let parsed;
         try { parsed = iface.parseLog(log); } catch(e) { continue; } // not a standard Transfer — skip silently
         const toAddr = (parsed.args.to || '').toLowerCase();
         const match = addrToUser[toAddr];
         if (!match) continue;
-        const known = STABLECOIN_CONTRACTS[tokenContract];
-        let decimals = known?.decimals;
-        let tokenSymbol = known?.symbol;
-        if (known === undefined) {
-          // Unrecognized token — fetch its REAL decimals from the contract
-          // instead of assuming 18. Getting this wrong would make the
-          // displayed/credited amount wildly incorrect for any token that
-          // isn't 18-decimal (6 and 8 are both common on BSC/BEP20).
-          try {
-            const c = new ethers.Contract(tokenContract, [
-              'function symbol() view returns (string)',
-              'function decimals() view returns (uint8)',
-            ], bscProvider);
-            const [sym, dec] = await Promise.all([
-              c.symbol().catch(()=>'UNKNOWN TOKEN'),
-              c.decimals().catch(()=>18),
-            ]);
-            tokenSymbol = sym; decimals = Number(dec);
-          } catch(e) { tokenSymbol = 'UNKNOWN TOKEN'; decimals = 18; }
-        }
+        const decimals = known.decimals;
+        const tokenSymbol = known.symbol;
         const amount = parseFloat(ethers.formatUnits(parsed.args.value, decimals));
         if (!amount || amount <= 0) continue;
         const logIndex = log.index ?? log.logIndex ?? 0;
@@ -4962,6 +4995,28 @@ app.put('/api/admin/deposits/:id/approve', adminAuth, requirePermission('deposit
     if (isFirstDeposit) await payComm(tx.user_id, tx.amount);
     await logAdmin(req.admin.id, `Approved deposit $${tx.amount}`, {depositId:req.params.id,userId:tx.user_id});
     res.json({success:true,message:'Deposit approved and credited'});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+// One-click cleanup for spam-token clutter created BEFORE the scanner fix
+// above — bulk-rejects every still-pending "needs valuation" deposit that
+// came from an unrecognized (non-stablecoin) token. Deliberately does NOT
+// notify each affected user (200+ "Deposit Rejected" pings for airdrop spam
+// nobody asked to receive would itself be spam), just one summary admin log
+// line. Only touches rows already flagged isForeignToken + NOT isStablecoin —
+// a real USDT deposit, an approved/rejected one, or a recognized-stablecoin
+// one (still worth reviewing) are never touched.
+app.post('/api/admin/deposits/clean-spam-tokens', adminAuth, requireRole('Super Admin'), async (req,res) => {
+  try {
+    const { rows } = await db(
+      `UPDATE transactions SET status='rejected', reviewed_by=$1, reviewed_at=NOW(),
+         reject_reason='Auto-cleaned: unrecognized token, not accepted for deposit'
+       WHERE type='deposit' AND status='pending'
+         AND meta->>'isForeignToken'='true' AND meta->>'isStablecoin'='false'
+       RETURNING id`,
+      [req.admin.id]);
+    await logAdmin(req.admin.id, `Cleaned ${rows.length} spam/unrecognized-token pending deposit(s)`, {count: rows.length});
+    res.json({success:true, message:`Cleaned ${rows.length} spam token deposit(s) from the queue.`, data:{count: rows.length}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
