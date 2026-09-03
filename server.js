@@ -709,8 +709,20 @@ async function retryStuckForeignDeposits() {
       if (u?.deposit_address_index == null) continue;
       if (d.token_symbol === 'BNB' && !d.token_contract) {
         await attemptSweepNativeBnb(d.id, u.deposit_address_index, d.to_address);
-      } else if (d.token_contract) {
+      } else if (d.token_contract && STABLECOIN_CONTRACTS[d.token_contract.toLowerCase()]) {
         await attemptSweepOtherToken(d.id, u.deposit_address_index, d.to_address, d.token_contract);
+      } else if (d.token_contract) {
+        // Not on the accepted-token allowlist — this row predates the
+        // scanner fix that stopped creating them (or was inserted by the
+        // manual wallet checker before that). Sweeping it isn't just
+        // pointless, it's often actively broken: this exact case is what was
+        // producing endless "Other-token sweep failed ... transfer amount
+        // exceeds balance" log spam — many airdrop-spam tokens are honeypot
+        // contracts that report a balance but revert on every real transfer.
+        // Mark it done-with-nothing-to-do so it drops out of this query for
+        // good instead of being retried forever.
+        await db(`UPDATE other_token_deposits SET swept=TRUE, sweep_error=$1 WHERE id=$2`,
+          ['Skipped: token is not on the accepted list, not swept.', d.id]);
       }
     }
   } catch(e) {
@@ -5015,8 +5027,20 @@ app.post('/api/admin/deposits/clean-spam-tokens', adminAuth, requireRole('Super 
          AND meta->>'isForeignToken'='true' AND meta->>'isStablecoin'='false'
        RETURNING id`,
       [req.admin.id]);
-    await logAdmin(req.admin.id, `Cleaned ${rows.length} spam/unrecognized-token pending deposit(s)`, {count: rows.length});
-    res.json({success:true, message:`Cleaned ${rows.length} spam token deposit(s) from the queue.`, data:{count: rows.length}});
+    // Also stops the sweep-retry loop immediately for these same rows'
+    // other_token_deposits entries — without this, retryStuckForeignDeposits()
+    // (every 30s) keeps retrying up to 20 still-unswept rows per cycle
+    // regardless of the transaction above being rejected, which is what was
+    // producing continuous "sweep failed ... exceeds balance" log spam even
+    // after a "Cleaned" toast. This closes that gap for everything just
+    // rejected, rather than waiting several cycles for the batch to drain.
+    const { rows: sweepRows } = await db(
+      `UPDATE other_token_deposits SET swept=TRUE, sweep_error='Skipped: token is not on the accepted list, not swept.'
+       WHERE swept=FALSE AND transaction_id IN (
+         SELECT id FROM transactions WHERE type='deposit' AND reject_reason='Auto-cleaned: unrecognized token, not accepted for deposit'
+       ) RETURNING id`);
+    await logAdmin(req.admin.id, `Cleaned ${rows.length} spam/unrecognized-token pending deposit(s)`, {count: rows.length, sweepRowsStopped: sweepRows.length});
+    res.json({success:true, message:`Cleaned ${rows.length} spam token deposit(s)${sweepRows.length ? `, stopped ${sweepRows.length} stuck sweep-retry row(s)` : ''} from the queue.`, data:{count: rows.length, sweepRowsStopped: sweepRows.length}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
