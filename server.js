@@ -5018,29 +5018,27 @@ app.put('/api/admin/deposits/:id/approve', adminAuth, requirePermission('deposit
 // line. Only touches rows already flagged isForeignToken + NOT isStablecoin —
 // a real USDT deposit, an approved/rejected one, or a recognized-stablecoin
 // one (still worth reviewing) are never touched.
-app.post('/api/admin/deposits/clean-spam-tokens', adminAuth, requireRole('Super Admin'), async (req,res) => {
+// Owner-only: permanently DELETES every spam/unrecognized-token deposit
+// record — not a soft reject. Matches regardless of current status (pending
+// still-unreviewed ones AND already-rejected historical ones from before
+// this endpoint existed), since the point is to clear the backlog out of the
+// list entirely, not just mark it handled. Deletes the linked
+// other_token_deposits row first (same criteria) so nothing orphaned is left
+// behind — the FK is ON DELETE SET NULL, so skipping this step wouldn't
+// break anything, but it would leave stray rows with no transaction to
+// point to for no reason.
+app.post('/api/admin/deposits/clean-spam-tokens', adminAuth, requireRole('Owner'), async (req,res) => {
   try {
-    const { rows } = await db(
-      `UPDATE transactions SET status='rejected', reviewed_by=$1, reviewed_at=NOW(),
-         reject_reason='Auto-cleaned: unrecognized token, not accepted for deposit'
-       WHERE type='deposit' AND status='pending'
-         AND meta->>'isForeignToken'='true' AND meta->>'isStablecoin'='false'
-       RETURNING id`,
-      [req.admin.id]);
-    // Also stops the sweep-retry loop immediately for these same rows'
-    // other_token_deposits entries — without this, retryStuckForeignDeposits()
-    // (every 30s) keeps retrying up to 20 still-unswept rows per cycle
-    // regardless of the transaction above being rejected, which is what was
-    // producing continuous "sweep failed ... exceeds balance" log spam even
-    // after a "Cleaned" toast. This closes that gap for everything just
-    // rejected, rather than waiting several cycles for the batch to drain.
-    const { rows: sweepRows } = await db(
-      `UPDATE other_token_deposits SET swept=TRUE, sweep_error='Skipped: token is not on the accepted list, not swept.'
-       WHERE swept=FALSE AND transaction_id IN (
-         SELECT id FROM transactions WHERE type='deposit' AND reject_reason='Auto-cleaned: unrecognized token, not accepted for deposit'
-       ) RETURNING id`);
-    await logAdmin(req.admin.id, `Cleaned ${rows.length} spam/unrecognized-token pending deposit(s)`, {count: rows.length, sweepRowsStopped: sweepRows.length});
-    res.json({success:true, message:`Cleaned ${rows.length} spam token deposit(s)${sweepRows.length ? `, stopped ${sweepRows.length} stuck sweep-retry row(s)` : ''} from the queue.`, data:{count: rows.length, sweepRowsStopped: sweepRows.length}});
+    const { rows: txRows } = await db(
+      `SELECT id FROM transactions WHERE type='deposit' AND meta->>'isForeignToken'='true' AND meta->>'isStablecoin'='false'`);
+    const ids = txRows.map(r => r.id);
+    if (!ids.length) {
+      return res.json({success:true, message:'Nothing to clean — no spam token deposits found.', data:{count:0}});
+    }
+    await db(`DELETE FROM other_token_deposits WHERE transaction_id = ANY($1::uuid[])`, [ids]);
+    const { rows: deleted } = await db(`DELETE FROM transactions WHERE id = ANY($1::uuid[]) RETURNING id`, [ids]);
+    await logAdmin(req.admin.id, `Permanently deleted ${deleted.length} spam/unrecognized-token deposit record(s)`, {count: deleted.length});
+    res.json({success:true, message:`Deleted ${deleted.length} spam token deposit(s) permanently.`, data:{count: deleted.length}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
