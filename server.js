@@ -4227,12 +4227,18 @@ app.get('/api/admin/stats', adminAuth, async (_,res) => {
       // user actually requested, before the platform's cut. Both are exposed
       // so the dashboard can show "net (sent to users)" and "with fee
       // (requested)" side by side instead of just one ambiguous total.
+      // The fee is matched against a numeric-string pattern before casting —
+      // every withdrawal created through the normal flow always stores a
+      // clean number here, but a malformed/non-numeric value in meta on any
+      // one legacy row would otherwise throw a cast error and take down this
+      // entire query (and the whole dashboard with it) for every row, not
+      // just the bad one.
       db(`SELECT
             COALESCE(SUM(amount) FILTER (WHERE status='paid'),0) total,
-            COALESCE(SUM(amount + COALESCE((meta->>'fee')::numeric,0)) FILTER (WHERE status='paid'),0) total_gross,
+            COALESCE(SUM(amount + CASE WHEN meta->>'fee' ~ '^[0-9]+(\\.[0-9]+)?$' THEN (meta->>'fee')::numeric ELSE 0 END) FILTER (WHERE status='paid'),0) total_gross,
             COUNT(*) FILTER (WHERE status='pending') pending,
             COALESCE(SUM(amount) FILTER (WHERE created_at::date=CURRENT_DATE AND status='paid'),0) today,
-            COALESCE(SUM(amount + COALESCE((meta->>'fee')::numeric,0)) FILTER (WHERE created_at::date=CURRENT_DATE AND status='paid'),0) today_gross
+            COALESCE(SUM(amount + CASE WHEN meta->>'fee' ~ '^[0-9]+(\\.[0-9]+)?$' THEN (meta->>'fee')::numeric ELSE 0 END) FILTER (WHERE created_at::date=CURRENT_DATE AND status='paid'),0) today_gross
           FROM transactions WHERE type='withdrawal'`),
       db(`SELECT COUNT(*) FILTER (WHERE status='active') active, COALESCE(SUM(amount) FILTER (WHERE status='active'),0) capital FROM investments`),
       db(`SELECT COALESCE(SUM(amount),0) profit FROM transactions WHERE type='deposit' AND status='approved' AND created_at::date=CURRENT_DATE`),
@@ -4746,6 +4752,23 @@ app.put('/api/admin/users/:id/wallet', adminAuth, requirePermission('users'), as
     if (e.code === '23505') return res.status(400).json({success:false,message:'This wallet address is already linked to another account.'});
     res.status(500).json({success:false,message:e.message});
   }
+});
+
+// Changes only the display name — referral_code (and therefore the user's
+// referral link), email, uid, and everything else stay exactly as they were.
+// Several users have asked for this (name typo at signup, legal name change,
+// etc.) without wanting to lose their existing referral link/history.
+app.put('/api/admin/users/:id/name', adminAuth, requirePermission('users'), async (req,res) => {
+  try {
+    const name = String(req.body.name||'').trim();
+    if (!name) return res.status(400).json({success:false,message:'Name is required'});
+    if (name.length > 100) return res.status(400).json({success:false,message:'Name is too long (max 100 characters)'});
+    const {rows:[u]} = await db(`SELECT name FROM users WHERE id=$1`, [req.params.id]);
+    if (!u) return res.status(404).json({success:false,message:'User not found'});
+    await db('UPDATE users SET name=$1 WHERE id=$2', [name, req.params.id]);
+    await logAdmin(req.admin.id, `Renamed user ${req.params.id}: "${u.name}" → "${name}"`, {userId:req.params.id, oldName:u.name, newName:name});
+    res.json({success:true,message:'Name updated — referral link and everything else stays the same.'});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
 app.get('/api/admin/users/:id/login-history', adminAuth, requirePermission('users'), async (req,res) => {
