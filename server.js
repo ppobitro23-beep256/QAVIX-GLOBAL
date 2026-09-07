@@ -5959,11 +5959,27 @@ app.delete('/api/admin/loss-entries/:id', adminAuth, requireRole('Super Admin'),
 // entries are (server rent, VPS, domain renewal, manual BNB top-ups, etc.).
 app.get('/api/admin/expense-entries', adminAuth, requirePermission('reports'), async (req,res) => {
   try {
+    const { month, year } = req.query;
+    let where = '';
+    const params = [];
+    if (year) {
+      params.push(parseInt(year));
+      where += ` AND EXTRACT(YEAR FROM e.created_at)=$${params.length}`;
+      if (month) {
+        params.push(parseInt(month)); // 1-12
+        where += ` AND EXTRACT(MONTH FROM e.created_at)=$${params.length}`;
+      }
+    }
     const {rows} = await db(`SELECT e.*, u.name as created_by_name FROM expense_entries e
       LEFT JOIN admins a ON a.id=e.created_by
       LEFT JOIN users u ON u.id=a.user_id
-      ORDER BY e.created_at DESC LIMIT 100`);
-    res.json({success:true,data:{entries:ccAll(rows)}});
+      WHERE TRUE ${where}
+      ORDER BY e.created_at DESC LIMIT 200`, params);
+    const {rows:monthsRows} = await db(
+      `SELECT DISTINCT EXTRACT(YEAR FROM created_at)::int AS year, EXTRACT(MONTH FROM created_at)::int AS month
+       FROM expense_entries ORDER BY year DESC, month DESC`);
+    const totalUsd = rows.reduce((s,r)=>s+parseFloat(r.amount_usd),0);
+    res.json({success:true,data:{entries:ccAll(rows), totalUsd, availableMonths: monthsRows}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 app.post('/api/admin/expense-entries', adminAuth, requireRole('Super Admin'), async (req,res) => {
