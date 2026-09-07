@@ -4209,7 +4209,7 @@ app.get('/api/admin/me', adminAuth, (req,res) => res.json({success:true,data:{ad
 // ── Dashboard stats ───────────────────────────────────────────────────────
 app.get('/api/admin/stats', adminAuth, async (_,res) => {
   try {
-    const [users, deposits, withdrawals, investments, today, managerDep, managerDepCurrent, promoterDep, promoterDepCurrent, promoterOwnDep] = await Promise.all([
+    const [users, deposits, withdrawals, investments, today, managerDep, managerDepCurrent, promoterDep, promoterDepCurrent, promoterOwnDep, maintenanceCost] = await Promise.all([
       db(`SELECT COUNT(*) total, COUNT(*) FILTER (WHERE status='active') active, COUNT(*) FILTER (WHERE status='banned') banned, COUNT(*) FILTER (WHERE created_at::date=CURRENT_DATE) today FROM users`),
       // Total Deposits counts every real USDT deposit, including ones made by
       // accounts tagged "Promoters" — a promoter depositing their own money
@@ -4265,6 +4265,11 @@ app.get('/api/admin/stats', adminAuth, async (_,res) => {
       // from accounts tagged "Promoters" themselves. Already included in the
       // main total; this is just a visibility subtotal, not an exclusion.
       db(`SELECT COALESCE(SUM(t.amount),0) total FROM transactions t JOIN users u ON u.id=t.user_id WHERE t.type='deposit' AND t.status='approved' AND u.admin_tag='Promoters'`),
+      // Lifetime total of every expense_entries row — both auto-tracked
+      // withdrawal-payout gas and admin-logged manual costs (server, VPS,
+      // domain, etc.). Everything the platform spends outside of paying
+      // users out, in one figure for the dashboard.
+      db(`SELECT COALESCE(SUM(amount_usd),0) total FROM expense_entries`),
     ]);
     res.json({success:true,data:{
       totalUsers: parseInt(users.rows[0].total), activeUsers: parseInt(users.rows[0].active), bannedUsers: parseInt(users.rows[0].banned), newUsersToday: parseInt(users.rows[0].today),
@@ -4274,7 +4279,8 @@ app.get('/api/admin/stats', adminAuth, async (_,res) => {
       revenueToday: parseFloat(today.rows[0].profit),
       managerDepositsTotal: parseFloat(managerDep.rows[0].total), managerDepositsCurrent: parseFloat(managerDepCurrent.rows[0].total),
       promoterDepositsTotal: parseFloat(promoterDep.rows[0].total), promoterDepositsCurrent: parseFloat(promoterDepCurrent.rows[0].total),
-      promoterOwnDeposits: parseFloat(promoterOwnDep.rows[0].total)
+      promoterOwnDeposits: parseFloat(promoterOwnDep.rows[0].total),
+      totalMaintenanceCost: parseFloat(maintenanceCost.rows[0].total)
     }});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
