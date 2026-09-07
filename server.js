@@ -247,6 +247,27 @@ async function recordGasExpense(gasBnb, withdrawalId, userId, txHash) {
   } catch (e) { console.error('recordGasExpense error (non-critical):', e.message); }
 }
 
+// Once-daily refresh of the BNB/USD rate used to price withdrawal gas costs.
+// This is a plain HTTP call to a price API (CoinGecko's free public
+// endpoint), not a blockchain RPC call — it does NOT touch BSC_RPC_URL or
+// its request quota, so this can't cause the "quota limit" outage the
+// on-chain scanners hit before. Best-effort only: on any failure (API down,
+// rate limited, network hiccup) the existing manually-set or last-fetched
+// rate is simply left in place for another day rather than the whole
+// platform erroring out over a background price refresh.
+async function refreshBnbUsdRate() {
+  try {
+    const resp = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=binancecoin&vs_currencies=usd');
+    if (!resp.ok) throw new Error(`CoinGecko responded ${resp.status}`);
+    const data = await resp.json();
+    const price = data?.binancecoin?.usd;
+    if (!price || typeof price !== 'number' || price <= 0) throw new Error('Unexpected response shape');
+    LIVE_EXPENSES.bnbUsdRate = +price.toFixed(2);
+    await saveSetting('expenses', LIVE_EXPENSES, null);
+    console.log(`✅ BNB/USD rate auto-updated: $${LIVE_EXPENSES.bnbUsdRate}`);
+  } catch (e) { console.error('refreshBnbUsdRate error (non-critical, keeping previous rate):', e.message); }
+}
+
 
 
 const USDT_ABI = ['event Transfer(address indexed from, address indexed to, uint256 value)'];
@@ -5984,12 +6005,22 @@ app.get('/api/admin/expense-entries', adminAuth, requirePermission('reports'), a
 });
 app.post('/api/admin/expense-entries', adminAuth, requireRole('Super Admin'), async (req,res) => {
   try {
-    const { amount, category, reason } = req.body;
+    const { amount, category, reason, date } = req.body;
     if (!amount||!reason) return res.status(400).json({success:false,message:'Amount and reason are required'});
+    // date lets an admin backdate a cost to the month it actually belongs to
+    // (a bill paid Sept 1st for August's usage should count as August), not
+    // just whichever month it happened to be logged in. Falls back to right
+    // now when omitted — this is genuinely optional, not a breaking change
+    // for the existing callers that don't send it.
+    let entryDate = new Date();
+    if (date) {
+      const parsed = new Date(date);
+      if (!isNaN(parsed.getTime())) entryDate = parsed;
+    }
     const {rows:[en]} = await db(
-      `INSERT INTO expense_entries(type,amount_usd,category,reason,created_by) VALUES('manual',$1,$2,$3,$4) RETURNING *`,
-      [parseFloat(amount), category||'Other', reason.trim(), req.admin.id]);
-    await logAdmin(req.admin.id, 'Logged a maintenance/expense entry', {amount, category});
+      `INSERT INTO expense_entries(type,amount_usd,category,reason,created_by,created_at) VALUES('manual',$1,$2,$3,$4,$5) RETURNING *`,
+      [parseFloat(amount), category||'Other', reason.trim(), req.admin.id, entryDate]);
+    await logAdmin(req.admin.id, 'Logged a maintenance/expense entry', {amount, category, date: entryDate.toISOString()});
     res.json({success:true,message:'Expense entry recorded',data:{entry:cc(en)}});
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
@@ -6197,7 +6228,7 @@ app.get('/api/admin/reports/:type', adminAuth, requirePermission('reports'), asy
         ],
         columns:['Date','Gas Cost (USD)','Gas Spent (BNB)','Manual Expenses'],
         rows: rows.map(r=>[r.day, `$${fmtNum(r.gas_usd).toFixed(4)}`, fmtNum(r.gas_bnb).toFixed(6), `$${fmtNum(r.manual_usd).toLocaleString()}`]),
-        note: `Gas cost is tracked automatically from every withdrawal auto-payout (BNB actually burned), converted to USD at the rate set in Settings → Expenses (currently $${LIVE_EXPENSES.bnbUsdRate}/BNB — update it there when the real price moves). Manual entries below are admin-logged operating costs (server, VPS, domain, manual gas top-ups, etc.).`,
+        note: `Gas cost is tracked automatically from every withdrawal auto-payout (BNB actually burned), converted to USD at the current rate — $${LIVE_EXPENSES.bnbUsdRate}/BNB, auto-refreshed daily from live market price (overridable in Settings → Expenses). Manual entries below are admin-logged operating costs (server, VPS, domain, manual gas top-ups, etc.).`,
       };
 
     } else {
@@ -7351,6 +7382,12 @@ initDB().then(async ()=>{
   };
   setTimeout(runDailyBackup, 30_000);
   setInterval(runDailyBackup, 24 * 60 * 60 * 1000);
+
+  // Daily BNB/USD rate refresh for the maintenance-cost gas conversion — a
+  // plain price-API HTTP call, not a BSC RPC call, so it never touches the
+  // on-chain quota. First run 45s after startup, then once every 24h.
+  setTimeout(refreshBnbUsdRate, 45_000);
+  setInterval(refreshBnbUsdRate, 24 * 60 * 60 * 1000);
 
   // On-chain auto-deposit scanner (only active when HD_MASTER_MNEMONIC is set).
   // First run 20s after startup, then every 30s.
