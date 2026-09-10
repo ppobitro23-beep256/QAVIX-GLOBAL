@@ -5575,6 +5575,46 @@ app.put('/api/admin/investments/:id/cancel', adminAuth, requireRole('Super Admin
   } catch(e){res.status(500).json({success:false,message:e.message});}
 });
 
+// Undoes a cancellation — puts a plan back exactly where it was, not
+// restarted from day 0. Recomputes end_date from the REMAINING days
+// (days_total - days_elapsed) counted from right now, and resets
+// last_credit_at to now so the next daily profit lands a full 24h from
+// restoration — otherwise the very next profit-credit cycle would either
+// instantly mark it 'completed' (if the old end_date had already passed
+// during the time it sat cancelled) or immediately re-credit a day that's
+// already accounted for. Built for exactly this situation: a plan cancelled
+// as a side effect of something else (e.g. terminating a promoter cancels
+// ALL of their active plans, including ones bought with their own real
+// deposit money, not just promoter-bonus plans) that shouldn't have been
+// touched.
+app.put('/api/admin/investments/:id/restore', adminAuth, requireRole('Super Admin'), async (req,res) => {
+  try {
+    const {rows:invRows} = await db('SELECT * FROM investments WHERE id=$1',[req.params.id]);
+    if (!invRows.length) return res.status(404).json({success:false,message:'Investment not found'});
+    const inv = invRows[0];
+    if (inv.status !== 'cancelled') return res.status(400).json({success:false,message:`This plan is ${inv.status}, not cancelled — nothing to restore.`});
+    const remainingDays = inv.days_total - inv.days_elapsed;
+    if (remainingDays <= 0) return res.status(400).json({success:false,message:'This plan had already run its full term before being cancelled — restoring it would mean crediting days it already completed. Use "Adjust Balance" instead if you want to compensate the user directly.'});
+
+    const newEndDate = new Date(Date.now() + remainingDays * 24*60*60*1000);
+    await db(
+      `UPDATE investments SET status='active', end_date=$1, last_credit_at=NOW() WHERE id=$2`,
+      [newEndDate, inv.id]
+    );
+
+    const {rows:u} = await db('SELECT name,email FROM users WHERE id=$1',[inv.user_id]);
+    await notif(inv.user_id, 'investment', `${inv.plan_name} restored`,
+      `Your admin restored this plan — it continues from day ${inv.days_elapsed} of ${inv.days_total}, ${remainingDays} day(s) remaining.`);
+
+    await logAdmin(req.admin.id, `Restored cancelled investment (${remainingDays} day(s) remaining)`, {
+      userId: inv.user_id, user: u[0]?.email, plan: inv.plan_name, amount: parseFloat(inv.amount),
+      daysElapsed: inv.days_elapsed, daysTotal: inv.days_total, remainingDays
+    });
+
+    res.json({success:true, message: `Plan restored — ${inv.days_elapsed}/${inv.days_total} days already elapsed, ${remainingDays} day(s) remaining, resumes on its normal 24h clock from now.`});
+  } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
 // Lightweight tag change — sets admin_tag to User/Manager/Promoters WITHOUT
 // touching balance or investments. This is what "un-Manager" or "un-Promoter"
 // a user who was tagged by mistake, or demote/promote someone, without the
