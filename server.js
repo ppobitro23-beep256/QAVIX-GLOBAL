@@ -1914,13 +1914,6 @@ function getTierRank(planId){
 // Sorted, active-only rank ladder.
 const getSalaryRanks = () => [...LIVE_SALARY_RANKS].filter(r => r.active !== false).sort((a,b) => a.order - b.order);
 
-// Counts a list of {membership_level} rows by tier.
-function tierBreakdown(rows){
-  const b = {};
-  rows.forEach(r => { b[r.membership_level] = (b[r.membership_level]||0) + 1; });
-  return b;
-}
-
 // Computes one user's full salary standing: their last APPROVED rank, which
 // rank they must be evaluated against this calendar month, their currently
 // unused/available active L1 members, whether they personally hold the
@@ -1979,11 +1972,20 @@ async function computeSalaryProgress(userId){
   const targetOrder = lastOrder === 0 ? null : Math.min(lastOrder + 1, maxOrder);
 
   const evaluate = (rank) => {
-    const avail = tierBreakdown(availableMembers);
     const tierMins = rank.tierMins || {};
-    const tierProgress = Object.keys(tierMins).map(t => ({
-      tier: t, required: tierMins[t], have: avail[t]||0, met: (avail[t]||0) >= tierMins[t]
-    }));
+    // "Bronze: 5" means 5 members at Bronze tier OR HIGHER — Silver/Gold/Elite
+    // members satisfy a Bronze requirement too, they just aren't Bronze
+    // exactly. tierBreakdown() bucketed by exact tier, so a Gold member never
+    // counted toward a Bronze minimum even though they clearly should —
+    // counting independently per threshold against the whole available pool
+    // (not exact-tier buckets) fixes that, and correctly supports a rank
+    // with more than one nested minimum (e.g. "5 Bronze+, of which 2 Gold+")
+    // since a Gold member legitimately counts toward both.
+    const tierProgress = Object.keys(tierMins).map(t => {
+      const minRank = getTierRank(t);
+      const have = availableMembers.filter(m => getTierRank(m.membership_level) >= minRank).length;
+      return { tier: t, required: tierMins[t], have, met: have >= tierMins[t] };
+    });
     const l1Met = availableMembers.length >= rank.l1Min;
     return { rank, l1Have: availableMembers.length, l1Min: rank.l1Min, l1Met, tierProgress, met: l1Met && tierProgress.every(t=>t.met) };
   };
@@ -2010,15 +2012,24 @@ async function computeSalaryProgress(userId){
 }
 
 // Deterministically picks which available members get "spent" on a claim:
-// fills each tier bucket (earliest-joined first) up to its minimum, then tops
-// up with any remaining earliest members until l1Min total is reached.
+// fills each tier threshold (highest requirement first, earliest-joined
+// within it) with anyone at or above that tier, then tops up with any
+// remaining earliest members until l1Min total is reached.
+//
+// Processing highest tier-rank requirement first matters for a rank with
+// more than one nested minimum (e.g. "5 Bronze+, of which 2 Gold+"): a Gold
+// member satisfies both thresholds, so reserving Gold+ members for the Gold
+// requirement FIRST, then filling the remaining Bronze slots from whoever's
+// left, guarantees a valid selection whenever evaluate() said the rank was
+// met — matching its same "tier or higher" counting exactly.
 function selectMembersForClaim(availableMembers, rank){
   const tierMins = rank.tierMins || {};
   const picked = new Set();
-  const byTier = {};
-  availableMembers.forEach(m => { (byTier[m.membership_level] ||= []).push(m); });
-  Object.keys(tierMins).forEach(t => {
-    (byTier[t]||[]).slice(0, tierMins[t]).forEach(m => picked.add(m.id));
+  const tiersDesc = Object.keys(tierMins).sort((a,b) => getTierRank(b) - getTierRank(a));
+  tiersDesc.forEach(t => {
+    const minRank = getTierRank(t);
+    const eligible = availableMembers.filter(m => !picked.has(m.id) && getTierRank(m.membership_level) >= minRank);
+    eligible.slice(0, tierMins[t]).forEach(m => picked.add(m.id));
   });
   for (const m of availableMembers){
     if (picked.size >= rank.l1Min) break;
